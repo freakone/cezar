@@ -30,7 +30,95 @@ export const DEFAULT_WORKTREE_RETENTION = 10;
  *  schema enforces (and mirrors the workspace default's bounds). */
 const worktreeRetentionSchema = z.number().int().min(0).max(1000);
 
+/**
+ * Where a task's agent process runs (spec: cezar+sbx). Absent = `local`, which
+ * is every existing install — isolation is opt-in, never inferred.
+ *
+ * The sandbox is NAMED and reused across tasks by design. A fresh container per
+ * task would hand every run a clean image: no `node_modules`, no warm caches, a
+ * dependency install before any work. `image` names the template the sandbox is
+ * built FROM, so a repo can point at one that already carries its toolchain;
+ * after that the running sandbox accumulates state like a dev box does.
+ */
+const sandboxSchema = z.object({
+  /** Run agents inside the sandbox. False/absent keeps them on this machine. */
+  enabled: z.boolean().default(false),
+  /**
+   * Container runtime. `podman` is the default: it needs no account, no
+   * registry login and no macOS keychain, so it works over ssh — which is what
+   * ruled `sbx` out. `sbx` stays selectable for hosts already using it.
+   */
+  provider: z.enum(['podman', 'sbx']).default('podman'),
+  /** Sandbox name, reused across every task in this repo. */
+  name: z.string().trim().min(1).max(120).default('cezar'),
+  /**
+   * The prepared image tasks run in — the repo's toolchain baked in ONCE so no
+   * task ever reinstalls it. Unset with podman = `cezar-agent/<name>:latest`,
+   * built from `containerfile`.
+   */
+  image: z.string().trim().min(1).max(300).optional(),
+  /**
+   * Containerfile the repo's image is built from, relative to the repo root.
+   * Ships nothing by itself: `FROM` the cezar agent base and add the toolchain.
+   */
+  containerfile: z.string().trim().min(1).max(300).default('.ai/cezar/Containerfile'),
+  /**
+   * Named volumes mounted into every task container, as `volume: mountpoint`.
+   * A container per task keeps tasks from polluting each other; these keep
+   * package installs warm anyway, which is what makes per-task affordable.
+   * Use for SHARED caches (a pnpm/npm store), never for build output.
+   */
+  cacheVolumes: z.record(z.string(), z.string()).optional().catch(undefined),
+  /**
+   * Container paths backed by a FRESH anonymous volume per task — `node_modules`
+   * being the case that matters.
+   *
+   * Two problems at once. Such a directory sits inside the bind-mounted repo,
+   * where small-file work runs ~15x slower than the VM's own filesystem
+   * (measured: 800 file creates, 154ms on the mount vs 10ms on a volume), and
+   * it is build output that has no business appearing on the host or leaking
+   * between tasks. An anonymous volume shadows the mount at that path: VM
+   * speed, invisible to the host, discarded with the container.
+   *
+   * Pair with a shared store in `cacheVolumes` so the reinstall is local.
+   * Note the store and the volume are different filesystems, so pnpm copies
+   * rather than hardlinks — still far cheaper than the network or the mount.
+   */
+  ephemeralPaths: z.array(z.string().trim().min(1)).optional().catch(undefined),
+  /**
+   * Mount the host's `~/.claude/.credentials.json` into the agent container
+   * (Tier 1 passthrough): the agent gets a working login, while `projects/`,
+   * `sessions/` and `history.jsonl` — your conversations — stay on the host and
+   * out of its reach. Note this shares your IDENTITY: the agent can read that
+   * token. Set false and log in inside the container for an independently
+   * revocable credential.
+   */
+  claudeCredentialPassthrough: z.boolean().default(true),
+  /** The `sbx create` agent kind. `shell` is right for cezar: cezar drives the
+   *  agent CLI itself and only needs a place to run it. */
+  agent: z.string().trim().min(1).max(60).default('shell'),
+  /** Create the sandbox when it does not exist yet. */
+  createIfMissing: z.boolean().default(true),
+  /** Container-local scratch for the agent. MUST NOT be inside the bind-mounted
+   *  workspace: the native claude binary cannot do its startup temp-file work
+   *  on that mount and dies with `ENOENT … fstat`. */
+  tmpdir: z.string().trim().min(1).max(300).default('/tmp/cez-agent'),
+  /** Unset the placeholder `ANTHROPIC_API_KEY` / `GH_TOKEN` sbx injects into
+   *  PID 1, so the container's own logins win. Set false when the sandbox has
+   *  real credentials bound through `sbx secret`. */
+  unsetPlaceholderCredentials: z.boolean().default(true),
+});
+
+export type SandboxConfig = z.infer<typeof sandboxSchema>;
+
 const configSchema = z.object({
+  /**
+   * Agent isolation (opt-in). `.catch(undefined)` keeps the key additive-safe:
+   * a malformed block degrades to "no sandbox" rather than discarding the rest
+   * of the config — and failing OPEN to local is the honest default, because a
+   * half-parsed sandbox config must never silently look like isolation.
+   */
+  sandbox: sandboxSchema.optional().catch(undefined),
   skillsRepos: z.array(skillsRepoSchema).default(DEFAULT_SKILLS_REPOS),
   /** How many tasks may run at once (spec 006). Non-git dirs always run 1. */
   maxParallel: z.number().int().min(1).max(16).default(2),
