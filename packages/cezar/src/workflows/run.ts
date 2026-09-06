@@ -12,7 +12,10 @@ import {
 import { AUTO_END_DELAY_MS, type AgentSession } from '../core/claude-cli-runner.ts';
 import { onUsage, registerRunProcess, unregisterRunProcess, type ProcessUsage } from '../core/process-usage.ts';
 import { parseUsageLimit } from '../core/usage-limit.ts';
-import { createRunner } from '../core/runner-factory.ts';
+import { backendSupportsLauncher, createRunner } from '../core/runner-factory.ts';
+import type { AgentBackend } from '../core/agent-runner.ts';
+import { createLauncher } from '../core/launcher-factory.ts';
+import { PodmanUnavailable, removeTaskContainer, startTaskContainer } from '../core/podman-lifecycle.ts';
 import type { RunnerId } from '../core/agent-runner.ts';
 import { modelConflictsWithRunner } from '../core/model-presets.ts';
 import { AGENT_MODELS_LOCKED_ERROR, agentModelsLocked } from '../core/agent-model-policy.ts';
@@ -47,7 +50,7 @@ import { AUTOMATIONS_PROMPT } from '../automations/prompts.ts';
 import { materializeSkillDir } from '../skills-remote.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
-import { loadConfig, resolveWorktreeRetention } from '../config.ts';
+import { loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
 import { autosaveCommit, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows } from './load.ts';
@@ -1715,6 +1718,10 @@ export class RunManager {
     // terminal path. Fire-and-forget: retention must never delay or throw into
     // the lifecycle.
     void this.enforceRetention();
+    // The task's container goes with the run, on the same terminal transition
+    // and for the same reason as its temp dir: it is scratch. The IMAGE and the
+    // cache volumes survive, so the next task still starts warm.
+    void removeTaskContainer(runId);
     // The run's temp directory (#785) goes on the same terminal transition, and
     // unconditionally — it is scratch, not an artifact, so unlike a worktree
     // there is no keep-count to respect and nothing left to recover from it. A
@@ -2542,6 +2549,36 @@ export class RunManager {
     if (!run) return;
     if (run.autoResumeAt !== undefined || run.autoResumeAttempts !== undefined) {
       this.store.updateRun(runId, { autoResumeAt: undefined, autoResumeAttempts: undefined });
+    }
+  }
+
+  /**
+   * Bring up this task's container, or explain in the run's own event log why
+   * it could not. Returns the container name, or `undefined` to run locally.
+   *
+   * A failure here is deliberately NOT fatal — a broken podman should not make
+   * the cockpit unusable — but it is deliberately loud: the run says, in the
+   * transcript the user reads, that it is executing unisolated. Silence would
+   * let a config that promises a sandbox quietly run agents on the host.
+   */
+  private async prepareSandbox(
+    runId: string,
+    sandbox: SandboxConfig | undefined,
+    backend: AgentBackend | undefined,
+    stepId: string,
+  ): Promise<string | undefined> {
+    if (!sandbox?.enabled || sandbox.provider !== 'podman') return undefined;
+    if (!backendSupportsLauncher(backend)) return undefined;
+    try {
+      return await startTaskContainer(sandbox, this.repoRoot, runId);
+    } catch (err) {
+      const why = err instanceof PodmanUnavailable ? err.message : String(err);
+      this.store.appendEvent(runId, {
+        type: 'note',
+        stepId,
+        message: `⚠ sandbox requested but the container could not be prepared — running UNISOLATED on this machine.\n${why}`,
+      });
+      return undefined;
     }
   }
 
@@ -3641,7 +3678,17 @@ export class RunManager {
     }
     this.store.updateStep(runId, stepId, { profileId: continueProfile.profileId });
 
-    const runner = createRunner(continueBackend);
+    // A Continue MUST land in a container too, and for a reason beyond
+    // isolation: the conversation it resumes lives in the AGENT's `~/.claude`,
+    // which is mounted into the container. Running it on the host sends claude
+    // looking in the operator's own `~/.claude`, where that session id has never
+    // existed — "No conversation found with session ID …", on a task that is
+    // perfectly intact.
+    const continueSandbox = (await loadConfig(this.repoRoot)).sandbox;
+    const continueContainer = await this.prepareSandbox(runId, continueSandbox, continueBackend, stepId);
+    const runner = createRunner(continueBackend, {
+      launcher: createLauncher(continueSandbox, continueContainer),
+    });
     state.currentStepId = stepId;
     this.beginUsageInvocation(runId, state, stepId);
     // A continuation's opening message becomes the session's `userPrompt` and never passes
@@ -4433,7 +4480,21 @@ export class RunManager {
     }
     this.store.updateStep(runId, step.id, { profileId: stepProfile.profileId });
 
-    const runner = createRunner(stepBackend);
+    // WHERE this step runs (this machine, or the repo's sandbox) is config, and
+    // orthogonal to WHICH agent runs it. Read per step so a config edit takes
+    // effect on the next task without a cockpit restart.
+    const sandbox = (await loadConfig(this.repoRoot)).sandbox;
+    // Never let "sandbox: enabled" read as isolation on a backend that spawns
+    // locally regardless — silence there would be the dangerous kind.
+    if (sandbox?.enabled && !backendSupportsLauncher(stepBackend)) {
+      this.store.appendEvent(runId, {
+        type: 'note',
+        stepId: step.id,
+        message: `⚠ sandbox is configured, but the ${stepBackend} runner does not support it yet — this step runs on this machine, unisolated`,
+      });
+    }
+    const containerName = await this.prepareSandbox(runId, sandbox, stepBackend, step.id);
+    const runner = createRunner(stepBackend, { launcher: createLauncher(sandbox, containerName) });
     let session: AgentSession;
     state.currentStepId = step.id;
     this.beginUsageInvocation(runId, state, step.id);
