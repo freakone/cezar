@@ -16,6 +16,7 @@ import {
   BlocksIcon,
   TicketIcon,
   ShieldCheckIcon,
+  ShieldIcon,
 } from 'lucide-react'
 import type { ComponentType, SVGProps } from 'react'
 
@@ -27,6 +28,7 @@ import { AgentsSection } from './agents-section'
 import { AppearanceSection } from './appearance'
 import { InstructionsSection } from './instructions-section'
 import { BookmarkletsSection } from './bookmarklets-section'
+import { IsolationSection } from './isolation-section'
 import { NotificationsSection } from './notifications-section'
 import { PrivacySection } from './privacy-section'
 import { ProjectsSection } from './projects-section'
@@ -62,6 +64,7 @@ export type SettingsSectionId =
   | 'agent-config'
   | 'instructions'
   | 'tasks'
+  | 'isolation'
   | 'resources'
   | 'worktrees'
   | 'projects'
@@ -161,6 +164,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     description: 'Edit the coding agents’ own config files, per scope.',
     icon: FileCogIcon,
     component: AgentConfigSection,
+    scope: 'project',
+  },
+  {
+    id: 'isolation',
+    title: 'Isolation',
+    description: 'Run this project’s agents in a container instead of on this machine.',
+    icon: ShieldIcon,
+    component: IsolationSection,
     scope: 'project',
   },
   {
