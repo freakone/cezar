@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { LaunchOpts, ProcessLauncher } from './process-launcher.ts';
 import { containerEnvPairs, guestKillScript, guestScript } from './container-runtime.ts';
 import type { SandboxConfig } from '../config.ts';
+import { credentialMountArgs, resolvePassthrough, type ResolvedCredential } from './credential-passthrough.ts';
 
 /**
  * Run the agent in a Podman container while cezar stays on the host.
@@ -65,7 +66,7 @@ export function podmanRunArgs(
   cfg: SandboxConfig,
   containerName: string,
   workspace: string,
-  opts: { credentialPassthrough: boolean } = { credentialPassthrough: true },
+  opts: { credentialPassthrough: boolean; credentials?: ResolvedCredential[] } = { credentialPassthrough: true },
 ): string[] {
   const args = [
     'run', '--detach', '--name', containerName,
@@ -90,6 +91,9 @@ export function podmanRunArgs(
   for (const target of cfg.ephemeralPaths ?? []) {
     args.push('-v', target);
   }
+  // Credentials the operator explicitly passed through. Mounts only — the
+  // copies happen after the container exists (`credentialCopyPlan`).
+  args.push(...credentialMountArgs(opts.credentials ?? resolvePassthrough(cfg.credentials)));
   args.push(imageTag(cfg), 'sleep', 'infinity');
   return args;
 }

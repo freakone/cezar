@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 
-import { putConfig } from '@/api/client'
+import { decideIsolationSuggestions, putConfig } from '@/api/client'
 import { queryKeys, useIsolationStatus } from '@/api/queries'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -39,12 +39,17 @@ export function IsolationSection() {
     },
     onError: (error: Error) => toast(error.message, { tone: 'danger' }),
   })
+  const decide = useMutation({
+    mutationFn: (body: { accept?: string[]; dismiss?: string[] }) => decideIsolationSuggestions(body),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.isolation }),
+    onError: (error: Error) => toast(error.message, { tone: 'danger' }),
+  })
 
   if (isPending || !data) {
     return <p className="text-sm text-muted-foreground">Checking this machine for a container runtime…</p>
   }
 
-  const { runtime, enabled, effective, image, hasContainerfile } = data
+  const { runtime, enabled, effective, image, hasContainerfile, suggestions } = data
   // The one case worth shouting about: the operator asked for isolation and is
   // not getting it. Every task in this state runs on the host with the
   // operator's own credentials, which is the opposite of what the switch says.
@@ -68,7 +73,7 @@ export function IsolationSection() {
       </SettingsField>
 
       {misleading ? (
-        <div className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm">
+        <div className="rounded-md border border-danger/50 bg-danger/10 p-3 text-sm">
           <p className="font-medium">Isolation is on, but tasks are running on this machine.</p>
           <p className="mt-1 text-muted-foreground">{runtime.reason}</p>
           {runtime.fix ? (
@@ -84,7 +89,7 @@ export function IsolationSection() {
         <div className="text-sm">
           {runtime.ready ? (
             <p>
-              <span className="text-emerald-600 dark:text-emerald-400">Ready</span>
+              <span className="text-success">Ready</span>
               {' — '}
               {runtime.provider}
               {runtime.version ? ` ${runtime.version}` : ''}
@@ -103,6 +108,49 @@ export function IsolationSection() {
           )}
         </div>
       </SettingsField>
+
+      {suggestions.length > 0 ? (
+        <SettingsField
+          title="Tools your agents installed"
+          hint={
+            'cezar noticed these while tasks ran. Adding them to this project’s Containerfile means the next task '
+            + 'starts with them already installed instead of installing them again.'
+          }
+        >
+          <div className="flex flex-col gap-2">
+            <ul className="flex flex-col gap-1">
+              {suggestions.map((s) => (
+                <li key={s.command} className="flex items-start gap-2 text-xs">
+                  <span className="mt-0.5 shrink-0 rounded bg-muted px-1 py-0.5 font-medium uppercase">{s.manager}</span>
+                  <code className="break-all">{s.command}</code>
+                </li>
+              ))}
+            </ul>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                disabled={decide.isPending}
+                onClick={() => decide.mutate({ accept: suggestions.map((s) => s.command) })}
+              >
+                Add to Containerfile
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={decide.isPending}
+                onClick={() => decide.mutate({ dismiss: suggestions.map((s) => s.command) })}
+              >
+                Dismiss
+              </Button>
+            </div>
+            {/* Said plainly, because the alternative reading — "nothing happened" — is
+                the one a user would otherwise reach when the current task is unaffected. */}
+            <p className="text-xs text-muted-foreground">
+              The image rebuilds before your next task. The one running now already has these.
+            </p>
+          </div>
+        </SettingsField>
+      ) : null}
 
       <SettingsField
         title="Image"
