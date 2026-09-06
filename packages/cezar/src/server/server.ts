@@ -128,6 +128,8 @@ import {
   readWorktreePath,
 } from './git-changes.ts';
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
+import { detectContainerRuntime } from '../core/container-probe.ts';
+import { imageTag } from '../core/podman-launcher.ts';
 import { findConfigFile } from '../agent-config/catalog.ts';
 import { readConfigFile, statConfigPath, writeConfigFile } from '../agent-config/files.ts';
 import { readAgentModelDefaults } from '../agent-config/models.ts';
@@ -5553,6 +5555,28 @@ export function createApp(deps: ServerDeps) {
       return c.json(await configAnswer(repoRoot, await loadConfig(repoRoot)));
     })
 
+    /**
+     * Agent isolation: what this MACHINE can do, and what this PROJECT asks for.
+     * Two questions, deliberately answered separately — a toggle that reads
+     * "on" while the container VM is stopped is a lie the run would then have
+     * to correct in its own log, so the composer renders `effective`.
+     */
+    .get('/isolation', async (c) => {
+      const repoRoot = c.get('project').root;
+      const config = await loadConfig(repoRoot);
+      const sandbox = config.sandbox;
+      const runtime = await detectContainerRuntime();
+      const enabled = sandbox?.enabled === true;
+      const containerfile = join(repoRoot, sandbox?.containerfile ?? '.ai/cezar/Containerfile');
+      return c.json({
+        runtime,
+        enabled,
+        effective: enabled && runtime.ready,
+        image: sandbox ? imageTag(sandbox) : '',
+        hasContainerfile: existsSync(containerfile),
+      });
+    })
+
     .put('/config', jsonZodValidator(() => setConfigSchema), async (c) => {
       const { root: repoRoot, dataDir } = c.get('project');
       const parsed = { data: c.req.valid('json') };
@@ -5570,6 +5594,14 @@ export function createApp(deps: ServerDeps) {
       if (parsed.data.baseBranch !== undefined) {
         if (parsed.data.baseBranch === null) delete raw.baseBranch;
         else raw.baseBranch = parsed.data.baseBranch;
+      }
+      if (parsed.data.sandbox !== undefined) {
+        // Merge, never replace: the block also carries image, cacheVolumes and
+        // credential wiring that the cockpit does not send and must not drop.
+        const existingSandbox = raw.sandbox && typeof raw.sandbox === 'object' && !Array.isArray(raw.sandbox)
+          ? raw.sandbox as Record<string, unknown>
+          : {};
+        raw.sandbox = { ...existingSandbox, ...parsed.data.sandbox };
       }
       if (parsed.data.defaultRunner !== undefined) raw.defaultRunner = parsed.data.defaultRunner;
       if (parsed.data.systemPrompt !== undefined) {
@@ -5634,6 +5666,13 @@ export function createApp(deps: ServerDeps) {
   // R6 keys) clears a knob back to its default.
   const modelPresetSchema = z.string().trim().max(200).nullable().optional();
   const setConfigSchema = z.object({
+    /**
+     * Agent isolation. Only `enabled` is settable from the cockpit: the rest of
+     * the block (image, mounts, credentials) is repo configuration a person
+     * edits deliberately, and a switch that could rewrite mount paths would be
+     * a much larger blast radius than a switch needs.
+     */
+    sandbox: z.object({ enabled: z.boolean() }).optional(),
     baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
     defaultRunner: z.enum(RUNNER_IDS).optional(),
     systemPrompt: z.string().trim().max(20_000, 'must be at most 20000 characters').nullable().optional(),
