@@ -16,6 +16,7 @@ import { backendSupportsLauncher, createRunner } from '../core/runner-factory.ts
 import type { AgentBackend } from '../core/agent-runner.ts';
 import { createLauncher } from '../core/launcher-factory.ts';
 import { PodmanUnavailable, removeTaskContainer, startTaskContainer } from '../core/podman-lifecycle.ts';
+import { noteInstalls } from '../core/containerfile-store.ts';
 import type { RunnerId } from '../core/agent-runner.ts';
 import { modelConflictsWithRunner } from '../core/model-presets.ts';
 import { AGENT_MODELS_LOCKED_ERROR, agentModelsLocked } from '../core/agent-model-policy.ts';
@@ -523,6 +524,13 @@ function formatWakeInstant(at: Date): string {
 export interface StartRunInput {
   task: string;
   model?: string;
+  /**
+   * Per-task isolation override from the composer. Absent = the project's
+   * Settings → Isolation switch decides. Persisted on the record so a Continue
+   * lands where the first turn did — a task that started in a container must
+   * not silently continue on the host, where its conversation does not exist.
+   */
+  isolated?: boolean;
   /** Agent backend chosen for this task (GUI). Unset = the config default. */
   runner?: RunnerId;
   /** Agent account for this task (spec 2026-07-29-agent-profiles), applying to steps that run
@@ -1180,6 +1188,10 @@ export class RunManager {
       // Persist the explicit opt-out so queued-run restart recovery and the
       // session Git routes can distinguish it from a removed isolated worktree.
       worktree: !group && !input.dispatchIntent && input.worktree === false ? false : undefined,
+      // Per-task isolation override, persisted so a Continue on a resumed run
+      // lands in the same place the first turn did — a task that started
+      // isolated must not silently continue on the host.
+      isolated: input.isolated,
       groupId: group?.groupId,
       variant: group?.variant,
       steps: workflow.steps.map((s) => ({ id: s.id, name: s.name ?? s.id, kind: stepKind(s) })),
@@ -2553,6 +2565,21 @@ export class RunManager {
   }
 
   /**
+   * A `Bash` tool call may have installed a system-wide tool. Record it as a
+   * Containerfile suggestion for this project.
+   *
+   * Only the SHAPE of the command is read — never its output — and only
+   * global installs count: a project's own `npm install` belongs to its
+   * lockfile, not to the image.
+   */
+  private noteToolInstall(event: { tool: string; input: unknown }): void {
+    if (event.tool !== 'Bash') return;
+    const command = (event.input as { command?: unknown } | null)?.command;
+    if (typeof command !== 'string' || command.length === 0) return;
+    noteInstalls(this.dataDir, command);
+  }
+
+  /**
    * Bring up this task's container, or explain in the run's own event log why
    * it could not. Returns the container name, or `undefined` to run locally.
    *
@@ -2566,8 +2593,13 @@ export class RunManager {
     sandbox: SandboxConfig | undefined,
     backend: AgentBackend | undefined,
     stepId: string,
+    override?: boolean,
   ): Promise<string | undefined> {
-    if (!sandbox?.enabled || sandbox.provider !== 'podman') return undefined;
+    // The per-task override wins over the project switch in BOTH directions:
+    // a task explicitly marked isolated runs in a container even if the project
+    // default is off, and one marked not-isolated stays on the host.
+    const wanted = override ?? sandbox?.enabled === true;
+    if (!wanted || sandbox?.provider !== 'podman') return undefined;
     if (!backendSupportsLauncher(backend)) return undefined;
     try {
       return await startTaskContainer(sandbox, this.repoRoot, runId);
@@ -3685,7 +3717,7 @@ export class RunManager {
     // existed — "No conversation found with session ID …", on a task that is
     // perfectly intact.
     const continueSandbox = (await loadConfig(this.repoRoot)).sandbox;
-    const continueContainer = await this.prepareSandbox(runId, continueSandbox, continueBackend, stepId);
+    const continueContainer = await this.prepareSandbox(runId, continueSandbox, continueBackend, stepId, this.store.getRun(runId)?.isolated);
     const runner = createRunner(continueBackend, {
       launcher: createLauncher(continueSandbox, continueContainer),
     });
@@ -4255,6 +4287,11 @@ export class RunManager {
         if (text) emit({ type: 'text', text, stepId: step.id });
         return;
       }
+      // Watch what the agent installs, so a repo with no Containerfile can be
+      // offered one built from the toolchain its own tasks needed. Observation
+      // only — it never writes anything a person has not accepted, and never
+      // throws into the run.
+      if (event.type === 'tool-call') this.noteToolInstall(event);
       emit({ ...event, stepId: step.id });
       if (event.type === 'error') {
         sessionError ??= event.message;
@@ -4486,14 +4523,15 @@ export class RunManager {
     const sandbox = (await loadConfig(this.repoRoot)).sandbox;
     // Never let "sandbox: enabled" read as isolation on a backend that spawns
     // locally regardless — silence there would be the dangerous kind.
-    if (sandbox?.enabled && !backendSupportsLauncher(stepBackend)) {
+    const isolationWanted = this.store.getRun(runId)?.isolated ?? sandbox?.enabled === true;
+    if (isolationWanted && !backendSupportsLauncher(stepBackend)) {
       this.store.appendEvent(runId, {
         type: 'note',
         stepId: step.id,
         message: `⚠ sandbox is configured, but the ${stepBackend} runner does not support it yet — this step runs on this machine, unisolated`,
       });
     }
-    const containerName = await this.prepareSandbox(runId, sandbox, stepBackend, step.id);
+    const containerName = await this.prepareSandbox(runId, sandbox, stepBackend, step.id, this.store.getRun(runId)?.isolated);
     const runner = createRunner(stepBackend, { launcher: createLauncher(sandbox, containerName) });
     let session: AgentSession;
     state.currentStepId = step.id;

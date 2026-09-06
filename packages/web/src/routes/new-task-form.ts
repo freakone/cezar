@@ -317,6 +317,13 @@ export function buildCreateRunBody(opts: {
   /** false → run in the repo working tree, no worktree (single runs only). Sent only when
    *  explicitly off; the default (isolated worktree) stays implicit. */
   worktree?: boolean
+  /**
+   * Per-task isolation override. Sent ONLY when the user touched the toggle:
+   * absent means "whatever the project's setting says at start time", which
+   * keeps a task started from a stale page honest rather than freezing a
+   * snapshot of the setting into the request.
+   */
+  isolated?: boolean
   /** true → autonomous run (never pauses for the user). Sent only when on. */
   autonomous?: boolean
   /** false → do not ask the agent for follow-up todos. Sent only when off. */
@@ -344,6 +351,7 @@ export function buildCreateRunBody(opts: {
     variants,
     images,
     worktree,
+    isolated,
     autonomous,
     generateFollowups,
     todoId,
@@ -363,6 +371,7 @@ export function buildCreateRunBody(opts: {
     images: images.length > 0 ? [...images] : undefined,
     // Off only matters for a single run — variants always isolate.
     worktree: worktree === false && variants <= 1 ? false : undefined,
+    isolated,
     autonomous: autonomous === true ? true : undefined,
     generateFollowups: generateFollowups === false ? false : undefined,
     todoId: todoId || undefined,

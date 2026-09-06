@@ -34,6 +34,16 @@ export interface NewTaskDraft {
   /** Worktree opt-out (#worktree-toggle): false runs in the repo working tree. null → the
    *  remembered `lastWorktree` / default (isolated worktree). */
   worktree: boolean | null
+  /**
+   * Per-task isolation override. `null` = follow the project's Settings →
+   * Isolation switch (and whether a container runtime is actually ready);
+   * `true`/`false` overrides it for this task only.
+   *
+   * Deliberately NOT sticky the way `worktree` is: isolation is a property of
+   * the project's setup rather than a way of working, so a one-off override
+   * should not silently become the default for every later task.
+   */
+  isolated: boolean | null
   /** Autonomous (#autonomous): true never pauses for the user. null → remembered
    *  `lastAutonomous` / default (off). */
   autonomous: boolean | null
@@ -132,6 +142,7 @@ const EMPTY: NewTaskDraft = {
   variants: 1,
   planFirst: false,
   worktree: null,
+  isolated: null,
   autonomous: null,
   generateFollowups: null,
   dispatch: null,
@@ -166,6 +177,10 @@ function normalize(raw: unknown): NewTaskDraft {
     model: typeof obj.model === 'string' ? obj.model : null,
     variants: obj.variants === 2 || obj.variants === 3 ? obj.variants : 1,
     planFirst: obj.planFirst === true,
+    // Tri-state on the wire too: `null` means "follow the project setting", and
+    // an older stored draft that predates this key must land there, not on a
+    // guessed boolean.
+    isolated: typeof obj.isolated === 'boolean' ? obj.isolated : null,
     worktree: typeof obj.worktree === 'boolean' ? obj.worktree : null,
     autonomous: typeof obj.autonomous === 'boolean' ? obj.autonomous : null,
     generateFollowups:

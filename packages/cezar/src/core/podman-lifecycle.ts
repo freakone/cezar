@@ -1,9 +1,10 @@
 import { execFile } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { agentClaudeHome, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import type { SandboxConfig } from '../config.ts';
+import { credentialCopyPlan, credentialEnvPairs, resolvePassthrough } from './credential-passthrough.ts';
 
 const run = promisify(execFile);
 
@@ -55,10 +56,15 @@ export async function ensureImage(
   bin = 'podman',
 ): Promise<void> {
   const tag = imageTag(cfg);
-  const exists = await run(bin, ['image', 'exists', tag]).then(() => true).catch(() => false);
-  if (exists) return;
   const containerfile = join(repoRoot, cfg.containerfile);
-  const hasFile = await run('test', ['-f', containerfile]).then(() => true).catch(() => false);
+  const hasFile = existsSync(containerfile);
+  const exists = await run(bin, ['image', 'exists', tag]).then(() => true).catch(() => false);
+  // An existing image is reused UNLESS its Containerfile has changed since it
+  // was built. That is what makes an accepted suggestion take effect on the
+  // NEXT task rather than never: without this check a stale tag would be
+  // reused forever, and rebuilding unconditionally would pay a full image
+  // build before every task, which is exactly the cost this design avoids.
+  if (exists && !(hasFile && (await containerfileIsNewer(containerfile, tag, bin)))) return;
   if (!hasFile) {
     throw new PodmanUnavailable(
       `image ${tag} is not present and ${cfg.containerfile} does not exist — ` +
@@ -66,6 +72,22 @@ export async function ensureImage(
     );
   }
   await podman(bin, podmanBuildArgs(cfg, containerfile, repoRoot));
+}
+
+/**
+ * Was the Containerfile edited after the image was built? Compares the file's
+ * mtime with the image's creation stamp. Unreadable either way answers `false`:
+ * a probe that cannot tell must not trigger a rebuild before every task.
+ */
+async function containerfileIsNewer(containerfile: string, tag: string, bin: string): Promise<boolean> {
+  try {
+    const { stdout } = await run(bin, ['image', 'inspect', tag, '--format', '{{.Created}}']);
+    const built = Date.parse(stdout.trim());
+    if (Number.isNaN(built)) return false;
+    return statSync(containerfile).mtimeMs > built;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -92,10 +114,28 @@ export async function startTaskContainer(
   // creates it root-owned inside the VM and the agent cannot write its
   // transcripts.
   mkdirSync(agentClaudeHome(), { recursive: true });
+  const credentials = resolvePassthrough(cfg.credentials);
   await podman(bin, podmanRunArgs(cfg, name, repoRoot, {
     credentialPassthrough: cfg.claudeCredentialPassthrough,
+    credentials,
   }));
+  // Copies happen after the container exists, because `podman cp` needs a
+  // target. Failing to place one is not fatal to the run: the agent will report
+  // the tool being logged out, which is a far clearer symptom than a container
+  // that refused to start.
+  for (const args of credentialCopyPlan(credentials, name)) {
+    await run(bin, args).catch(() => undefined);
+  }
   return name;
+}
+
+/**
+ * `KEY=VALUE` pairs for credentials passed through as environment variables.
+ * Applied per exec rather than baked into the container, so a token rotated on
+ * the host reaches the next turn of a long-running task.
+ */
+export function credentialEnvFor(cfg: SandboxConfig): string[] {
+  return credentialEnvPairs(resolvePassthrough(cfg.credentials));
 }
 
 /** Remove this task's container. Never throws — teardown must not fail a run. */

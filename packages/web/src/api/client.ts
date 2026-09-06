@@ -676,6 +676,20 @@ export async function getIsolationStatus(opts?: ReadOptions): Promise<IsolationS
   )
 }
 
+/**
+ * Accept or dismiss Containerfile suggestions. Accepting writes the repo's
+ * Containerfile; the image is rebuilt lazily before the NEXT task, never now.
+ */
+export async function decideIsolationSuggestions(body: { accept?: string[]; dismiss?: string[] }) {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].isolation.suggestions.$post(
+      { param: { projectId: queryScope() }, json: body },
+      init(),
+    ),
+    '/isolation/suggestions',
+  )
+}
+
 /** The selected project's agent-owned config catalog and current file state. */
 export async function getAgentConfig(opts: ReadOptions = {}): Promise<AgentConfigListing> {
   return unwrap(
