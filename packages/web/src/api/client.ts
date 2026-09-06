@@ -27,6 +27,7 @@ import type {
   ChangesPayload,
   CheckoutProjectInput,
   ConfigResponse,
+  IsolationStatusResponse,
   ReclaimWorktreesResponse,
   RemoveWorktreeResponse,
   WorktreesResponse,
@@ -650,6 +651,17 @@ export async function getConfig(opts?: ReadOptions): Promise<ConfigResponse> {
   return unwrap(
     await cez.api.v1.p[':projectId'].config.$get({ param: { projectId: queryScope() } }, init(opts)),
     '/config',
+  )
+}
+
+/**
+ * Agent isolation status (`GET /api/isolation`): what the MACHINE can do and
+ * what the PROJECT asks for, kept apart on purpose — see the contract.
+ */
+export async function getIsolationStatus(opts?: ReadOptions): Promise<IsolationStatusResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].isolation.$get({ param: { projectId: queryScope() } }, init(opts)),
+    '/isolation',
   )
 }
 

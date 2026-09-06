@@ -347,6 +347,13 @@ export type SetConfigResponse = z.infer<typeof setConfigResponseSchema>;
  * another runner's preset.
  */
 export const setConfigInputSchema = z.object({
+  /**
+   * Agent isolation. Only `enabled` crosses the wire: the rest of the repo's
+   * `sandbox` block (image, mounts, credential wiring) is configuration a
+   * person edits deliberately, and the server MERGES this patch rather than
+   * replacing the block, so a switch can never drop those keys.
+   */
+  sandbox: z.object({ enabled: z.boolean() }).optional(),
   baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
   defaultRunner: runnerSchema.optional(),
   systemPrompt: z.string().trim().max(20_000).nullable().optional(),

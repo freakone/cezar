@@ -17,6 +17,7 @@ import {
   getAgentAccountStatus,
   getAgentProfiles,
   getConfig,
+  getIsolationStatus,
   getGithub,
   getGithubChecks,
   getGithubComments,
@@ -171,6 +172,11 @@ export const queryKeys = {
   repoCommit: (sha: string) => [queryScope(), 'repo', 'commit', sha] as const,
   get uiState() {
     return [queryScope(), 'ui-state'] as const
+  },
+  /** Agent isolation for THIS project (`GET /api/isolation`): the machine's
+   *  container-runtime status plus the project's own switch. */
+  get isolation() {
+    return [queryScope(), 'isolation'] as const
   },
   /** The Settings → Agents knobs (`GET /api/config`, R6 1.5). */
   get config() {
@@ -1059,6 +1065,23 @@ export function useConfig() {
   return useQuery({
     queryKey: queryKeys.config,
     queryFn: ({ signal }) => getConfig({ signal }),
+  })
+}
+
+/**
+ * Settings → Isolation, and the composer's isolation toggle.
+ *
+ * Refetched on focus rather than polled: the answer changes when someone starts
+ * or stops the container VM OUTSIDE cezar, which is a returning-to-the-tab
+ * event, not a per-second one. Probing spawns a process, so an interval here
+ * would run `podman machine list` forever on an idle settings page.
+ */
+export function useIsolationStatus() {
+  return useQuery({
+    queryKey: queryKeys.isolation,
+    queryFn: ({ signal }) => getIsolationStatus({ signal }),
+    staleTime: 30_000,
+    refetchOnWindowFocus: true,
   })
 }
 
