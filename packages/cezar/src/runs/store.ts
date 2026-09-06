@@ -249,6 +249,13 @@ export const runRecordSchema = z.object({
   /** Explicit execution policy. `false` means the run intentionally uses the repo root;
    *  absent on older runs and for the default isolated-worktree mode. */
   worktree: z.literal(false).optional(),
+  /**
+   * Per-task isolation override from the composer (additive). Absent = the
+   * project's Settings → Isolation switch decides. Persisted because a Continue
+   * must land where the first turn did: a task that started in a container
+   * cannot silently continue on the host, where its conversation does not exist.
+   */
+  isolated: z.boolean().optional(),
   /** Task worktree (spec 006) — absent for in-place runs and after explicit cleanup. */
   worktreePath: z.string().optional(),
   /** The task's own branch (`cez/<id8>`), created off `baseBranch`. */
@@ -613,6 +620,8 @@ export class RunStore extends EventEmitter {
     title: string;
     workflow: string;
     task: string;
+    /** Per-task isolation override from the composer (see `runRecordSchema`). */
+    isolated?: boolean;
     model?: string;
     runner?: RunnerId;
     /** Composer's per-task agent account (spec 2026-07-29-agent-profiles). */

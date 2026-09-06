@@ -54,7 +54,9 @@ Options:
       --workflow <name>       workflow for \`run\` (default: quick-task)
       --model <model>         model override for \`run\`
       --no-open               don't open the browser
-      --platform <id>         server-install target (ubuntu-vps | macosx-ngrok)
+      --platform <id>         server-install target (ubuntu-vps | macosx-ngrok |
+                              macosx-cloudflare-tunnel | macosx-tailscale |
+                              macosx-caddy | macosx-external-proxy)
       --domain <host>         server-install (ubuntu-vps): host a SECOND, independent
                               cockpit for this domain (own nginx site + service + port).
                               A new domain never resumes/clobbers the first install.
@@ -62,9 +64,11 @@ Options:
                               reverse proxy owning :80/:443 (Dokploy/Traefik, Coolify,
                               Caddy, your own nginx). Installs the service only — no
                               nginx, no certbot. That proxy must provide TLS + auth.
+                              (On macOS use --platform macosx-external-proxy.)
       --bind-host <host>      host the cockpit binds (default 127.0.0.1). Use with
-                              --external-proxy when the proxy runs in a container and
-                              cannot reach loopback (e.g. docker bridge 172.17.0.1).
+                              --external-proxy / macosx-external-proxy when the proxy
+                              runs in a container and cannot reach loopback (e.g.
+                              docker bridge 172.17.0.1).
                               cezar has NO built-in auth — never expose this publicly.
       --yes                   server-install: accept safe defaults (never auto-sudo)
       --reconfigure <ids>     server-install: force re-run of step id(s), comma-separated

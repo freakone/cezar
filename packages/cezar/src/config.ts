@@ -86,6 +86,32 @@ const sandboxSchema = z.object({
    */
   ephemeralPaths: z.array(z.string().trim().min(1)).optional().catch(undefined),
   /**
+   * Which of the operator's OTHER credentials the agent may use — gh, gcloud,
+   * AWS, kube, ssh, and anything defined by hand.
+   *
+   * Nothing is passed unless named here: an isolated agent starts with no
+   * credentials at all, and each one is a deliberate widening. `mode` picks the
+   * mechanism per credential — `mount` for anything the tool refreshes in place
+   * (a cloud CLI's OAuth token), `copy` for static keys, where the container
+   * gets a snapshot it cannot write back.
+   */
+  credentials: z
+    .object({
+      enabled: z.record(z.string(), z.union([z.boolean(), z.object({ mode: z.enum(['mount', 'copy']).optional() })])).optional(),
+      custom: z
+        .array(z.object({
+          id: z.string().trim().min(1),
+          label: z.string().trim().optional(),
+          hostPath: z.string().trim().optional(),
+          guestPath: z.string().trim().optional(),
+          env: z.array(z.string().trim().min(1)).optional(),
+          mode: z.enum(['mount', 'copy']).optional(),
+        }))
+        .optional(),
+    })
+    .optional()
+    .catch(undefined),
+  /**
    * Mount the host's `~/.claude/.credentials.json` into the agent container
    * (Tier 1 passthrough): the agent gets a working login, while `projects/`,
    * `sessions/` and `history.jsonl` — your conversations — stay on the host and

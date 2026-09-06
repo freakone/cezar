@@ -105,6 +105,8 @@ import {
 } from './git-changes.ts';
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { detectContainerRuntime } from '../core/container-probe.ts';
+import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
+import { renderContainerfile } from '../core/containerfile-suggest.ts';
 import { imageTag } from '../core/podman-launcher.ts';
 import { findConfigFile } from '../agent-config/catalog.ts';
 import { readConfigFile, statConfigPath, writeConfigFile } from '../agent-config/files.ts';
@@ -5115,7 +5117,29 @@ export function createApp(deps: ServerDeps) {
         effective: enabled && runtime.ready,
         image: sandbox ? imageTag(sandbox) : '',
         hasContainerfile: existsSync(containerfile),
+        suggestions: loadProposal(c.get('project').dataDir).pending,
       });
+    })
+
+    /**
+     * Accept or dismiss the "your agents installed these" proposal.
+     *
+     * Accepting WRITES the Containerfile but does NOT rebuild the image: the
+     * container running right now already has these tools — that is where the
+     * suggestion came from — so a rebuild here would pay for an image nobody is
+     * waiting on. `ensureImage` sees the newer file and rebuilds before the NEXT
+     * task instead.
+     */
+    .post('/isolation/suggestions', jsonZodValidator(() => suggestionDecisionSchema), async (c) => {
+      const { root: repoRoot, dataDir } = c.get('project');
+      const { accept, dismiss } = c.req.valid('json');
+      const sandbox = (await loadConfig(repoRoot)).sandbox;
+      const relPath = sandbox?.containerfile ?? '.ai/cezar/Containerfile';
+      if (dismiss?.length) dismissSuggestions(dataDir, dismiss);
+      if (accept?.length) {
+        acceptSuggestions(dataDir, repoRoot, relPath, accept, (all) => renderContainerfile(all));
+      }
+      return c.json({ pending: loadProposal(dataDir).pending });
     })
 
     .put('/config', jsonZodValidator(() => setConfigSchema), async (c) => {
@@ -5206,6 +5230,11 @@ export function createApp(deps: ServerDeps) {
   // the file. All fields optional + additive: `null` (and `''` for the
   // R6 keys) clears a knob back to its default.
   const modelPresetSchema = z.string().trim().max(200).nullable().optional();
+  const suggestionDecisionSchema = z.object({
+    accept: z.array(z.string().min(1)).optional(),
+    dismiss: z.array(z.string().min(1)).optional(),
+  });
+
   const setConfigSchema = z.object({
     /**
      * Agent isolation. Only `enabled` is settable from the cockpit: the rest of

@@ -223,6 +223,8 @@ export const runRecordSchema = z.object({
   /** Explicit execution policy. `false` means the run intentionally uses the repo root;
    *  absent on older runs and for the default isolated-worktree mode. */
   worktree: z.literal(false).optional(),
+  /** Per-task isolation override, when the composer set one (additive). */
+  isolated: z.boolean().optional(),
   /** Absent for in-place runs and after an isolated worktree is removed. */
   worktreePath: z.string().optional(),
   branch: z.string().optional(),
@@ -625,6 +627,16 @@ export const createRunInputBaseSchema = z
     /** false → run in the repo working tree instead of an isolated worktree (read-only skills).
      *  Omit for the default. Ignored server-side when variants > 1. */
     worktree: z.boolean().optional(),
+    /**
+     * Per-task isolation override. Absent = the project's Settings → Isolation
+     * switch decides; `true`/`false` overrides it for THIS task only.
+     *
+     * It is an override rather than a copy of the setting because the composer
+     * shows what a task would ACTUALLY do (the setting AND a ready runtime),
+     * and a user who flips it there means "this one, differently" — not "change
+     * the project".
+     */
+    isolated: z.boolean().optional(),
     /** true → autonomous run: never parks at "waiting"; auto-continues until done. */
     autonomous: z.boolean().optional(),
     /** false → keep the handoff journal but do not expose or request a follow-up todos file.

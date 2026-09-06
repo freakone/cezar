@@ -47,5 +47,14 @@ export const isolationStatusResponseSchema = z.object({
   image: z.string(),
   /** Whether the repo has its own Containerfile, or is on the generic base. */
   hasContainerfile: z.boolean(),
+  /**
+   * Installs cezar noticed this project's agents performing, proposed for the
+   * image. Observation, not configuration: accepting one is what turns it into
+   * a `Containerfile` the user then owns, and nothing is written before that.
+   */
+  suggestions: z.array(z.object({
+    command: z.string(),
+    manager: z.enum(['apt', 'npm', 'pnpm', 'yarn', 'pip', 'pipx', 'go', 'cargo', 'gem', 'apk', 'dnf']),
+  })).default([]),
 });
 export type IsolationStatusResponse = z.infer<typeof isolationStatusResponseSchema>;

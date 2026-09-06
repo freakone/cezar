@@ -24,9 +24,16 @@ describe('macosx-ngrok', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it('is registered alongside ubuntu-vps', () => {
+  it('is registered alongside the other platforms', () => {
     expect(getStrategy('macosx-ngrok')?.id).toBe('macosx-ngrok');
-    expect(availablePlatformIds()).toEqual(['ubuntu-vps', 'macosx-ngrok']);
+    expect(availablePlatformIds()).toEqual([
+      'ubuntu-vps',
+      'macosx-ngrok',
+      'macosx-cloudflare-tunnel',
+      'macosx-tailscale',
+      'macosx-caddy',
+      'macosx-external-proxy',
+    ]);
   });
 
   it('launchdPlist embeds the port, basic-auth and reserved domain', () => {
