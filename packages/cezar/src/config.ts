@@ -264,8 +264,19 @@ function withMachineDefaults(raw: unknown, machine: WorkspaceConfig['agentDefaul
     ? own.defaultModels as Record<string, unknown>
     : undefined;
   const models = { ...machine.models, ...ownModels };
+  // The machine's isolation default applies only where the repo's `sandbox`
+  // block is SILENT about `enabled` — a repo that says `false` means false, and
+  // the machine must not override a deliberate choice with its own.
+  const ownSandbox = own.sandbox && typeof own.sandbox === 'object' && !Array.isArray(own.sandbox)
+    ? own.sandbox as Record<string, unknown>
+    : undefined;
+  const sandbox = machine.isolation !== undefined && ownSandbox?.enabled === undefined
+    ? { ...(ownSandbox ?? {}), enabled: machine.isolation }
+    : ownSandbox;
+
   return {
     ...own,
+    ...(sandbox ? { sandbox } : {}),
     ...(own.defaultRunner === undefined && machine.runner !== undefined
       ? { defaultRunner: machine.runner }
       : {}),

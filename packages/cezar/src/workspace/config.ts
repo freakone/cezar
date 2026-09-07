@@ -140,6 +140,17 @@ const composerDefaultsSchema = z
  */
 const agentDefaultsSchema = z
   .object({
+    /**
+     * Whether a repo that has said nothing runs its agents in a container.
+     *
+     * Machine-wide rather than per repo because the answer is a property of how
+     * much the operator trusts this machine's agents, not of any one project —
+     * and because the alternative is remembering to set it on every checkout.
+     * Optional with no default, like every key here: absent has to stay
+     * distinguishable from a deliberate `false`, or "the machine decides"
+     * collapses into "always off".
+     */
+    isolation: z.boolean().optional().catch(undefined),
     runner: z.enum(PROVIDER_IDS).optional().catch(undefined),
     models: z
       .object({
