@@ -191,6 +191,7 @@ import {
 } from './git-changes.ts';
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { detectContainerRuntime } from '../core/container-probe.ts';
+import { removeTaskContainer } from '../core/podman-lifecycle.ts';
 import { CREDENTIAL_CATALOG, hostPathOf } from '../core/credential-passthrough.ts';
 import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
 import { renderContainerfile } from '../core/containerfile-suggest.ts';
@@ -5280,6 +5281,10 @@ export function createApp(deps: ServerDeps) {
       if (!run) return c.json({ error: 'not found' }, 404);
       if (manager.isActive(id)) return c.json({ error: 'run is active — cancel it first' }, 409);
       if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
+      // The container is this task's materialized state exactly as the worktree
+      // is, so it goes wherever the worktree goes. Removing it in retention
+      // alone leaked one per deleted task, running forever.
+      await removeTaskContainer(id);
       store.updateRun(id, { worktreePath: undefined, branch: undefined });
       if (run.prHead) await manager.sweepPrHeadRefs();
       return c.json({ removed: true });
@@ -5293,6 +5298,7 @@ export function createApp(deps: ServerDeps) {
       if (!run) return c.json({ error: 'not found' }, 404);
       // Delete cleans up after itself: worktree + branch go with the run (spec 006).
       if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
+      await removeTaskContainer(id);
       const deleted = store.deleteRun(id);
       // The run's `refs/cezar/pr/<n>` goes with the last run that needed it (Phase 3).
       if (deleted && run.prHead) await manager.sweepPrHeadRefs();
@@ -5488,6 +5494,7 @@ export function createApp(deps: ServerDeps) {
       for (const loser of losers) {
         if (manager.isActive(loser.id)) manager.cancel(loser.id);
         if (loser.worktreePath) await removeWorktree(repoRoot, loser.worktreePath, loser.branch);
+        await removeTaskContainer(loser.id);
         store.updateRun(loser.id, { worktreePath: undefined, branch: undefined });
         store.setArchived(loser.id, true);
         store.appendEvent(loser.id, {
