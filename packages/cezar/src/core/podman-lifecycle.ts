@@ -4,9 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
-import { agentClaudeHome, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
+import { BASE_IMAGE_TAG, agentClaudeHome, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import type { SandboxConfig } from '../config.ts';
-import { credentialCopyPlan, credentialEnvPairs, resolvePassthrough } from './credential-passthrough.ts';
+import { credentialCopyPlan, resolvePassthrough } from './credential-passthrough.ts';
 
 const run = promisify(execFile);
 
@@ -52,9 +52,6 @@ async function podman(bin: string, args: string[]): Promise<string> {
  * an error: the repo simply has no image of its own and the configured (or
  * default) tag is expected to exist already — pulled, or built by hand.
  */
-/** The shared base every repo image builds FROM, shipped with cezar itself. */
-export const BASE_IMAGE_TAG = 'localhost/cezar-agent/base:latest';
-
 /** `containers/agent-base.Containerfile`, in the installed package or the checkout. */
 export function baseContainerfilePath(): string {
   // here = <pkg>/dist/core (built) or <pkg>/src/core (tsx dev).
@@ -88,9 +85,9 @@ export async function ensureImage(
   repoRoot: string,
   bin = 'podman',
 ): Promise<void> {
-  const tag = imageTag(cfg);
   const containerfile = join(repoRoot, cfg.containerfile);
   const hasFile = existsSync(containerfile);
+  const tag = imageTag(cfg, hasFile);
   const exists = await run(bin, ['image', 'exists', tag]).then(() => true).catch(() => false);
   // An existing image is reused UNLESS its Containerfile has changed since it
   // was built. That is what makes an accepted suggestion take effect on the
@@ -99,16 +96,12 @@ export async function ensureImage(
   // build before every task, which is exactly the cost this design avoids.
   if (exists && !(hasFile && (await containerfileIsNewer(containerfile, tag, bin)))) return;
   if (!hasFile) {
-    // No repo Containerfile: the base IS the image for this project. Build it
-    // rather than failing — a repo with no toolchain of its own is the ordinary
-    // case, not a misconfiguration.
+    // No repo Containerfile: the base IS the image for this project. A repo
+    // with no toolchain of its own is the ordinary case, not a
+    // misconfiguration — and the settings page promises exactly this ("tasks
+    // run on the generic base image"). Throwing here made the DEFAULT config
+    // unable to isolate at all.
     await ensureBaseImage(bin);
-    if (tag !== BASE_IMAGE_TAG) {
-      throw new PodmanUnavailable(
-        `image ${tag} is not present and ${cfg.containerfile} does not exist — ` +
-          'add a Containerfile, or point `sandbox.image` at an image that exists',
-      );
-    }
     return;
   }
   // A repo Containerfile builds FROM the base, so the base has to exist first.
@@ -165,12 +158,19 @@ export async function startTaskContainer(
     credentialPassthrough: cfg.claudeCredentialPassthrough,
     credentials,
     publishPort,
+    hasContainerfile: existsSync(join(repoRoot, cfg.containerfile)),
   }));
   // Copies happen after the container exists, because `podman cp` needs a
   // target. Failing to place one is not fatal to the run: the agent will report
   // the tool being logged out, which is a far clearer symptom than a container
   // that refused to start.
   for (const args of credentialCopyPlan(credentials, name)) {
+    // `podman cp` fails when the destination's parent is absent, and the base
+    // image has no `/root/.config/gh` or `/root/.docker`. Without this the copy
+    // failed silently and the agent reported the tool as logged out, with
+    // nothing in the run log to explain why.
+    const dest = args[2]?.split(':')[1];
+    if (dest) await run(bin, ['exec', name, 'mkdir', '-p', dirname(dest)]).catch(() => undefined);
     await run(bin, args).catch(() => undefined);
   }
   return { name, publishedPort: publishPort };
@@ -208,14 +208,6 @@ async function publishedPortOf(name: string, bin: string): Promise<number | unde
   }
 }
 
-/**
- * `KEY=VALUE` pairs for credentials passed through as environment variables.
- * Applied per exec rather than baked into the container, so a token rotated on
- * the host reaches the next turn of a long-running task.
- */
-export function credentialEnvFor(cfg: SandboxConfig): string[] {
-  return credentialEnvPairs(resolvePassthrough(cfg.credentials));
-}
 
 /** Remove this task's container. Never throws — teardown must not fail a run. */
 export async function removeTaskContainer(runId: string, bin = 'podman'): Promise<void> {
