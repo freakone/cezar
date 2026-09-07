@@ -26,6 +26,18 @@ import { SettingsField } from './settings-field'
  * actually do. When those disagree, the disagreement is the most important
  * thing on the page and is rendered as such rather than as a silent default.
  */
+/** Toggle or re-mode one credential, leaving the rest of the map untouched. */
+function nextEnabled(
+  current: Record<string, boolean | { mode?: 'mount' | 'copy' }>,
+  id: string,
+  value: boolean | { mode?: 'mount' | 'copy' },
+): Record<string, boolean | { mode?: 'mount' | 'copy' }> {
+  const next = { ...current }
+  if (value === false) delete next[id]
+  else next[id] = value
+  return next
+}
+
 export function IsolationSection() {
   const { data, isPending, refetch, isFetching } = useIsolationStatus()
   const queryClient = useQueryClient()
@@ -39,6 +51,18 @@ export function IsolationSection() {
     },
     onError: (error: Error) => toast(error.message, { tone: 'danger' }),
   })
+  const saveCredentials = useMutation({
+    mutationFn: (enabledMap: Record<string, boolean | { mode?: 'mount' | 'copy' }>) =>
+      putConfig({ sandbox: { credentials: { enabled: enabledMap } } }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.isolation }),
+    onError: (error: Error) => toast(error.message, { tone: 'danger' }),
+  })
+  const saveResources = useMutation({
+    mutationFn: (patch: { memory?: string | null; cpus?: number | null; shmSize?: string }) =>
+      putConfig({ sandbox: { resources: patch } }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.isolation }),
+    onError: (error: Error) => toast(error.message, { tone: 'danger' }),
+  })
   const decide = useMutation({
     mutationFn: (body: { accept?: string[]; dismiss?: string[] }) => decideIsolationSuggestions(body),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.isolation }),
@@ -49,7 +73,7 @@ export function IsolationSection() {
     return <p className="text-sm text-muted-foreground">Checking this machine for a container runtime…</p>
   }
 
-  const { runtime, enabled, effective, image, hasContainerfile, suggestions } = data
+  const { runtime, enabled, effective, image, hasContainerfile, suggestions, credentials, resources } = data
   // The one case worth shouting about: the operator asked for isolation and is
   // not getting it. Every task in this state runs on the host with the
   // operator's own credentials, which is the opposite of what the switch says.
@@ -151,6 +175,115 @@ export function IsolationSection() {
           </div>
         </SettingsField>
       ) : null}
+
+      <SettingsField
+        title="Container resources"
+        hint={
+          'Limits for each task container. These cap it WITHIN the container VM’s own allocation — on macOS that is '
+          + 'not your machine’s total, so raising a limit above what the VM has does nothing.'
+        }
+      >
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-muted-foreground">Memory</span>
+            <input
+              className="w-24 rounded border bg-background px-2 py-1 text-sm"
+              defaultValue={resources.memory ?? ''}
+              placeholder="VM max"
+              aria-label="Container memory limit"
+              onBlur={(e) => {
+                const value = e.target.value.trim()
+                if (value !== (resources.memory ?? '')) saveResources.mutate({ memory: value || null })
+              }}
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-muted-foreground">CPUs</span>
+            <input
+              className="w-20 rounded border bg-background px-2 py-1 text-sm"
+              defaultValue={resources.cpus ?? ''}
+              placeholder="VM max"
+              inputMode="decimal"
+              aria-label="Container CPU limit"
+              onBlur={(e) => {
+                const raw = e.target.value.trim()
+                const value = raw ? Number(raw) : null
+                if (value !== null && !Number.isFinite(value)) return
+                if (String(value ?? '') !== String(resources.cpus ?? '')) saveResources.mutate({ cpus: value })
+              }}
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-muted-foreground">/dev/shm</span>
+            <input
+              className="w-24 rounded border bg-background px-2 py-1 text-sm"
+              defaultValue={resources.shmSize}
+              aria-label="Container shared memory size"
+              onBlur={(e) => {
+                const value = e.target.value.trim()
+                if (value && value !== resources.shmSize) saveResources.mutate({ shmSize: value })
+              }}
+            />
+          </label>
+        </div>
+        {/* The one people lose a day to: podman's 64m default kills any headless
+            browser, and the crash reads as out-of-memory rather than as shared
+            memory. Say it here rather than leaving it to be rediscovered. */}
+        <p className="mt-2 text-xs text-muted-foreground">
+          Chromium and other headless browsers need roughly 1g of <code>/dev/shm</code>; the container default of 64m
+          crashes them with what looks like an out-of-memory error.
+        </p>
+      </SettingsField>
+
+      <SettingsField
+        title="Credentials the agent may use"
+        hint={
+          'An isolated agent starts with none. Each one you add is a deliberate widening — mount for anything the '
+          + 'tool refreshes in place, copy for static keys the container should not be able to write back.'
+        }
+      >
+        <ul className="flex flex-col gap-2">
+          {credentials.catalog.map((source) => {
+            const choice = credentials.enabled[source.id]
+            const on = Boolean(choice)
+            const mode = (typeof choice === 'object' && choice?.mode) || source.defaultMode
+            return (
+              <li key={source.id} className="flex flex-wrap items-center gap-2 text-sm">
+                <Switch
+                  checked={on}
+                  // A credential this machine does not have reads as unavailable,
+                  // not as "off": the two call for different next steps.
+                  disabled={!source.present || saveCredentials.isPending}
+                  onCheckedChange={(next) => saveCredentials.mutate(
+                    nextEnabled(credentials.enabled, source.id, next ? { mode } : false),
+                  )}
+                  aria-label={source.label}
+                />
+                <span className={source.present ? '' : 'text-muted-foreground'}>{source.label}</span>
+                {on ? (
+                  <select
+                    className="rounded border bg-background px-1 py-0.5 text-xs"
+                    value={mode}
+                    disabled={saveCredentials.isPending}
+                    aria-label={`${source.label} passthrough mode`}
+                    onChange={(e) => saveCredentials.mutate(
+                      nextEnabled(credentials.enabled, source.id, { mode: e.target.value as 'mount' | 'copy' }),
+                    )}
+                  >
+                    <option value="mount">mount (live)</option>
+                    <option value="copy">copy (snapshot)</option>
+                  </select>
+                ) : null}
+                {!source.present ? (
+                  <span className="text-xs text-muted-foreground">not on this machine</span>
+                ) : source.note ? (
+                  <span className="basis-full text-xs text-muted-foreground">{source.note}</span>
+                ) : null}
+              </li>
+            )
+          })}
+        </ul>
+      </SettingsField>
 
       <SettingsField
         title="Image"

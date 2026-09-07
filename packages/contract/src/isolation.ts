@@ -56,5 +56,43 @@ export const isolationStatusResponseSchema = z.object({
     command: z.string(),
     manager: z.enum(['apt', 'npm', 'pnpm', 'yarn', 'pip', 'pipx', 'go', 'cargo', 'gem', 'apk', 'dnf']),
   })).default([]),
+  /**
+   * Per-container limits. On macOS these cap a container within the podman VM's
+   * OWN allocation, not the host's — which is why a task can report 8GB on a
+   * 32GB machine, and why the VM size is a separate thing to raise.
+   */
+  resources: z.object({
+    memory: z.string().optional(),
+    cpus: z.number().optional(),
+    shmSize: z.string(),
+  }),
+  /**
+   * Which of the operator's credentials the agent may use.
+   *
+   * `catalog` is what this machine offers, with `present` saying whether the
+   * file is actually there — a credential the operator does not have must read
+   * as unavailable rather than as "off", because the two suggest different next
+   * steps. `enabled` and `custom` are the project's choices.
+   */
+  credentials: z.object({
+    catalog: z.array(z.object({
+      id: z.string(),
+      label: z.string(),
+      hostPath: z.string().optional(),
+      env: z.array(z.string()).default([]),
+      defaultMode: z.enum(['mount', 'copy']),
+      note: z.string().optional(),
+      present: z.boolean(),
+    })).default([]),
+    enabled: z.record(z.string(), z.union([z.boolean(), z.object({ mode: z.enum(['mount', 'copy']).optional() })])).default({}),
+    custom: z.array(z.object({
+      id: z.string(),
+      label: z.string().optional(),
+      hostPath: z.string().optional(),
+      guestPath: z.string().optional(),
+      env: z.array(z.string()).optional(),
+      mode: z.enum(['mount', 'copy']).optional(),
+    })).default([]),
+  }),
 });
 export type IsolationStatusResponse = z.infer<typeof isolationStatusResponseSchema>;

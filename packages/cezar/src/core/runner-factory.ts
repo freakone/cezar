@@ -16,9 +16,10 @@ import { PiRunner } from './pi-runner.ts';
  *
  * `launcher` is the orthogonal axis — WHERE the agent runs (this machine, or a
  * sandbox). It is threaded in rather than read from config here so the factory
- * stays pure and the caller owns the config read. Only the claude runner honours
- * it so far; the other three still spawn locally, and passing a launcher they
- * ignore would be a silent isolation lie, so they say so out loud instead.
+ * stays pure and the caller owns the config read. Every backend honours it:
+ * three speak stdio and only needed the spawn swapped, while opencode talks
+ * HTTP to its own process and additionally binds the port the launcher
+ * published.
  */
 export function createRunner(
   backend: AgentBackend | RunnerId | undefined,
@@ -26,13 +27,13 @@ export function createRunner(
 ): AgentRunner {
   switch (backend) {
     case 'codex':
-      return new CodexAppServerRunner();
+      return new CodexAppServerRunner({ launcher: opts.launcher });
     case 'opencode':
-      return new OpencodeServerRunner();
+      return new OpencodeServerRunner({ launcher: opts.launcher });
     case 'cursor':
       return new CursorAgentRunner();
     case 'pi':
-      return new PiRunner();
+      return new PiRunner({ launcher: opts.launcher });
     case 'junie':
       return new JunieRunner();
     case 'copilot':
@@ -44,7 +45,14 @@ export function createRunner(
   }
 }
 
-/** True when `backend` would ignore a launcher — the caller must not claim isolation. */
+/**
+ * True when `backend` honours a launcher. The engine must never claim isolation
+ * on a backend that would ignore it, so this is an allowlist of the runners that
+ * take one — a runner added without a launcher (Cursor, Junie and Copilot
+ * arrived that way) runs on the host and is reported as such, not as isolated.
+ */
+const LAUNCHER_BACKENDS: ReadonlySet<string> = new Set(['claude', 'claude-cli', 'codex', 'opencode', 'pi']);
+
 export function backendSupportsLauncher(backend: AgentBackend | RunnerId | undefined): boolean {
-  return backend === undefined || backend === 'claude' || backend === 'claude-cli';
+  return LAUNCHER_BACKENDS.has(backend ?? 'claude');
 }

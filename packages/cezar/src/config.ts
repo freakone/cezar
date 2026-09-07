@@ -125,6 +125,28 @@ const sandboxSchema = z.object({
   agent: z.string().trim().min(1).max(60).default('shell'),
   /** Create the sandbox when it does not exist yet. */
   createIfMissing: z.boolean().default(true),
+  /**
+   * Per-container resource limits. Unset = the container may use whatever the
+   * podman VM has, which on macOS is the VM's allocation and NOT the host's —
+   * the distinction that makes "why does it only see 8GB" a confusing question.
+   *
+   * `shmSize` defaults to 1g rather than podman's 64m because a headless
+   * Chromium (Playwright, Puppeteer, anything driving a browser in tests)
+   * crashes on the default, and the crash reads as an out-of-memory error
+   * rather than as a shared-memory one. 64m is right for a container that runs
+   * one process; an agent's container is a dev box.
+   */
+  resources: z
+    .object({
+      /** e.g. `4g`. Passed to `--memory`. */
+      memory: z.string().trim().min(1).max(20).optional(),
+      /** e.g. `2`. Passed to `--cpus`. */
+      cpus: z.number().positive().max(256).optional(),
+      /** e.g. `1g`. Passed to `--shm-size`. */
+      shmSize: z.string().trim().min(1).max(20).default('1g'),
+    })
+    .default({ shmSize: '1g' })
+    .catch({ shmSize: '1g' }),
   /** Container-local scratch for the agent. MUST NOT be inside the bind-mounted
    *  workspace: the native claude binary cannot do its startup temp-file work
    *  on that mount and dies with `ENOENT … fstat`. */
