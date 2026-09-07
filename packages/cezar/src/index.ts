@@ -685,6 +685,11 @@ function ensureDataGitignore(repoRoot: string): void {
     'automation-log.ndjson',
     'automation-log.ndjson.tmp',
     'automation-poll.lock',
+    // Observed installs proposed for the repo's Containerfile: cezar wrote it
+    // by watching, the user never typed it. The Containerfile it produces IS
+    // committable and deliberately absent from this list.
+    'container-suggestions.json',
+    'container-suggestions.json.tmp',
   ];
   try {
     mkdirSync(join(repoRoot, '.ai/cezar'), { recursive: true });

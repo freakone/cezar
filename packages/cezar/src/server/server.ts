@@ -581,6 +581,8 @@ const startRunSchema = z
     // Composer worktree opt-out (#worktree-toggle): false runs in the repo
     // working tree. Ignored when variants > 1.
     worktree: z.boolean().optional(),
+    /** Per-task isolation override; absent = the project's Settings switch. */
+    isolated: z.boolean().optional(),
     // Autonomous mode (#autonomous): the run never parks at `waiting` — it
     // auto-continues until the agent signals done. No "needs you" is raised.
     autonomous: z.boolean().optional(),
@@ -3572,6 +3574,10 @@ export function createApp(deps: ServerDeps) {
         images,
         systemPrompt: parsed.data.systemPrompt,
         worktree: parsed.data.worktree,
+        // The composer's per-task isolation override. Absent = the project's
+        // Settings → Isolation switch decides; dropping it here made the chip
+        // decorative and left a Continue with nothing to land back into.
+        isolated: parsed.data.isolated,
         autonomous: parsed.data.autonomous,
         // Opt-in inbox (#471): the capability is the ceiling, so a client asking
         // for follow-ups on a server that has them off gets a plain `false`
