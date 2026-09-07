@@ -26,6 +26,16 @@ export interface ProcessLauncher {
   readonly id: 'local' | 'sbx' | 'podman';
   /** One line naming where this launcher puts the agent — shown in run notes. */
   describe(): string;
+  /**
+   * A host port forwarded into the container, for a backend that talks HTTP to
+   * its own agent process (opencode `serve`) rather than over stdio.
+   *
+   * `undefined` on the local launcher, where there is nothing to forward. A
+   * backend that needs one and does not get one must NOT silently bind a random
+   * port: inside a container that port is unreachable from the host, and the
+   * failure looks like a hung agent rather than a networking mistake.
+   */
+  readonly publishedPort?: number;
   spawn(bin: string, args: string[], opts: LaunchOpts): ChildProcessWithoutNullStreams;
   /**
    * Deliver `sig` to the agent process. Resolves once the signal has been

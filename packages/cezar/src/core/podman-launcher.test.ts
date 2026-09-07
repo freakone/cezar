@@ -15,6 +15,7 @@ const cfg = (over: Partial<SandboxConfig> = {}): SandboxConfig => ({
   unsetPlaceholderCredentials: true,
   containerfile: '.ai/cezar/Containerfile',
   claudeCredentialPassthrough: true,
+  resources: { shmSize: '1g' },
   ...over,
 });
 
@@ -71,6 +72,31 @@ describe('podman launcher', () => {
     expect(args).not.toContain(`/Users/k/work/app/web/node_modules:/Users/k/work/app/web/node_modules`);
   });
 
+  it('shm defaults to 1g — podman\'s 64m kills any headless browser the agent starts', () => {
+    // And it fails as an out-of-memory error, not a shared-memory one, which is
+    // why the default is set here rather than left to whoever debugs it.
+    const args = podmanRunArgs(cfg(), 'cez-run1', REPO);
+    expect(args).toContain('--shm-size');
+    expect(args[args.indexOf('--shm-size') + 1]).toBe('1g');
+  });
+
+  it('memory and cpu limits are passed when set, and omitted when not', () => {
+    const limited = podmanRunArgs(cfg({ resources: { shmSize: '2g', memory: '6g', cpus: 4 } }), 'c', REPO);
+    expect(limited).toContain('--memory');
+    expect(limited).toContain('6g');
+    expect(limited).toContain('--cpus');
+    expect(limited).toContain('4');
+    // Unset means "whatever the VM has" — NOT a guessed cap.
+    expect(podmanRunArgs(cfg(), 'c', REPO)).not.toContain('--memory');
+  });
+
+  it('publishes a loopback port for HTTP-speaking backends only when asked', () => {
+    const withPort = podmanRunArgs(cfg(), 'c', REPO, { credentialPassthrough: true, publishPort: 41234 });
+    expect(withPort).toContain('-p');
+    expect(withPort).toContain('127.0.0.1:41234:41234');
+    expect(podmanRunArgs(cfg(), 'c', REPO)).not.toContain('-p');
+  });
+
   it('the image is per repo and prepared once, not built per task', () => {
     expect(imageTag(cfg())).toBe('cezar-agent/textbook:latest');
     expect(imageTag(cfg({ image: 'my/toolchain:v3' }))).toBe('my/toolchain:v3');
@@ -96,7 +122,7 @@ describe('podman launcher', () => {
   it('podman without a container falls back to local rather than faking isolation', () => {
     // A misconfigured run must not silently exec into nothing.
     expect(createLauncher(cfg())).toBe(localLauncher);
-    expect(createLauncher(cfg(), 'cez-run1').id).toBe('podman');
-    expect(createLauncher(cfg(), 'cez-run1').describe()).toContain('cez-run1');
+    expect(createLauncher(cfg(), { name: 'cez-run1' }).id).toBe('podman');
+    expect(createLauncher(cfg(), { name: 'cez-run1' }).describe()).toContain('cez-run1');
   });
 });

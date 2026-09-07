@@ -129,6 +129,7 @@ import {
 } from './git-changes.ts';
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { detectContainerRuntime } from '../core/container-probe.ts';
+import { CREDENTIAL_CATALOG, hostPathOf } from '../core/credential-passthrough.ts';
 import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
 import { renderContainerfile } from '../core/containerfile-suggest.ts';
 import { imageTag } from '../core/podman-launcher.ts';
@@ -5577,6 +5578,22 @@ export function createApp(deps: ServerDeps) {
         image: sandbox ? imageTag(sandbox) : '',
         hasContainerfile: existsSync(containerfile),
         suggestions: loadProposal(c.get('project').dataDir).pending,
+        resources: sandbox?.resources ?? { shmSize: '1g' },
+        credentials: {
+          catalog: CREDENTIAL_CATALOG.map((source) => ({
+            id: source.id,
+            label: source.label,
+            hostPath: hostPathOf(source),
+            env: source.env ?? [],
+            defaultMode: source.defaultMode,
+            note: source.note,
+            // Whether it is actually on this machine: a credential the operator
+            // does not have should read as unavailable, not as "off".
+            present: source.hostPath ? existsSync(hostPathOf(source) ?? '') : true,
+          })),
+          enabled: sandbox?.credentials?.enabled ?? {},
+          custom: sandbox?.credentials?.custom ?? [],
+        },
       });
     })
 
@@ -5625,7 +5642,22 @@ export function createApp(deps: ServerDeps) {
         const existingSandbox = raw.sandbox && typeof raw.sandbox === 'object' && !Array.isArray(raw.sandbox)
           ? raw.sandbox as Record<string, unknown>
           : {};
-        raw.sandbox = { ...existingSandbox, ...parsed.data.sandbox };
+        // Nested blocks merge too: a page that edits only `resources.memory`
+        // must not drop the credential selection sitting beside it.
+        const patch = { ...parsed.data.sandbox } as Record<string, unknown>;
+        for (const key of ['resources', 'credentials'] as const) {
+          const incoming = patch[key];
+          if (incoming === undefined) continue;
+          const existing = existingSandbox[key];
+          const base = existing && typeof existing === 'object' && !Array.isArray(existing)
+            ? existing as Record<string, unknown>
+            : {};
+          const merged: Record<string, unknown> = { ...base, ...(incoming as Record<string, unknown>) };
+          // `null` clears a key rather than storing a null the schema would reject.
+          for (const [k, v] of Object.entries(merged)) if (v === null) delete merged[k];
+          patch[key] = merged;
+        }
+        raw.sandbox = { ...existingSandbox, ...patch };
       }
       if (parsed.data.defaultRunner !== undefined) raw.defaultRunner = parsed.data.defaultRunner;
       if (parsed.data.systemPrompt !== undefined) {
@@ -5701,7 +5733,33 @@ export function createApp(deps: ServerDeps) {
      * edits deliberately, and a switch that could rewrite mount paths would be
      * a much larger blast radius than a switch needs.
      */
-    sandbox: z.object({ enabled: z.boolean() }).optional(),
+    sandbox: z
+      .object({
+        enabled: z.boolean().optional(),
+        resources: z
+          .object({
+            memory: z.string().trim().min(1).max(20).nullable().optional(),
+            cpus: z.number().positive().max(256).nullable().optional(),
+            shmSize: z.string().trim().min(1).max(20).optional(),
+          })
+          .optional(),
+        credentials: z
+          .object({
+            enabled: z.record(z.string(), z.union([z.boolean(), z.object({ mode: z.enum(['mount', 'copy']).optional() })])).optional(),
+            custom: z
+              .array(z.object({
+                id: z.string().trim().min(1),
+                label: z.string().trim().optional(),
+                hostPath: z.string().trim().optional(),
+                guestPath: z.string().trim().optional(),
+                env: z.array(z.string().trim().min(1)).optional(),
+                mode: z.enum(['mount', 'copy']).optional(),
+              }))
+              .optional(),
+          })
+          .optional(),
+      })
+      .optional(),
     baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
     defaultRunner: z.enum(RUNNER_IDS).optional(),
     systemPrompt: z.string().trim().max(20_000, 'must be at most 20000 characters').nullable().optional(),

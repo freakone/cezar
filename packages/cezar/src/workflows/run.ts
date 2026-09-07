@@ -15,7 +15,7 @@ import { parseUsageLimit } from '../core/usage-limit.ts';
 import { backendSupportsLauncher, createRunner } from '../core/runner-factory.ts';
 import type { AgentBackend } from '../core/agent-runner.ts';
 import { createLauncher } from '../core/launcher-factory.ts';
-import { PodmanUnavailable, removeTaskContainer, startTaskContainer } from '../core/podman-lifecycle.ts';
+import { PodmanUnavailable, removeTaskContainer, startTaskContainer, type TaskContainer } from '../core/podman-lifecycle.ts';
 import { noteInstalls } from '../core/containerfile-store.ts';
 import type { RunnerId } from '../core/agent-runner.ts';
 import { modelConflictsWithRunner } from '../core/model-presets.ts';
@@ -1730,10 +1730,6 @@ export class RunManager {
     // terminal path. Fire-and-forget: retention must never delay or throw into
     // the lifecycle.
     void this.enforceRetention();
-    // The task's container goes with the run, on the same terminal transition
-    // and for the same reason as its temp dir: it is scratch. The IMAGE and the
-    // cache volumes survive, so the next task still starts warm.
-    void removeTaskContainer(runId);
     // The run's temp directory (#785) goes on the same terminal transition, and
     // unconditionally — it is scratch, not an artifact, so unlike a worktree
     // there is no keep-count to respect and nothing left to recover from it. A
@@ -2594,7 +2590,7 @@ export class RunManager {
     backend: AgentBackend | undefined,
     stepId: string,
     override?: boolean,
-  ): Promise<string | undefined> {
+  ): Promise<TaskContainer | undefined> {
     // The per-task override wins over the project switch in BOTH directions:
     // a task explicitly marked isolated runs in a container even if the project
     // default is off, and one marked not-isolated stays on the host.
@@ -2620,7 +2616,18 @@ export class RunManager {
   private async enforceRetention(): Promise<void> {
     try {
       const keep = await resolveWorktreeRetention(this.repoRoot);
-      await reclaimWorktrees(this.repoRoot, this.store, keep);
+      const reclaimed = await reclaimWorktrees(this.repoRoot, this.store, keep);
+      // A task's container has the same lifetime as its worktree: both are the
+      // task's materialized state, and both are recoverable only while they
+      // exist. Removing the container on every terminal transition — which is
+      // what this used to do — threw away an environment the next Continue
+      // needed, and a run that FAILS is exactly the one most likely to be
+      // continued. An hour of installed services died with each failure.
+      //
+      // Retention already answers "is this task still live enough to keep its
+      // disk state?", so the container follows that answer rather than
+      // inventing a second, harsher policy.
+      for (const runId of reclaimed) void removeTaskContainer(runId);
     } catch {
       // retention is best-effort; swallow so terminal transitions never break.
     }
@@ -4531,8 +4538,8 @@ export class RunManager {
         message: `⚠ sandbox is configured, but the ${stepBackend} runner does not support it yet — this step runs on this machine, unisolated`,
       });
     }
-    const containerName = await this.prepareSandbox(runId, sandbox, stepBackend, step.id, this.store.getRun(runId)?.isolated);
-    const runner = createRunner(stepBackend, { launcher: createLauncher(sandbox, containerName) });
+    const container = await this.prepareSandbox(runId, sandbox, stepBackend, step.id, this.store.getRun(runId)?.isolated);
+    const runner = createRunner(stepBackend, { launcher: createLauncher(sandbox, container) });
     let session: AgentSession;
     state.currentStepId = step.id;
     this.beginUsageInvocation(runId, state, step.id);

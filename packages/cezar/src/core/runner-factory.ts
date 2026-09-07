@@ -13,9 +13,10 @@ import { PiRunner } from './pi-runner.ts';
  *
  * `launcher` is the orthogonal axis — WHERE the agent runs (this machine, or a
  * sandbox). It is threaded in rather than read from config here so the factory
- * stays pure and the caller owns the config read. Only the claude runner honours
- * it so far; the other three still spawn locally, and passing a launcher they
- * ignore would be a silent isolation lie, so they say so out loud instead.
+ * stays pure and the caller owns the config read. Every backend honours it:
+ * three speak stdio and only needed the spawn swapped, while opencode talks
+ * HTTP to its own process and additionally binds the port the launcher
+ * published.
  */
 export function createRunner(
   backend: AgentBackend | RunnerId | undefined,
@@ -23,11 +24,11 @@ export function createRunner(
 ): AgentRunner {
   switch (backend) {
     case 'codex':
-      return new CodexAppServerRunner();
+      return new CodexAppServerRunner({ launcher: opts.launcher });
     case 'opencode':
-      return new OpencodeServerRunner();
+      return new OpencodeServerRunner({ launcher: opts.launcher });
     case 'pi':
-      return new PiRunner();
+      return new PiRunner({ launcher: opts.launcher });
     case 'claude':
     case 'claude-cli':
     default:
@@ -35,7 +36,11 @@ export function createRunner(
   }
 }
 
-/** True when `backend` would ignore a launcher — the caller must not claim isolation. */
-export function backendSupportsLauncher(backend: AgentBackend | RunnerId | undefined): boolean {
-  return backend === undefined || backend === 'claude' || backend === 'claude-cli';
+/**
+ * True when `backend` honours a launcher. Every backend does now; the predicate
+ * stays because the engine must never claim isolation on a backend that would
+ * ignore it, and a fifth runner would arrive spawning locally.
+ */
+export function backendSupportsLauncher(_backend: AgentBackend | RunnerId | undefined): boolean {
+  return true;
 }
