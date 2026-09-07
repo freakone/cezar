@@ -184,6 +184,10 @@ class OpencodeSession implements AgentSession {
     //    listening only on the container's own loopback and cezar sees a hung
     //    agent rather than a networking mistake.
     const published = this.launcher.publishedPort;
+    // The server prints the address it BOUND. Inside a container that is the
+    // wildcard, which is not a valid destination to dial — the published
+    // mapping is on loopback, so that is what the host must connect to.
+
     const port = published ?? 40000 + Math.floor(Math.random() * 20000);
     const hostname = published ? '0.0.0.0' : '127.0.0.1';
     try {
@@ -224,7 +228,7 @@ class OpencodeSession implements AgentSession {
     this.child.stderr.on('data', (chunk: string) => stderrChunks.push(chunk));
 
     // The server prints its URL on stdout once listening.
-    const urlReady = this.waitForServerUrl();
+    const urlReady = this.waitForServerUrl(, published ? '127.0.0.1' : undefined);
 
     const limitMs = spec.timeoutMs ?? timeoutMs;
     let deadline: NodeJS.Timeout | undefined;
@@ -360,7 +364,7 @@ class OpencodeSession implements AgentSession {
 
   // ---- server lifecycle ---------------------------------------------------
 
-  private waitForServerUrl(): Promise<string> {
+  private waitForServerUrl(, dialHost?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       let buffer = '';
       const timer = setTimeout(() => {
@@ -373,7 +377,11 @@ class OpencodeSession implements AgentSession {
         const m = /https?:\/\/[\d.]+:\d+/.exec(buffer);
         if (m) {
           cleanup();
-          resolve(m[0]);
+          // The server prints the address it BOUND. In a container that is the
+          // wildcard `0.0.0.0`, which is not a valid destination to dial — the
+          // published mapping is on loopback, so rewrite the host rather than
+          // relying on 0.0.0.0 happening to route locally.
+          resolve(dialHost ? m[0].replace(/\/\/[\d.]+:/, `//${dialHost}:`) : m[0]);
         }
       };
       const onExit = () => {

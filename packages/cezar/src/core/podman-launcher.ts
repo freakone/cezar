@@ -1,11 +1,12 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { LaunchOpts, ProcessLauncher } from './process-launcher.ts';
 import { containerEnvPairs, guestKillScript, guestScript } from './container-runtime.ts';
 import type { SandboxConfig } from '../config.ts';
-import { credentialMountArgs, resolvePassthrough, type ResolvedCredential } from './credential-passthrough.ts';
+import { credentialEnvPairs, credentialMountArgs, resolvePassthrough, type ResolvedCredential } from './credential-passthrough.ts';
 
 /**
  * Run the agent in a Podman container while cezar stays on the host.
@@ -47,9 +48,21 @@ export function hostClaudeCredential(): string {
   return join(homedir(), '.claude', '.credentials.json');
 }
 
-/** Image tag for a repo's prepared image. Derived, so it is stable per repo. */
-export function imageTag(cfg: SandboxConfig): string {
-  return cfg.image ?? `cezar-agent/${cfg.name}:latest`;
+/** The shared base every repo image builds FROM, shipped with cezar itself. */
+export const BASE_IMAGE_TAG = 'localhost/cezar-agent/base:latest';
+
+/**
+ * The image a repo's containers run.
+ *
+ * An explicit `sandbox.image` wins. Otherwise a repo gets its own derived tag
+ * ONLY when it has a Containerfile to build that tag from — without one there
+ * is nothing to build, and naming a tag that will never exist makes `podman
+ * run` fail on the default configuration. Such a repo runs the base, which is
+ * exactly what the settings page promises it will.
+ */
+export function imageTag(cfg: SandboxConfig, hasContainerfile = true): string {
+  if (cfg.image) return cfg.image;
+  return hasContainerfile ? `cezar-agent/${cfg.name}:latest` : BASE_IMAGE_TAG;
 }
 
 /** `podman build` argv for a repo's image. Run once per Containerfile change. */
@@ -71,6 +84,10 @@ export function podmanRunArgs(
     credentials?: ResolvedCredential[];
     /** Forwarded to the host on loopback, for HTTP-speaking backends. */
     publishPort?: number;
+    /** Whether the repo has a Containerfile — decides base vs derived tag. */
+    hasContainerfile?: boolean;
+    /** Injectable for tests; defaults to a real filesystem check. */
+    credentialExists?: (path: string) => boolean;
   } = { credentialPassthrough: true },
 ): string[] {
   const args = [
@@ -81,8 +98,13 @@ export function podmanRunArgs(
     // from here and impossible to strand inside a container that is gone.
     '-v', `${agentClaudeHome()}:/root/.claude`,
   ];
-  if (opts.credentialPassthrough) {
-    // Only the credential file — never `projects/`, `sessions/` or history.
+  // Only the credential file — never `projects/`, `sessions/` or history — and
+  // only when it EXISTS. Podman creates a missing bind source as a DIRECTORY,
+  // so mounting blindly would leave a directory named `.credentials.json` in
+  // the operator's real `~/.claude` — on macOS, where Claude Code may keep its
+  // token in the Keychain and that file legitimately does not exist. Every
+  // other credential here is skipped-with-a-reason when absent; so is this one.
+  if (opts.credentialPassthrough && (opts.credentialExists ?? existsSync)(hostClaudeCredential())) {
     args.push('-v', `${hostClaudeCredential()}:/root/.claude/.credentials.json`);
   }
   // Package caches survive the per-task container, so a fresh container still
@@ -108,7 +130,7 @@ export function podmanRunArgs(
   if (cfg.resources?.shmSize) args.push('--shm-size', cfg.resources.shmSize);
   if (cfg.resources?.memory) args.push('--memory', cfg.resources.memory);
   if (cfg.resources?.cpus) args.push('--cpus', String(cfg.resources.cpus));
-  args.push(imageTag(cfg), 'sleep', 'infinity');
+  args.push(imageTag(cfg, opts.hasContainerfile ?? true), 'sleep', 'infinity');
   return args;
 }
 
@@ -122,7 +144,13 @@ export function podmanExecArgs(
   pidFile: string,
 ): string[] {
   const env = { ...opts.env, CEZ_PID_FILE: pidFile };
-  const envArgs = containerEnvPairs(env, cfg.tmpdir).flatMap((pair) => ['-e', pair]);
+  // Credentials passed as environment variables (AWS_PROFILE, a custom
+  // STRIPE_API_KEY…). Applied per EXEC rather than baked into the container, so
+  // a token rotated on the host reaches the next turn of a long task. Read from
+  // the host env, not from `opts.env`, which `buildChildEnv` has already
+  // filtered — that filtering is why they were absent before.
+  const credentialEnv = credentialEnvPairs(resolvePassthrough(cfg.credentials));
+  const envArgs = [...containerEnvPairs(env, cfg.tmpdir), ...credentialEnv].flatMap((pair) => ['-e', pair]);
   return [
     'exec',
     // `-i` keeps stdin open for the stream-json conversation. No `-t`: cezar
@@ -132,7 +160,12 @@ export function podmanExecArgs(
     '-w', opts.cwd,
     ...envArgs,
     containerName,
-    'sh', '-c', guestScript(cfg.unsetPlaceholderCredentials ? ['ANTHROPIC_API_KEY', 'GH_TOKEN'] : []),
+    // NOT `unsetPlaceholderCredentials`: that exists because *sbx* injects
+    // `ANTHROPIC_API_KEY=proxy-managed` and a fake GH_TOKEN into PID 1. Podman
+    // injects nothing, and `buildChildEnv` forwards the host's REAL
+    // `ANTHROPIC_*` and `GH_TOKEN` in the `-e` pairs above — unsetting them
+    // here would delete the only credential an API-key user has.
+    'sh', '-c', guestScript([]),
     'cez-podman', bin, ...args,
   ];
 }

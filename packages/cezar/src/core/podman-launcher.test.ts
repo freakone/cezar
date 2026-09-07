@@ -40,6 +40,36 @@ describe('podman launcher', () => {
     expect(args).not.toContain('history.jsonl');
   });
 
+  it('NEVER mounts a credential that is absent — podman would create a directory', () => {
+    // On a host where Claude Code keeps its token in the Keychain, that file
+    // legitimately does not exist. Mounting blindly leaves a DIRECTORY named
+    // `.credentials.json` inside the operator's real ~/.claude.
+    const args = podmanRunArgs(cfg(), 'c', REPO, {
+      credentialPassthrough: true,
+      credentialExists: () => false,
+    }).join(' ');
+    expect(args).not.toContain('.credentials.json');
+  });
+
+  it('a repo with no Containerfile runs the BASE image, not a tag that cannot exist', () => {
+    // The derived tag is only buildable when there is a Containerfile to build
+    // it from; naming it anyway made the default configuration unable to run.
+    expect(imageTag(cfg(), false)).toBe('localhost/cezar-agent/base:latest');
+    expect(imageTag(cfg(), true)).toBe('cezar-agent/textbook:latest');
+    // An explicit pin still wins over both.
+    expect(imageTag(cfg({ image: 'my/img:1' }), false)).toBe('my/img:1');
+    expect(podmanRunArgs(cfg(), 'c', REPO, { credentialPassthrough: false, hasContainerfile: false }))
+      .toContain('localhost/cezar-agent/base:latest');
+  });
+
+  it('does NOT unset ANTHROPIC_API_KEY/GH_TOKEN — that is an sbx quirk', () => {
+    // sbx injects placeholders into PID 1; podman injects nothing, and
+    // buildChildEnv forwards the host's REAL keys. Unsetting them here deleted
+    // the only credential an API-key user has.
+    const args = podmanExecArgs(cfg(), 'c', 'claude', [], { cwd: REPO, env: {} }, '/tmp/p.pid');
+    expect(args.join(' ')).not.toContain('unset ANTHROPIC_API_KEY');
+  });
+
   it('read-write on the credential: claude rewrites it when the token refreshes', () => {
     const mount = podmanRunArgs(cfg(), 'cez-run1', REPO)
       .find((a) => a.includes('.credentials.json'));
