@@ -2633,8 +2633,12 @@ export class RunManager {
       // the moment the run is finished: there is no worktree to inspect, so
       // nothing about it is worth keeping warm for a Continue that has no
       // isolated tree to return to.
-      const run = this.store.getRun(runId);
-      if (run?.worktree === false) void removeTaskContainer(runId);
+      // `runId` is absent when retention runs at startup rather than on a
+      // terminal transition; there is no single run to special-case then.
+      if (runId) {
+        const run = this.store.getRun(runId);
+        if (run?.worktree === false) void removeTaskContainer(runId);
+      }
     } catch {
       // retention is best-effort; swallow so terminal transitions never break.
     }

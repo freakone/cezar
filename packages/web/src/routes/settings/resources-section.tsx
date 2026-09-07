@@ -132,6 +132,34 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
       className="mx-auto flex w-full max-w-2xl flex-col gap-7 p-4 pb-[calc(90px+env(safe-area-inset-bottom))] md:p-6 md:pb-6"
     >
       <SettingsField
+        title="Isolate agents by default"
+        hint={
+          'What a project that has not chosen for itself does. A project can still override this '
+          + 'either way in its own Isolation settings, and a single task can override it in the composer.'
+        }
+      >
+        <select
+          aria-label="Isolate agents by default"
+          data-slot="resources-isolation-default"
+          // Three states, not two: "no opinion" has to stay distinguishable
+          // from a deliberate off, or a project that never chose would be
+          // permanently overridden by a default nobody set.
+          value={config.agentDefaults.isolation === undefined ? 'unset' : String(config.agentDefaults.isolation)}
+          disabled={save.isPending}
+          onChange={(event) => save.mutate({
+            agentDefaults: {
+              isolation: event.target.value === 'unset' ? null : event.target.value === 'true',
+            },
+          })}
+          className="block w-44 rounded-md border border-input bg-card px-3 py-1.5 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50"
+        >
+          <option value="unset">No opinion (off)</option>
+          <option value="true">Isolate</option>
+          <option value="false">Do not isolate</option>
+        </select>
+      </SettingsField>
+
+      <SettingsField
         title="Max parallel tasks"
         hint="How many tasks run at once across every project. The rest wait in the queue. A non-git directory always runs one at a time."
       >

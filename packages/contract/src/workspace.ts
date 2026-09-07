@@ -58,6 +58,8 @@ export const workspaceConfigResponseSchema = z.object({
    * the repo's own `.ai/cezar/config.json` is silent — a repo that chose is never overruled.
    */
   agentDefaults: z.object({
+    /** Whether a repo that has said nothing isolates its agents. */
+    isolation: z.boolean().optional(),
     runner: runnerSchema.optional(),
     models: z.object({
       claude: z.string().optional(),
@@ -90,6 +92,7 @@ export const setWorkspaceConfigInputSchema = z.object({
    *  absent key cannot say in a partial patch. */
   agentDefaults: z
     .object({
+      isolation: z.boolean().nullable().optional(),
       runner: runnerSchema.nullable().optional(),
       models: z
         .object({
