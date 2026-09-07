@@ -3383,6 +3383,7 @@ export function createApp(deps: ServerDeps) {
     // `JSON.stringify` drops it, which is the exact drift `contract-parity` catches. And absent has
     // to keep meaning "no opinion" here, or the fallback collapses into "always claude".
     agentDefaults: {
+      ...(config.agentDefaults.isolation !== undefined ? { isolation: config.agentDefaults.isolation } : {}),
       ...(config.agentDefaults.runner !== undefined ? { runner: config.agentDefaults.runner } : {}),
       ...(config.agentDefaults.models !== undefined ? { models: config.agentDefaults.models } : {}),
     },
@@ -3470,6 +3471,8 @@ export function createApp(deps: ServerDeps) {
           }
           // `null` CLEARS back to "no opinion" — a partial patch cannot say that by omission,
           // and leaving a stale runner behind would keep overriding repos that never chose.
+          if (agentDefaults?.isolation === null) delete config.agentDefaults.isolation;
+          else if (agentDefaults?.isolation !== undefined) config.agentDefaults.isolation = agentDefaults.isolation;
           if (agentDefaults?.runner === null) delete config.agentDefaults.runner;
           else if (agentDefaults?.runner !== undefined) config.agentDefaults.runner = agentDefaults.runner;
           for (const runner of PROVIDER_IDS) {

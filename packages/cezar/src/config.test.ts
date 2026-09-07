@@ -157,6 +157,58 @@ describe('loadConfig systemPrompt', () => {
  * only *seeds* repos that set none, which is exactly what Settings → Worktrees
  * tells the user, so the precedence is the contract under test here.
  */
+describe('machine-wide isolation default', () => {
+  let repoRoot: string;
+  let cezHome: string;
+  const savedHome = process.env.CEZ_HOME;
+
+  beforeEach(() => {
+    repoRoot = mkdtempSync(join(tmpdir(), 'cez-isolation-'));
+    mkdirSync(join(repoRoot, '.ai/cezar'), { recursive: true });
+    cezHome = mkdtempSync(join(tmpdir(), 'cez-home-iso-'));
+    process.env.CEZ_HOME = cezHome;
+  });
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.CEZ_HOME;
+    else process.env.CEZ_HOME = savedHome;
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(cezHome, { recursive: true, force: true });
+  });
+
+  const writeRepo = (value: unknown) =>
+    writeFileSync(join(repoRoot, '.ai/cezar', 'config.json'), JSON.stringify(value), 'utf8');
+  const writeWorkspace = (value: unknown) =>
+    writeFileSync(join(cezHome, 'config.json'), JSON.stringify(value), 'utf8');
+
+  it('applies when the repo says nothing about isolation', async () => {
+    writeWorkspace({ agentDefaults: { isolation: true } });
+    writeRepo({ sandbox: { name: 'app' } });
+    expect((await loadConfig(repoRoot)).sandbox?.enabled).toBe(true);
+  });
+
+  it('applies when the repo has no sandbox block at all', async () => {
+    writeWorkspace({ agentDefaults: { isolation: true } });
+    expect((await loadConfig(repoRoot)).sandbox?.enabled).toBe(true);
+  });
+
+  it('NEVER overrides a repo that chose — an explicit false is a decision', async () => {
+    // The three-state rule. Collapsing "absent" and "false" here would let a
+    // machine default permanently overrule a project that opted out.
+    writeWorkspace({ agentDefaults: { isolation: true } });
+    writeRepo({ sandbox: { enabled: false } });
+    expect((await loadConfig(repoRoot)).sandbox?.enabled).toBe(false);
+  });
+
+  it('a machine with no opinion leaves the repo exactly as it was', async () => {
+    writeWorkspace({});
+    writeRepo({ sandbox: { enabled: true, name: 'app' } });
+    expect((await loadConfig(repoRoot)).sandbox?.enabled).toBe(true);
+    writeRepo({});
+    expect((await loadConfig(repoRoot)).sandbox).toBeUndefined();
+  });
+});
+
 describe('resolveWorktreeRetention', () => {
   let repoRoot: string;
   let cezHome: string;

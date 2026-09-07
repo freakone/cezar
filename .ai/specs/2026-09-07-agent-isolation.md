@@ -191,14 +191,19 @@ Each of these was a failure first, and each is now a comment or a default in the
 
 ## Open questions for review
 
-1. **Default on or off for new projects?** Currently off. Isolation is the safer default and the
-   surprising one; a project whose tasks suddenly cannot reach `~/.aws` will read as a regression.
+1. ~~**Default on or off for new projects?**~~ **Settled: configurable.** The machine decides, in
+   Global settings → Resources, and a project that has chosen for itself is never overruled. Three
+   states rather than two, because "no opinion" has to stay distinguishable from a deliberate
+   *off* — collapsing them would let a machine default permanently overrule a project that opted
+   out. Ships as no-opinion (off), so nothing changes for an existing install.
 2. **Should `sandbox.image` pinning stay?** It is useful and it silently bypasses the per-repo
    layer — a footgun we already hit.
 3. **Linux hosts.** The probe treats installed-means-ready there, but nothing has been run on Linux.
    Windows is refused outright (see Platforms).
-4. **Is `copy` worth its complexity?** Mount is correct for everything that refreshes; copy exists
-   for static keys and adds a second code path plus a drift mode.
+4. ~~**Is `copy` worth its complexity?**~~ **Settled for now: mount is enough.** `copy` stays
+   (it is written and tested, and is the right answer for a static key the container should not be
+   able to write back) but nothing depends on it, and the catalog's defaults can move to mount
+   wholesale if it proves to be dead weight.
 5. **Windows.** Not considered.
 
 ## Platforms
