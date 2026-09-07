@@ -96,6 +96,9 @@ export async function ensureImage(
   // build before every task, which is exactly the cost this design avoids.
   if (exists && !(hasFile && (await containerfileIsNewer(containerfile, tag, bin)))) return;
   if (!hasFile) {
+    // An explicit pin is expected to exist already — cezar has nothing to build
+    // it from — so only the base is built here.
+    if (cfg.image) return;
     // No repo Containerfile: the base IS the image for this project. A repo
     // with no toolchain of its own is the ordinary case, not a
     // misconfiguration — and the settings page promises exactly this ("tasks

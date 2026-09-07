@@ -56,8 +56,10 @@ describe('podman launcher', () => {
     // it from; naming it anyway made the default configuration unable to run.
     expect(imageTag(cfg(), false)).toBe('localhost/cezar-agent/base:latest');
     expect(imageTag(cfg(), true)).toBe('cezar-agent/textbook:latest');
-    // An explicit pin still wins over both.
+    // A pin is a fallback for a repo with no Containerfile, NOT an override:
+    // a config key must not silently shadow a file sitting in the repo.
     expect(imageTag(cfg({ image: 'my/img:1' }), false)).toBe('my/img:1');
+    expect(imageTag(cfg({ image: 'my/img:1' }), true)).toBe('cezar-agent/textbook:latest');
     expect(podmanRunArgs(cfg(), 'c', REPO, { credentialPassthrough: false, hasContainerfile: false }))
       .toContain('localhost/cezar-agent/base:latest');
   });
@@ -129,7 +131,8 @@ describe('podman launcher', () => {
 
   it('the image is per repo and prepared once, not built per task', () => {
     expect(imageTag(cfg())).toBe('cezar-agent/textbook:latest');
-    expect(imageTag(cfg({ image: 'my/toolchain:v3' }))).toBe('my/toolchain:v3');
+    // A pin applies only where there is no Containerfile to build from.
+    expect(imageTag(cfg({ image: 'my/toolchain:v3' }), false)).toBe('my/toolchain:v3');
     expect(podmanBuildArgs(cfg(), `${REPO}/.ai/cezar/Containerfile`, REPO)).toEqual([
       'build', '-t', 'cezar-agent/textbook:latest', '-f', `${REPO}/.ai/cezar/Containerfile`, REPO,
     ]);
