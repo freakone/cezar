@@ -24,14 +24,21 @@ const suggestionSchema = z.object({
 const fileSchema = z.object({
   /** Installs seen since the proposal was last accepted or dismissed. */
   pending: z.array(suggestionSchema).default([]),
-  /** Commands already accepted, so a re-install never re-proposes them. */
+  /** Commands written into the Containerfile — the render list. */
   accepted: z.array(z.string()).default([]),
+  /**
+   * Commands the user said no to. Kept ONLY so they are never proposed again;
+   * they must never reach the rendered file. These were previously folded into
+   * `accepted` ("accepted means decided"), which meant a later Accept rebuilt
+   * the file from that list and wrote in a command the user had refused.
+   */
+  dismissed: z.array(z.string()).default([]),
   updatedAt: z.string().optional(),
 });
 
 export type ContainerfileProposal = z.infer<typeof fileSchema>;
 
-const EMPTY: ContainerfileProposal = { pending: [], accepted: [] };
+const EMPTY: ContainerfileProposal = { pending: [], accepted: [], dismissed: [] };
 
 export function proposalPath(dataDir: string): string {
   return join(dataDir, 'container-suggestions.json');
@@ -67,7 +74,9 @@ export function noteInstalls(dataDir: string, command: string): void {
     const found = extractInstalls(command);
     if (found.length === 0) return;
     const current = loadProposal(dataDir);
-    const fresh = found.filter((f) => !current.accepted.includes(f.command));
+    // Neither written nor refused: those are the only ones worth proposing.
+    const decided = new Set([...current.accepted, ...current.dismissed]);
+    const fresh = found.filter((f) => !decided.has(f.command));
     if (fresh.length === 0) return;
     const pending = mergeSuggestions(current.pending, fresh);
     if (pending.length === current.pending.length) return;
@@ -108,7 +117,11 @@ export function acceptSuggestions(
   mkdirSync(dirname(target), { recursive: true });
   writeFileSync(target, render(acceptedAll), 'utf8');
 
-  save(dataDir, { pending: keptPending, accepted: acceptedAll.map((s) => s.command) });
+  save(dataDir, {
+    pending: keptPending,
+    accepted: acceptedAll.map((s) => s.command),
+    dismissed: current.dismissed,
+  });
   return { written: target, accepted: acceptedAll };
 }
 
@@ -118,10 +131,8 @@ export function dismissSuggestions(dataDir: string, commands: string[]): Contain
   const next: ContainerfileProposal = {
     ...current,
     pending: current.pending.filter((s) => !commands.includes(s.command)),
-    // Dismissed commands go into `accepted` so they are not proposed again on
-    // the next run. "Accepted" here means "decided", which is what the
-    // do-not-ask-again list actually tracks.
-    accepted: [...new Set([...current.accepted, ...commands])],
+    // Its own list: do-not-propose-again is not the same as write-this-down.
+    dismissed: [...new Set([...current.dismissed, ...commands])],
   };
   save(dataDir, next);
   return next;

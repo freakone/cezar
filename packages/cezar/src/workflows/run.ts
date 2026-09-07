@@ -1729,7 +1729,7 @@ export class RunManager {
     // Enforce count-based retention (#483) here so a single hook covers every
     // terminal path. Fire-and-forget: retention must never delay or throw into
     // the lifecycle.
-    void this.enforceRetention();
+    void this.enforceRetention(runId);
     // The run's temp directory (#785) goes on the same terminal transition, and
     // unconditionally — it is scratch, not an artifact, so unlike a worktree
     // there is no keep-count to respect and nothing left to recover from it. A
@@ -2613,7 +2613,7 @@ export class RunManager {
   /** Reclaim finished worktrees beyond the keep-limit (#483) — directory only,
    *  `cez/<id8>` branch kept. Best-effort; a failure never affects run
    *  lifecycle. `review`/live runs are excluded by the selector. */
-  private async enforceRetention(): Promise<void> {
+  private async enforceRetention(runId?: string): Promise<void> {
     try {
       const keep = await resolveWorktreeRetention(this.repoRoot);
       const reclaimed = await reclaimWorktrees(this.repoRoot, this.store, keep);
@@ -2628,6 +2628,13 @@ export class RunManager {
       // disk state?", so the container follows that answer rather than
       // inventing a second, harsher policy.
       for (const runId of reclaimed) void removeTaskContainer(runId);
+      // A run with `worktree: false` has no worktreePath, so retention skips it
+      // entirely and its container would live forever. Its container is scratch
+      // the moment the run is finished: there is no worktree to inspect, so
+      // nothing about it is worth keeping warm for a Continue that has no
+      // isolated tree to return to.
+      const run = this.store.getRun(runId);
+      if (run?.worktree === false) void removeTaskContainer(runId);
     } catch {
       // retention is best-effort; swallow so terminal transitions never break.
     }
