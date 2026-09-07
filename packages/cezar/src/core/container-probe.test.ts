@@ -12,6 +12,15 @@ describe('container runtime probe', () => {
     expect(missing.fix).toMatch(/brew install podman/);
   });
 
+  it('refuses Windows up front rather than letting mounts fail later', async () => {
+    // Same-absolute-path mounting is the design's foundation and cannot hold
+    // for `C:\...`. Saying "ready" would hand someone silently wrong mounts.
+    const s = await detectContainerRuntime('echo', 'win32');
+    expect(s.ready).toBe(false);
+    expect(s.reason).toMatch(/Windows/);
+    expect(s.fix).toBeUndefined();
+  });
+
   it('on linux there is no VM, so installed means ready', async () => {
     const s = await detectContainerRuntime('echo', 'linux');
     expect(s.installed).toBe(true);
