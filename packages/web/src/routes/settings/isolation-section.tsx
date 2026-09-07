@@ -70,7 +70,11 @@ export function IsolationSection() {
   })
 
   if (isPending || !data) {
-    return <p className="text-sm text-muted-foreground">Checking this machine for a container runtime…</p>
+    return (
+      <p data-slot="isolation-loading" className="p-4 text-[13px] text-soft-foreground md:p-6">
+        Checking this machine for a container runtime…
+      </p>
+    )
   }
 
   const { runtime, enabled, effective, image, hasContainerfile, suggestions, credentials, resources } = data
@@ -80,7 +84,12 @@ export function IsolationSection() {
   const misleading = enabled && !effective
 
   return (
-    <div className="flex flex-col gap-6">
+    // Same frame every other settings section uses: sections own their padding
+    // and column width, the shell only supplies the header and nav.
+    <div
+      data-slot="isolation-section"
+      className="mx-auto flex w-full max-w-2xl flex-col gap-7 p-4 pb-[calc(90px+env(safe-area-inset-bottom))] md:p-6 md:pb-6"
+    >
       <SettingsField
         title="Run agents in a container"
         hint={

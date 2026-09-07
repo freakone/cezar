@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { agentClaudeHome, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import type { SandboxConfig } from '../config.ts';
@@ -51,6 +52,37 @@ async function podman(bin: string, args: string[]): Promise<string> {
  * an error: the repo simply has no image of its own and the configured (or
  * default) tag is expected to exist already — pulled, or built by hand.
  */
+/** The shared base every repo image builds FROM, shipped with cezar itself. */
+export const BASE_IMAGE_TAG = 'localhost/cezar-agent/base:latest';
+
+/** `containers/agent-base.Containerfile`, in the installed package or the checkout. */
+export function baseContainerfilePath(): string {
+  // here = <pkg>/dist/core (built) or <pkg>/src/core (tsx dev).
+  const here = fileURLToPath(new URL('.', import.meta.url));
+  return join(here, '..', '..', 'containers', 'agent-base.Containerfile');
+}
+
+/**
+ * Build the shared base image if this machine does not have it yet.
+ *
+ * Without this, isolation works only on a machine where someone built the base
+ * by hand — and fails everywhere else with "image is not present", naming a tag
+ * the user has never heard of. The base is cezar's own artifact, so cezar
+ * builds it.
+ */
+export async function ensureBaseImage(bin = 'podman'): Promise<void> {
+  const exists = await run(bin, ['image', 'exists', BASE_IMAGE_TAG]).then(() => true).catch(() => false);
+  if (exists) return;
+  const file = baseContainerfilePath();
+  if (!existsSync(file)) {
+    throw new PodmanUnavailable(
+      `the cezar agent base image is missing and ${file} was not found — reinstall cezar, or set ` +
+        '`sandbox.image` to an image that exists',
+    );
+  }
+  await podman(bin, ['build', '-t', BASE_IMAGE_TAG, '-f', file, dirname(file)]);
+}
+
 export async function ensureImage(
   cfg: SandboxConfig,
   repoRoot: string,
@@ -67,11 +99,20 @@ export async function ensureImage(
   // build before every task, which is exactly the cost this design avoids.
   if (exists && !(hasFile && (await containerfileIsNewer(containerfile, tag, bin)))) return;
   if (!hasFile) {
-    throw new PodmanUnavailable(
-      `image ${tag} is not present and ${cfg.containerfile} does not exist — ` +
-        'build the image or point `sandbox.image` at one that exists',
-    );
+    // No repo Containerfile: the base IS the image for this project. Build it
+    // rather than failing — a repo with no toolchain of its own is the ordinary
+    // case, not a misconfiguration.
+    await ensureBaseImage(bin);
+    if (tag !== BASE_IMAGE_TAG) {
+      throw new PodmanUnavailable(
+        `image ${tag} is not present and ${cfg.containerfile} does not exist — ` +
+          'add a Containerfile, or point `sandbox.image` at an image that exists',
+      );
+    }
+    return;
   }
+  // A repo Containerfile builds FROM the base, so the base has to exist first.
+  await ensureBaseImage(bin);
   await podman(bin, podmanBuildArgs(cfg, containerfile, repoRoot));
 }
 
