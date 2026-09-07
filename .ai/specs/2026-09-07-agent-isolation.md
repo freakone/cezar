@@ -198,13 +198,17 @@ Each of these was a failure first, and each is now a comment or a default in the
    out. Ships as no-opinion (off), so nothing changes for an existing install.
 2. **Should `sandbox.image` pinning stay?** It is useful and it silently bypasses the per-repo
    layer — a footgun we already hit.
-3. **Linux hosts.** The probe treats installed-means-ready there, but nothing has been run on Linux.
-   Windows is refused outright (see Platforms).
+3. **Linux hosts.** The probe treats installed-means-ready there, but nothing has been run on
+   Linux. See Platforms.
 4. ~~**Is `copy` worth its complexity?**~~ **Settled for now: mount is enough.** `copy` stays
    (it is written and tested, and is the right answer for a static key the container should not be
    able to write back) but nothing depends on it, and the catalog's defaults can move to mount
    wholesale if it proves to be dead weight.
-5. **Windows.** Not considered.
+5. **What is wired but never exercised.** claude has been run end to end in a container; codex,
+   opencode and pi are wired through the same seam and have not been. Neither has the learned
+   Containerfile round trip (observe → accept → rebuild), nor credential passthrough with a real
+   credential selected. None of that is speculative work — it is untested work, which is a
+   different thing to say out loud before review.
 
 ## Platforms
 
