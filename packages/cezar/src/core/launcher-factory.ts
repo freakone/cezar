@@ -15,7 +15,7 @@ import { PodmanLauncher } from './podman-launcher.ts';
 export function createLauncher(
   sandbox: SandboxConfig | undefined,
   /** The per-task container podman execs into; the engine creates it per run. */
-  containerName?: string,
+  container?: { name: string; publishedPort?: number },
 ): ProcessLauncher {
   if (!sandbox?.enabled) return localLauncher;
   switch (sandbox.provider) {
@@ -23,8 +23,8 @@ export function createLauncher(
       // Without a container there is nothing to exec into. Falling back to
       // local would run the agent UNISOLATED while the config says otherwise,
       // so the caller must supply one — see the engine's per-task creation.
-      if (!containerName) return localLauncher;
-      return new PodmanLauncher(sandbox, containerName);
+      if (!container) return localLauncher;
+      return new PodmanLauncher(sandbox, container.name, 'podman', container.publishedPort);
     case 'sbx':
       return new SbxLauncher(sandbox);
     default:

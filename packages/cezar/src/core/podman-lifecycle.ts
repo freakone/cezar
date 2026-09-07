@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createServer } from 'node:net';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -101,14 +102,18 @@ export async function startTaskContainer(
   repoRoot: string,
   runId: string,
   bin = 'podman',
-): Promise<string> {
+): Promise<TaskContainer> {
   const name = taskContainerName(runId);
   const running = await run(bin, ['container', 'exists', name]).then(() => true).catch(() => false);
   if (running) {
     // A stopped container from an earlier turn still has to be woken.
     await run(bin, ['start', name]).catch(() => undefined);
-    return name;
+    return { name, publishedPort: await publishedPortOf(name, bin) };
   }
+  // Allocated BEFORE the container exists, because publishing is a
+  // creation-time property: an HTTP-speaking backend that discovers it needs a
+  // port later would have nowhere to put it.
+  const publishPort = await freePort();
   await ensureImage(cfg, repoRoot, bin);
   // The agent's own claude home must exist before it is mounted, or podman
   // creates it root-owned inside the VM and the agent cannot write its
@@ -118,6 +123,7 @@ export async function startTaskContainer(
   await podman(bin, podmanRunArgs(cfg, name, repoRoot, {
     credentialPassthrough: cfg.claudeCredentialPassthrough,
     credentials,
+    publishPort,
   }));
   // Copies happen after the container exists, because `podman cp` needs a
   // target. Failing to place one is not fatal to the run: the agent will report
@@ -126,7 +132,39 @@ export async function startTaskContainer(
   for (const args of credentialCopyPlan(credentials, name)) {
     await run(bin, args).catch(() => undefined);
   }
-  return name;
+  return { name, publishedPort: publishPort };
+}
+
+/** What `startTaskContainer` hands back: where to exec, and the forwarded port. */
+export interface TaskContainer {
+  name: string;
+  /** Host port forwarded to the same port inside, for HTTP-speaking backends. */
+  publishedPort?: number;
+}
+
+/** An unused loopback port, asked of the OS rather than guessed. */
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const address = srv.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      srv.close(() => (port ? resolve(port) : reject(new Error('no free port'))));
+    });
+  });
+}
+
+/** Re-read the published port of a container we did not just create. */
+async function publishedPortOf(name: string, bin: string): Promise<number | undefined> {
+  try {
+    const { stdout } = await run(bin, ['port', name]);
+    // "40123/tcp -> 127.0.0.1:40123"
+    const match = /^(\d+)\/tcp/m.exec(stdout.trim());
+    return match ? Number(match[1]) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

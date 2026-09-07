@@ -66,7 +66,12 @@ export function podmanRunArgs(
   cfg: SandboxConfig,
   containerName: string,
   workspace: string,
-  opts: { credentialPassthrough: boolean; credentials?: ResolvedCredential[] } = { credentialPassthrough: true },
+  opts: {
+    credentialPassthrough: boolean;
+    credentials?: ResolvedCredential[];
+    /** Forwarded to the host on loopback, for HTTP-speaking backends. */
+    publishPort?: number;
+  } = { credentialPassthrough: true },
 ): string[] {
   const args = [
     'run', '--detach', '--name', containerName,
@@ -94,6 +99,15 @@ export function podmanRunArgs(
   // Credentials the operator explicitly passed through. Mounts only — the
   // copies happen after the container exists (`credentialCopyPlan`).
   args.push(...credentialMountArgs(opts.credentials ?? resolvePassthrough(cfg.credentials)));
+  // Loopback only: the agent's HTTP server is cezar's business and nobody
+  // else's, so it is reachable from this machine and not from the network.
+  if (opts.publishPort) args.push('-p', `127.0.0.1:${opts.publishPort}:${opts.publishPort}`);
+  // Resource limits. `--shm-size` is the one that is set by DEFAULT, because
+  // podman's 64m default kills any headless browser the agent starts and does
+  // so with an error that reads as out-of-memory.
+  if (cfg.resources?.shmSize) args.push('--shm-size', cfg.resources.shmSize);
+  if (cfg.resources?.memory) args.push('--memory', cfg.resources.memory);
+  if (cfg.resources?.cpus) args.push('--cpus', String(cfg.resources.cpus));
   args.push(imageTag(cfg), 'sleep', 'infinity');
   return args;
 }
@@ -132,6 +146,8 @@ export class PodmanLauncher implements ProcessLauncher {
     /** The container to exec into; the engine creates it per task. */
     private readonly containerName: string,
     private readonly bin = 'podman',
+    /** The port published when the container was created, if any. */
+    readonly publishedPort?: number,
   ) {}
 
   describe(): string {

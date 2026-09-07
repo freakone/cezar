@@ -10,6 +10,7 @@ const cfg = (over: Partial<SandboxConfig> = {}): SandboxConfig => ({
   provider: 'sbx',
   containerfile: '.ai/cezar/Containerfile',
   claudeCredentialPassthrough: true,
+  resources: { shmSize: '1g' },
   name: 'textbook',
   agent: 'shell',
   createIfMissing: true,
