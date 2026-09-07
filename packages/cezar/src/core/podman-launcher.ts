@@ -52,17 +52,21 @@ export function hostClaudeCredential(): string {
 export const BASE_IMAGE_TAG = 'localhost/cezar-agent/base:latest';
 
 /**
- * The image a repo's containers run.
+ * The image a repo's containers run. Precedence, highest first:
  *
- * An explicit `sandbox.image` wins. Otherwise a repo gets its own derived tag
- * ONLY when it has a Containerfile to build that tag from — without one there
- * is nothing to build, and naming a tag that will never exist makes `podman
- * run` fail on the default configuration. Such a repo runs the base, which is
- * exactly what the settings page promises it will.
+ *  1. **its Containerfile**, if it has one — the repo's own declared toolchain
+ *     is the most specific statement about what its agents need, and a config
+ *     key must not silently shadow a file sitting in the repo. An `image` pin
+ *     that overrode it produced exactly that: a project with a Containerfile
+ *     quietly running the generic base, and a settings page saying so in words
+ *     nobody connected to the pin;
+ *  2. an explicit `sandbox.image`, for a repo that would rather point at a
+ *     prebuilt image than write a Containerfile;
+ *  3. the shared base — the only fallback, and only when there is nothing else.
  */
 export function imageTag(cfg: SandboxConfig, hasContainerfile = true): string {
-  if (cfg.image) return cfg.image;
-  return hasContainerfile ? `cezar-agent/${cfg.name}:latest` : BASE_IMAGE_TAG;
+  if (hasContainerfile) return `cezar-agent/${cfg.name}:latest`;
+  return cfg.image ?? BASE_IMAGE_TAG;
 }
 
 /** `podman build` argv for a repo's image. Run once per Containerfile change. */

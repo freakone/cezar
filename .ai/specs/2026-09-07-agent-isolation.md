@@ -196,10 +196,17 @@ Each of these was a failure first, and each is now a comment or a default in the
    states rather than two, because "no opinion" has to stay distinguishable from a deliberate
    *off* — collapsing them would let a machine default permanently overrule a project that opted
    out. Ships as no-opinion (off), so nothing changes for an existing install.
-2. **Should `sandbox.image` pinning stay?** It is useful and it silently bypasses the per-repo
-   layer — a footgun we already hit.
-3. **Linux hosts.** The probe treats installed-means-ready there, but nothing has been run on
-   Linux. See Platforms.
+2. ~~**Should `sandbox.image` pinning stay?**~~ **Settled: it stays, but as a fallback rather than
+   an override.** Precedence is now Containerfile → pin → base. A config key must not silently
+   shadow a file sitting in the repo, which is exactly the footgun we hit: a project with a
+   toolchain quietly running the generic base. A pin remains the way to point at a prebuilt image
+   when there is no Containerfile to build from.
+3. **Linux hosts.** Nothing has been run there. Two things are genuinely different rather than
+   merely untested: containers run directly with no VM, so there is no VM allocation acting as the
+   real memory ceiling and mounts are direct; and rootless podman maps the container's root onto a
+   subuid, so files an agent writes into the bind-mounted repo can land owned by a uid the operator
+   does not have — `--userns=keep-id` is the usual answer, and nothing here passes it. See
+   Platforms.
 4. ~~**Is `copy` worth its complexity?**~~ **Settled for now: mount is enough.** `copy` stays
    (it is written and tested, and is the right answer for a static key the container should not be
    able to write back) but nothing depends on it, and the catalog's defaults can move to mount
