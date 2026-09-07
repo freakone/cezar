@@ -1,3 +1,4 @@
+import { localLauncher, type ProcessLauncher } from './process-launcher.ts';
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type {
   AgentEvent,
@@ -27,6 +28,8 @@ export interface OpencodeRunnerOptions {
   bin?: string;
   /** Wall-clock timeout for a run (ms); per-spec `timeoutMs` still wins. */
   timeoutMs?: number;
+  /** WHERE the server runs — this machine, or a container. Defaults to local. */
+  launcher?: ProcessLauncher;
 }
 
 const SERVER_START_TIMEOUT_MS = 30_000;
@@ -52,10 +55,12 @@ export class OpencodeServerRunner implements AgentRunner {
   private readonly bin: string;
   private readonly timeoutMs: number;
   private lastSession: OpencodeSession | null = null;
+  private readonly launcher: ProcessLauncher;
 
   constructor(opts: OpencodeRunnerOptions = {}) {
     this.bin = opts.bin ?? process.env.CEZ_OPENCODE_BIN ?? 'opencode';
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    this.launcher = opts.launcher ?? localLauncher;
   }
 
   run(spec: AgentRunSpec, onEvent?: (event: AgentEvent) => void): Promise<AgentRunResult> {
@@ -71,7 +76,7 @@ export class OpencodeServerRunner implements AgentRunner {
     onEvent?: (event: AgentEvent) => void,
     opts: SessionOptions = {},
   ): AgentSession {
-    const session = new OpencodeSession(this.bin, this.timeoutMs, spec, onEvent, opts);
+    const session = new OpencodeSession(this.bin, this.timeoutMs, spec, onEvent, opts, this.launcher);
     this.lastSession = session;
     return session;
   }
@@ -128,11 +133,24 @@ class OpencodeSession implements AgentSession {
     private readonly spec: AgentRunSpec,
     private readonly onEvent: ((event: AgentEvent) => void) | undefined,
     private readonly opts: SessionOptions,
+    /** WHERE the server runs; also supplies the published port when isolated. */
+    private readonly launcher: ProcessLauncher = localLauncher,
   ) {
-    // Random high port; the actual bound URL is read back from stdout.
-    const port = 40000 + Math.floor(Math.random() * 20000);
+    // opencode is the one backend cezar talks to over HTTP rather than stdio,
+    // so WHERE it runs changes how it must bind:
+    //
+    //  - locally, loopback and a random high port is right — nothing else
+    //    should be able to reach it;
+    //  - in a container, the port must be one the launcher PUBLISHED (chosen
+    //    at container-creation time, so it cannot be picked here) and the
+    //    server must bind 0.0.0.0 inside, or the publish forwards to a socket
+    //    listening only on the container's own loopback and cezar sees a hung
+    //    agent rather than a networking mistake.
+    const published = this.launcher.publishedPort;
+    const port = published ?? 40000 + Math.floor(Math.random() * 20000);
+    const hostname = published ? '0.0.0.0' : '127.0.0.1';
     try {
-      this.child = nodeSpawn(bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
+      this.child = this.launcher.spawn(bin, ['serve', '--hostname', hostname, '--port', String(port)], {
         cwd: spec.cwd,
         env: buildChildEnv({ backend: 'opencode', extraEnv: spec.env }),
       });
@@ -277,10 +295,10 @@ class OpencodeSession implements AgentSession {
   private terminate(): void {
     if (this.signalled || this.hasExited()) return;
     this.signalled = true;
-    this.child.kill('SIGTERM');
+    void this.launcher.signal(this.child, 'SIGTERM');
     setTimeout(() => {
       if (this.hasExited()) return;
-      this.child.kill('SIGKILL');
+      void this.launcher.signal(this.child, 'SIGKILL');
     }, KILL_GRACE_MS).unref?.();
   }
 
