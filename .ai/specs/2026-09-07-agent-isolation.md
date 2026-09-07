@@ -142,6 +142,11 @@ Each of these was a failure first, and each is now a comment or a default in the
   tasks appeared lost this way — once when the cockpit moved out of a sandbox, once when the
   Continue path ran outside the container. Hence the agent's `~/.claude` is a host-mounted volume,
   and the isolation choice is persisted on the run so a Continue lands where the first turn did.
+- **A container outlives its task unless every worktree-removal path removes it too.** Tying
+  container lifetime to retention covered the common case and leaked one container per *deleted*
+  task, because delete, "Remove worktree" and losing-variant cleanup each remove a worktree
+  directly. The rule that holds is simpler than the mechanism: the container is the task's
+  materialized state exactly as the worktree is, so it goes wherever the worktree goes.
 - **A container removed on any terminal transition takes an hour of installed services with it** —
   and a failed run is exactly the one most likely to be continued. Container lifetime now follows
   worktree retention.
