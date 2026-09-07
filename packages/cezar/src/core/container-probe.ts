@@ -60,6 +60,22 @@ export async function detectContainerRuntime(
   bin = 'podman',
   platform: NodeJS.Platform = process.platform,
 ): Promise<ContainerRuntimeStatus> {
+  // Windows is refused up front rather than left to fail at `podman run`.
+  //
+  // The whole design rests on mounting the repo at its OWN absolute path, so
+  // cwd, `--add-dir`, the worktree and CEZ_HANDOFF_FILE need no translation.
+  // `C:\Users\k\repo` is not a path a Linux container can be given, so that
+  // property — and every mount and `-w` built on it — collapses. Reporting
+  // "ready" here would let someone turn isolation on and get containers whose
+  // mounts are silently wrong, which is worse than not offering it.
+  if (platform === 'win32') {
+    return {
+      provider: 'podman', ready: false, installed: false, machineRunning: false,
+      reason: 'Agent isolation does not support Windows yet: it mounts the repo at its own absolute '
+        + 'path, which a Linux container cannot be given for a Windows path.',
+    };
+  }
+
   let version: string;
   try {
     const { stdout } = await run(bin, ['--version'], { timeout: 5_000 });

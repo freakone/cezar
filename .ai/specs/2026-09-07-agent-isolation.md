@@ -22,12 +22,28 @@ Each task's agent runs inside its own container. cezar stays on the host — dur
 holding the operator's real credentials — and only the part that executes model-authored commands
 is confined.
 
+```mermaid
+flowchart LR
+  subgraph HOST["host — unchanged, durable"]
+    CEZ["cezar<br/>launchd · :4321<br/>the operator's credentials"]
+    OTHER["~/.ssh · ~/.aws<br/>every other repo<br/><b>not reachable from the container</b>"]
+    REPO[("this repo<br/>+ task worktree")]
+  end
+
+  subgraph CTR["container — one per task"]
+    AGENT["claude / codex<br/>opencode / pi"]
+    MOUNT["the repo, at its OWN absolute path"]
+    CRED["only the credentials<br/>you selected"]
+  end
+
+  CEZ -->|"podman exec -i -w &lt;worktree&gt;"| AGENT
+  REPO -.->|"-v /path:/path — same string both sides"| MOUNT
+  AGENT --- MOUNT
+  AGENT --- CRED
+  OTHER -.-x CTR
 ```
-host                                    container (per task)
-  cezar (launchd, port 4321)              claude / codex / opencode / pi
-  the operator's credentials              the repo, at its own absolute path
-  every other repo, ~/.ssh, ~/.aws        an explicitly chosen subset of credentials
-```
+
+The dotted line that ends in a cross is the feature: everything else on the host stays out.
 
 Opt-in per project, overridable per task, and off by default: an install that says nothing behaves
 exactly as it always has.
@@ -78,6 +94,28 @@ rather than by keeping one container forever:
 
 The expensive part (tools) is in an image, the slow part (packages) is in a volume, and only the
 disposable part is per task.
+
+```mermaid
+flowchart TD
+  BASE["<b>base image</b> — ships with cezar<br/>node · git · gh · ripgrep · the agent CLI"]
+  REPOIMG["<b>repo image</b> cezar-agent/&lt;name&gt;<br/>built from .ai/cezar/Containerfile<br/><i>rebuilt only when that file changes</i>"]
+  C1["container — task A"]
+  C2["container — task B"]
+  CACHE[("cache volumes<br/>npm / pnpm store<br/><i>permanent</i>")]
+  EPH1[("node_modules<br/><i>per task, VM-native</i>")]
+  EPH2[("node_modules<br/><i>per task, VM-native</i>")]
+
+  BASE -->|FROM| REPOIMG
+  REPOIMG --> C1
+  REPOIMG --> C2
+  CACHE -.->|shared, keeps installs warm| C1
+  CACHE -.->|shared| C2
+  C1 --- EPH1
+  C2 --- EPH2
+```
+
+A task's container lives as long as its worktree — both are the task's materialized state, so a
+failed run keeps the environment its Continue will need.
 
 ### Learned Containerfiles
 
@@ -158,9 +196,28 @@ Each of these was a failure first, and each is now a comment or a default in the
 2. **Should `sandbox.image` pinning stay?** It is useful and it silently bypasses the per-repo
    layer — a footgun we already hit.
 3. **Linux hosts.** The probe treats installed-means-ready there, but nothing has been run on Linux.
+   Windows is refused outright (see Platforms).
 4. **Is `copy` worth its complexity?** Mount is correct for everything that refreshes; copy exists
    for static keys and adds a second code path plus a drift mode.
 5. **Windows.** Not considered.
+
+## Platforms
+
+**macOS** — developed and exercised here. Containers run in a podman VM, so its allocation is the
+real ceiling and container limits cap within it, not within the host's.
+
+**Linux** — should work and is the simpler case (no VM, so installed means ready), but nothing has
+been run there.
+
+**Windows — refused, deliberately.** The design mounts the repo at its own absolute path so that
+cwd, `--add-dir`, the worktree and `CEZ_HANDOFF_FILE` need no translation. `C:\Users\k\repo` is
+not a path a Linux container can be given, so that property collapses and every mount and `-w`
+built on it goes with it. The probe therefore reports Windows as unsupported up front rather than
+letting `podman run` produce silently wrong mounts — a toggle that promises isolation and delivers
+broken paths is worse than one that is not offered.
+
+Supporting it means translating host paths to guest paths everywhere, which is precisely the class
+of bug the same-path decision was made to avoid. It is doable; it is a different feature.
 
 ## Not in scope
 
