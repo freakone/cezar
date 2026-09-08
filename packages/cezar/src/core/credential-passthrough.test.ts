@@ -33,6 +33,21 @@ describe('credential passthrough', () => {
     expect(CREDENTIAL_CATALOG.find((c) => c.id === 'github-cli')?.defaultMode).toBe('copy');
   });
 
+  it('never FILE-mounts something its owner rewrites — mount the directory instead', () => {
+    // A bind mount binds an inode; an atomic rewrite unlinks it and the
+    // container is left holding a deleted file. This cost us the Claude
+    // credential in practice, so the catalog may not repeat it.
+    // `kind` is declared, not sniffed: `.ssh` (a directory) and `.npmrc` (a
+    // file) are indistinguishable as path strings.
+    for (const source of CREDENTIAL_CATALOG) {
+      if (source.defaultMode !== 'mount') continue;
+      expect(
+        source.kind,
+        `${source.id} mounts ${source.hostPath} — mount its directory or copy it`,
+      ).toBe('dir');
+    }
+  });
+
   it('the operator can override the mode per credential', () => {
     const resolved = resolvePassthrough(
       { enabled: { gcloud: { mode: 'copy' } } }, HOME, allExist,

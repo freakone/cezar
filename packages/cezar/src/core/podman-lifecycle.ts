@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
-import { BASE_IMAGE_TAG, agentClaudeHome, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
+import { BASE_IMAGE_TAG, agentClaudeHome, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import type { SandboxConfig } from '../config.ts';
 import { credentialCopyPlan, resolvePassthrough } from './credential-passthrough.ts';
 
@@ -145,6 +145,10 @@ export async function startTaskContainer(
   if (running) {
     // A stopped container from an earlier turn still has to be woken.
     await run(bin, ['start', name]).catch(() => undefined);
+    // Every spawn re-copies, so a token refreshed on the host reaches the next
+    // turn of a long task — the property a mount was supposed to give and
+    // could not (see `podmanRunArgs`).
+    if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
     return { name, publishedPort: await publishedPortOf(name, bin) };
   }
   // Allocated BEFORE the container exists, because publishing is a
@@ -167,6 +171,7 @@ export async function startTaskContainer(
   // target. Failing to place one is not fatal to the run: the agent will report
   // the tool being logged out, which is a far clearer symptom than a container
   // that refused to start.
+  if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
   for (const args of credentialCopyPlan(credentials, name)) {
     // `podman cp` fails when the destination's parent is absent, and the base
     // image has no `/root/.config/gh` or `/root/.docker`. Without this the copy
@@ -211,6 +216,24 @@ async function publishedPortOf(name: string, bin: string): Promise<number | unde
   }
 }
 
+
+/**
+ * Put the host's current Claude credential into the container.
+ *
+ * Copied rather than mounted, and re-copied before every spawn: Claude Code
+ * rewrites that file atomically when it refreshes the token, which breaks a
+ * file bind mount permanently (the container keeps the unlinked inode). A copy
+ * has the opposite failure — it goes stale — and re-copying is what removes it.
+ *
+ * Silent when the host has no credential: that is the Keychain case, and the
+ * container may hold its own login.
+ */
+export async function syncClaudeCredential(container: string, bin = 'podman'): Promise<void> {
+  const source = hostClaudeCredential();
+  if (!existsSync(source)) return;
+  await run(bin, ['exec', container, 'mkdir', '-p', '/root/.claude']).catch(() => undefined);
+  await run(bin, ['cp', source, `${container}:/root/.claude/.credentials.json`]).catch(() => undefined);
+}
 
 /** Remove this task's container. Never throws — teardown must not fail a run. */
 export async function removeTaskContainer(runId: string, bin = 'podman'): Promise<void> {
