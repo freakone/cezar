@@ -23,6 +23,12 @@ import { join } from 'node:path';
  *
  * Mount is right for things that refresh, copy for static keys. Neither is
  * right for everything, which is why the choice is exposed rather than decided.
+ *
+ * One rule constrains the catalog, learned the hard way: **never file-mount
+ * something its owner rewrites atomically.** A bind mount binds an inode, and a
+ * temp-file-plus-rename unlinks it — the container is left holding a deleted
+ * file, reads fail with ENOENT, and the tool reports itself logged out. Mount
+ * the containing DIRECTORY (stable inode) or copy the file; both survive.
  */
 
 export type PassthroughMode = 'mount' | 'copy';
@@ -32,8 +38,14 @@ export interface CredentialSource {
   id: string;
   /** What a human calls it. */
   label: string;
-  /** Host path, `~`-relative. Directory or file. */
+  /** Host path, `~`-relative. */
   hostPath?: string;
+  /**
+   * Whether `hostPath` is a file or a directory. Declared rather than sniffed:
+   * `.ssh` and `.npmrc` are indistinguishable as strings, and this is what the
+   * mount rule below is enforced against.
+   */
+  kind?: 'file' | 'dir';
   /** Where it lands in the container. Defaults to the same path under /root. */
   guestPath?: string;
   /** Environment variables to forward instead of (or besides) a path. */
@@ -53,6 +65,7 @@ export interface CredentialSource {
 export const CREDENTIAL_CATALOG: CredentialSource[] = [
   {
     id: 'github-cli',
+    kind: 'file',
     label: 'GitHub CLI (gh)',
     hostPath: '.config/gh/hosts.yml',
     guestPath: '/root/.config/gh/hosts.yml',
@@ -62,6 +75,7 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
   },
   {
     id: 'git-config',
+    kind: 'file',
     label: 'Git identity (.gitconfig)',
     hostPath: '.gitconfig',
     guestPath: '/root/.gitconfig',
@@ -70,6 +84,7 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
   },
   {
     id: 'ssh',
+    kind: 'dir',
     label: 'SSH keys',
     hostPath: '.ssh',
     guestPath: '/root/.ssh',
@@ -78,6 +93,7 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
   },
   {
     id: 'gcloud',
+    kind: 'dir',
     label: 'Google Cloud (gcloud)',
     hostPath: '.config/gcloud',
     guestPath: '/root/.config/gcloud',
@@ -87,6 +103,7 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
   },
   {
     id: 'aws',
+    kind: 'dir',
     label: 'AWS CLI',
     hostPath: '.aws',
     guestPath: '/root/.aws',
@@ -96,15 +113,23 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
   },
   {
     id: 'kube',
+    kind: 'dir',
     label: 'Kubernetes (kubeconfig)',
-    hostPath: '.kube/config',
-    guestPath: '/root/.kube/config',
+    // The DIRECTORY, not `config` itself. Exec-based auth plugins rewrite the
+    // kubeconfig to cache tokens, and they rewrite it atomically — which
+    // permanently breaks a bind mount of the file (the container keeps the
+    // unlinked inode and every read fails). A directory mount survives that
+    // because the directory's own inode is stable. The same trap cost us the
+    // Claude credential, which is now copied instead.
+    hostPath: '.kube',
+    guestPath: '/root/.kube',
     env: ['KUBECONFIG'],
     defaultMode: 'mount',
-    note: 'Exec-based auth plugins rewrite cached tokens here.',
+    note: 'The whole ~/.kube: exec auth plugins rewrite the config to cache tokens.',
   },
   {
     id: 'docker',
+    kind: 'file',
     label: 'Container registry logins',
     hostPath: '.docker/config.json',
     guestPath: '/root/.docker/config.json',
@@ -112,6 +137,7 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
   },
   {
     id: 'npm',
+    kind: 'file',
     label: 'npm registry token (.npmrc)',
     hostPath: '.npmrc',
     guestPath: '/root/.npmrc',
@@ -120,6 +146,7 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
   },
   {
     id: 'pypi',
+    kind: 'file',
     label: 'PyPI token (.pypirc)',
     hostPath: '.pypirc',
     guestPath: '/root/.pypirc',

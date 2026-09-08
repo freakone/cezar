@@ -102,15 +102,16 @@ export function podmanRunArgs(
     // from here and impossible to strand inside a container that is gone.
     '-v', `${agentClaudeHome()}:/root/.claude`,
   ];
-  // Only the credential file — never `projects/`, `sessions/` or history — and
-  // only when it EXISTS. Podman creates a missing bind source as a DIRECTORY,
-  // so mounting blindly would leave a directory named `.credentials.json` in
-  // the operator's real `~/.claude` — on macOS, where Claude Code may keep its
-  // token in the Keychain and that file legitimately does not exist. Every
-  // other credential here is skipped-with-a-reason when absent; so is this one.
-  if (opts.credentialPassthrough && (opts.credentialExists ?? existsSync)(hostClaudeCredential())) {
-    args.push('-v', `${hostClaudeCredential()}:/root/.claude/.credentials.json`);
-  }
+  // The Claude credential is deliberately NOT mounted — it is copied in, and
+  // re-copied before every agent spawn (`syncClaudeCredential`).
+  //
+  // A bind mount binds an INODE, not a path. Claude Code refreshes its OAuth
+  // token by writing a temp file and renaming over the original, which unlinks
+  // the inode the container holds: the directory entry lingers, every read
+  // fails with ENOENT, and once the old token expires the agent reports "Not
+  // logged in". Observed in practice after ~35 hours. Mounting a single file
+  // that its owner rewrites atomically cannot work; copying it can, and
+  // re-copying keeps it fresh.
   // Package caches survive the per-task container, so a fresh container still
   // installs fast. This is what makes "container per task" affordable.
   for (const [volume, target] of Object.entries(cfg.cacheVolumes ?? {})) {
