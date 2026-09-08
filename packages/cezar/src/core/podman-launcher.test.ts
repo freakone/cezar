@@ -27,29 +27,24 @@ describe('podman launcher', () => {
     expect(args).toContain(`${REPO}:${REPO}`);
   });
 
-  it('passes ONLY the credential through — conversations stay on the host', () => {
+  it('gives the agent its own claude home and none of the operator\'s conversations', () => {
     const args = podmanRunArgs(cfg(), 'cez-run1', REPO).join(' ');
-    // The agent gets its own claude home, on a host volume so transcripts can
-    // never be stranded inside a container that is gone.
+    // On a host volume, so transcripts are never stranded in a dead container.
     expect(args).toContain(`${agentClaudeHome()}:/root/.claude`);
-    // Tier 1: the credential file, and nothing else.
-    expect(args).toContain(`${homedir()}/.claude/.credentials.json:/root/.claude/.credentials.json`);
-    // Never the conversation stores.
     expect(args).not.toContain('/.claude/projects');
     expect(args).not.toContain('/.claude/sessions');
     expect(args).not.toContain('history.jsonl');
   });
 
-  it('NEVER mounts a credential that is absent — podman would create a directory', () => {
-    // On a host where Claude Code keeps its token in the Keychain, that file
-    // legitimately does not exist. Mounting blindly leaves a DIRECTORY named
-    // `.credentials.json` inside the operator's real ~/.claude.
-    const args = podmanRunArgs(cfg(), 'c', REPO, {
-      credentialPassthrough: true,
-      credentialExists: () => false,
-    }).join(' ');
-    expect(args).not.toContain('.credentials.json');
+  it('NEVER mounts the Claude credential — a rewrite permanently breaks a file mount', () => {
+    // Claude Code refreshes its OAuth token with temp-file-plus-rename, which
+    // unlinks the inode a bind mount holds: the container keeps a deleted file,
+    // reads fail, and the agent reports "Not logged in". Seen after ~35 hours.
+    // `syncClaudeCredential` copies it in before every spawn instead.
+    const args = podmanRunArgs(cfg(), 'cez-run1', REPO).join(' ');
+    expect(args).not.toContain(`${homedir()}/.claude/.credentials.json:`);
   });
+
 
   it('a repo with no Containerfile runs the BASE image, not a tag that cannot exist', () => {
     // The derived tag is only buildable when there is a Containerfile to build
@@ -72,20 +67,7 @@ describe('podman launcher', () => {
     expect(args.join(' ')).not.toContain('unset ANTHROPIC_API_KEY');
   });
 
-  it('read-write on the credential: claude rewrites it when the token refreshes', () => {
-    const mount = podmanRunArgs(cfg(), 'cez-run1', REPO)
-      .find((a) => a.includes('.credentials.json'));
-    // A `:ro` suffix here works until the OAuth token expires, then fails
-    // inscrutably — so it must be absent.
-    expect(mount?.endsWith(':ro')).toBe(false);
-  });
 
-  it('credential passthrough can be declined (log in inside the container instead)', () => {
-    const args = podmanRunArgs(cfg(), 'cez-run1', REPO, { credentialPassthrough: false }).join(' ');
-    expect(args).not.toContain('.credentials.json');
-    // The agent's own store is still mounted — that is where its login lands.
-    expect(args).toContain(`${agentClaudeHome()}:/root/.claude`);
-  });
 
   it('cache volumes survive the per-task container, so installs stay warm', () => {
     const args = podmanRunArgs(cfg({ cacheVolumes: { 'cez-npm': '/root/.npm' } }), 'cez-run1', REPO);
