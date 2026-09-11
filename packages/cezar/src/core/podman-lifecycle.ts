@@ -155,6 +155,12 @@ export async function startTaskContainer(
     // turn of a long task — the property a mount was supposed to give and
     // could not (see `podmanRunArgs`).
     if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
+    // And the same for everything else that is COPIED, so a credential ticked
+    // after this container started reaches the next turn of the task instead of
+    // waiting for a task that does not exist yet. Mounts cannot be refreshed
+    // this way — they are fixed at creation — which is the practical argument
+    // for copying anything that does not have to be live.
+    await applyCredentials(name, resolvePassthrough(cfg.credentials), bin);
     return { name, publishedPort: await publishedPortOf(name, bin) };
   }
   // Allocated BEFORE the container exists, because publishing is a
@@ -178,7 +184,30 @@ export async function startTaskContainer(
   // the tool being logged out, which is a far clearer symptom than a container
   // that refused to start.
   if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
-  for (const planned of credentialCopyPlan(credentials, name)) {
+  await applyCredentials(name, credentials, bin);
+  return { name, publishedPort: publishPort };
+}
+
+/**
+ * Place the COPIED credentials into a container that already exists.
+ *
+ * Separate from container creation on purpose, and callable on a running
+ * container: a copy can be refreshed at any time, which is the whole practical
+ * difference between the two mechanisms. A mount is fixed when the container is
+ * created, so changing one means recreating the container and losing the task's
+ * running state — that is why narrowed ssh keys are copies, and why ticking a
+ * key can take effect in the session you are already in.
+ *
+ * Every step is best-effort: a credential that fails to land shows up as the
+ * tool reporting itself logged out, which is a far clearer symptom than a
+ * container that refused to start.
+ */
+export async function applyCredentials(
+  container: string,
+  credentials: ResolvedCredential[],
+  bin = 'podman',
+): Promise<void> {
+  for (const planned of credentialCopyPlan(credentials, container)) {
     // A credential that has to be rewritten on the way in is copied from a
     // temp file instead of straight from the operator's own.
     const credential = credentials.find((c) => c.hostPath === planned[1]);
@@ -189,7 +218,7 @@ export async function startTaskContainer(
     // failed silently and the agent reported the tool as logged out, with
     // nothing in the run log to explain why.
     const dest = args[2]?.split(':')[1];
-    if (dest) await run(bin, ['exec', name, 'mkdir', '-p', dirname(dest)]).catch(() => undefined);
+    if (dest) await run(bin, ['exec', container, 'mkdir', '-p', dirname(dest)]).catch(() => undefined);
     await run(bin, args).catch(() => undefined);
     // And then the modes, where the credential declares them. An SSH private
     // key that lands group-readable is REFUSED by ssh ("UNPROTECTED PRIVATE KEY
@@ -198,12 +227,65 @@ export async function startTaskContainer(
     // connecting it to the copy.
     const perms = dest ? permsFor(credentials, dest) : undefined;
     if (dest && perms) {
-      await run(bin, ['exec', name, 'chmod', perms.dir, dirname(dest)]).catch(() => undefined);
-      await run(bin, ['exec', name, 'chmod', perms.file, dest]).catch(() => undefined);
+      await run(bin, ['exec', container, 'chmod', perms.dir, dirname(dest)]).catch(() => undefined);
+      await run(bin, ['exec', container, 'chmod', perms.file, dest]).catch(() => undefined);
     }
     if (staged) rmSync(staged, { force: true });
   }
-  return { name, publishedPort: publishPort };
+}
+
+/**
+ * Push the project's COPIED credentials into every running container of that
+ * project, and answer the ones that were updated.
+ *
+ * This is what makes ticking a key in Settings take effect in the task you are
+ * already in, rather than in some future one. It is possible at all only
+ * because narrowed credentials are copies: a mount is fixed when the container
+ * is created, so the same change to a mounted credential could only be applied
+ * by destroying the container and the running task with it.
+ *
+ * Containers are matched by the workspace they have mounted, not by a name or a
+ * label we maintain: a container's own mount list is the only statement about
+ * which repo it belongs to that cannot drift. Pushing one project's credentials
+ * into another project's container is the failure worth designing against here.
+ */
+export async function applyCredentialsToRunning(
+  cfg: SandboxConfig,
+  repoRoot: string,
+  bin = 'podman',
+  /** Injectable for tests; defaults to running the real `podman`. */
+  ask: PodmanQuery = (args) => run(bin, args).then(({ stdout }) => stdout),
+): Promise<string[]> {
+  let names: string[];
+  try {
+    names = (await ask(['ps', '--format', '{{.Names}}']))
+      .split('\n').map((n) => n.trim()).filter((n) => n.startsWith('cez-'));
+  } catch {
+    return []; // no podman, or no VM — nothing to update and nothing to report
+  }
+  if (names.length === 0) return [];
+  const credentials = resolvePassthrough(cfg.credentials);
+  if (credentials.length === 0) return [];
+  const updated: string[] = [];
+  for (const name of names) {
+    if (!(await mountsWorkspace(name, repoRoot, ask))) continue;
+    await applyCredentials(name, credentials, bin);
+    updated.push(name);
+  }
+  return updated;
+}
+
+/** Reads something from podman. Answers its stdout; throws as `podman` does. */
+export type PodmanQuery = (args: string[]) => Promise<string>;
+
+/** Does this container have `repoRoot` bind-mounted — i.e. is it this project's? */
+async function mountsWorkspace(container: string, repoRoot: string, ask: PodmanQuery): Promise<boolean> {
+  try {
+    const mounts = await ask(['inspect', container, '--format', '{{range .Mounts}}{{.Source}}\n{{end}}']);
+    return mounts.split('\n').some((line) => line.trim() === repoRoot);
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -105,7 +105,7 @@ import {
 } from './git-changes.ts';
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { detectContainerRuntime } from '../core/container-probe.ts';
-import { removeTaskContainer } from '../core/podman-lifecycle.ts';
+import { applyCredentialsToRunning, removeTaskContainer } from '../core/podman-lifecycle.ts';
 import { CREDENTIAL_CATALOG, hostPathOf, listSshEntries } from '../core/credential-passthrough.ts';
 import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
 import { renderContainerfile } from '../core/containerfile-suggest.ts';
@@ -5275,8 +5275,22 @@ export function createApp(deps: ServerDeps) {
       } catch (err) {
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
       }
+      const saved = await loadConfig(repoRoot);
+      // Ticking a credential applies to the task you are IN, not just the next
+      // one. Copies can be refreshed in a running container, so a selection
+      // that only ever took effect at container creation would look broken for
+      // exactly as long as the current task lasts — which is how long anyone
+      // would be looking at it. Best-effort: a container that cannot be
+      // updated still gets the credential when its next turn starts.
+      if (parsed.data.sandbox?.credentials !== undefined && saved.sandbox) {
+        try {
+          await applyCredentialsToRunning(saved.sandbox, repoRoot);
+        } catch {
+          // podman missing, VM down — the save itself is unaffected.
+        }
+      }
       // Pre-R6 answer shape ({baseBranch, defaultRunner}) + additive R6 fields.
-      return c.json(await configAnswer(repoRoot, await loadConfig(repoRoot)));
+      return c.json(await configAnswer(repoRoot, saved));
     });
 
   // Set/clear the agents' config knobs (Settings → Agents; the Repo tab's
