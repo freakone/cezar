@@ -130,7 +130,7 @@ import {
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { detectContainerRuntime } from '../core/container-probe.ts';
 import { removeTaskContainer } from '../core/podman-lifecycle.ts';
-import { CREDENTIAL_CATALOG, hostPathOf } from '../core/credential-passthrough.ts';
+import { CREDENTIAL_CATALOG, hostPathOf, listSshEntries } from '../core/credential-passthrough.ts';
 import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
 import { renderContainerfile } from '../core/containerfile-suggest.ts';
 import { imageTag } from '../core/podman-launcher.ts';
@@ -5609,6 +5609,10 @@ export function createApp(deps: ServerDeps) {
             // Whether it is actually on this machine: a credential the operator
             // does not have should read as unavailable, not as "off".
             present: source.hostPath ? existsSync(hostPathOf(source) ?? '') : true,
+            // What the operator could tick instead of the whole directory.
+            // Read fresh on every request rather than cached: a key generated a
+            // minute ago should appear without restarting the cockpit.
+            entries: source.selectable === 'ssh' ? listSshEntries() : [],
           })),
           enabled: sandbox?.credentials?.enabled ?? {},
           custom: sandbox?.credentials?.custom ?? [],
@@ -5764,7 +5768,15 @@ export function createApp(deps: ServerDeps) {
           .optional(),
         credentials: z
           .object({
-            enabled: z.record(z.string(), z.union([z.boolean(), z.object({ mode: z.enum(['mount', 'copy']).optional() })])).optional(),
+            enabled: z.record(z.string(), z.union([
+        z.boolean(),
+        z.object({
+          mode: z.enum(['mount', 'copy']).optional(),
+          // Narrow a directory credential to individual files — `~/.ssh` today.
+          // Each is one path segment: these become host AND guest paths.
+          keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+        }),
+      ])).optional(),
             custom: z
               .array(z.object({
                 id: z.string().trim().min(1),
