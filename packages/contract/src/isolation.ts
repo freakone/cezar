@@ -83,8 +83,28 @@ export const isolationStatusResponseSchema = z.object({
       defaultMode: z.enum(['mount', 'copy']),
       note: z.string().optional(),
       present: z.boolean(),
+      /**
+       * Individual files this credential can be narrowed to, discovered on the
+       * host — today only `~/.ssh`. All-or-nothing is a real hazard there: one
+       * directory mount hands the container every host every key reaches, so
+       * the UI offers the files and the operator ticks the ones the task needs.
+       * Selected files are COPIED whatever `mode` says (see the core module).
+       */
+      entries: z.array(z.object({
+        name: z.string(),
+        kind: z.enum(['private-key', 'config', 'known-hosts']),
+        /** `ed25519 · kamil@mac`, when the matching `.pub` says so. */
+        detail: z.string().optional(),
+      })).default([]),
     })).default([]),
-    enabled: z.record(z.string(), z.union([z.boolean(), z.object({ mode: z.enum(['mount', 'copy']).optional() })])).default({}),
+    enabled: z.record(z.string(), z.union([
+      z.boolean(),
+      z.object({
+        mode: z.enum(['mount', 'copy']).optional(),
+        /** Narrowed file picks; empty or absent means the whole directory. */
+        keys: z.array(z.string()).optional(),
+      }),
+    ])).default({}),
     custom: z.array(z.object({
       id: z.string(),
       label: z.string().optional(),

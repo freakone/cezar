@@ -4,7 +4,10 @@ import {
   credentialCopyPlan,
   credentialEnvPairs,
   credentialMountArgs,
+  listSshEntries,
   resolvePassthrough,
+  sanitizeSshConfig,
+  type SshFs,
 } from './credential-passthrough.ts';
 
 const HOME = '/Users/k';
@@ -101,5 +104,156 @@ describe('credential passthrough', () => {
   it('a custom credential defaults to copy — the safer of the two', () => {
     const resolved = resolvePassthrough({ custom: [{ id: 'x', hostPath: '.x', guestPath: '/root/.x' }] }, HOME, allExist);
     expect(resolved[0]?.mode).toBe('copy');
+  });
+});
+
+/** A fake `~/.ssh` with the shapes that actually turn up on a real machine. */
+const sshFs = (files: Record<string, string>, dirs: string[] = []): SshFs => ({
+  readdir: () => [...Object.keys(files), ...dirs],
+  isFile: (path) => !dirs.some((d) => path.endsWith(`/${d}`)),
+  head: (path, bytes) => (files[path.split('/').pop() ?? ''] ?? '').slice(0, bytes),
+});
+
+const REAL_SSH = {
+  // Named by their purpose, not `id_ed25519` — which is the normal case, and
+  // the one a name-based guess gets wrong.
+  github: '-----BEGIN OPENSSH PRIVATE KEY-----\nabc',
+  'github.pub': 'ssh-ed25519 AAAAC3Nz kamil@mac',
+  gitlab: '-----BEGIN OPENSSH PRIVATE KEY-----\ndef',
+  deploy_prod: '-----BEGIN RSA PRIVATE KEY-----\nghi',
+  config: 'Host gl\n  IdentityFile ~/.ssh/gitlab',
+  known_hosts: 'gitlab.com ssh-ed25519 AAAA',
+  'known_hosts.old': 'stale',
+  authorized_keys: 'ssh-rsa AAAA someone@else',
+};
+
+describe('ssh keys, one at a time', () => {
+  it('finds keys by their CONTENT — people do not name them id_ed25519', () => {
+    const found = listSshEntries('/Users/k', sshFs(REAL_SSH, ['agent']));
+    expect(found.map((e) => e.name)).toEqual(['config', 'deploy_prod', 'github', 'gitlab', 'known_hosts']);
+    expect(found.find((e) => e.name === 'github')).toMatchObject({
+      kind: 'private-key',
+      // Read from the matching .pub, so the list is identifiable at a glance.
+      detail: 'ed25519 · kamil@mac',
+    });
+  });
+
+  it('never offers authorized_keys, backups, .pub files or directories', () => {
+    const names = listSshEntries('/Users/k', sshFs(REAL_SSH, ['agent'])).map((e) => e.name);
+    // `authorized_keys` is who may log in to THIS machine — other people's keys,
+    // and nothing the agent can use.
+    expect(names).not.toContain('authorized_keys');
+    expect(names).not.toContain('known_hosts.old');
+    // A .pub rides along with its private key; as its own tick it is a decision
+    // with no consequence.
+    expect(names.some((n) => n.endsWith('.pub'))).toBe(false);
+    expect(names).not.toContain('agent');
+  });
+
+  it('a missing ~/.ssh is an empty list, not a crash', () => {
+    const exploding: SshFs = {
+      readdir: () => { throw new Error('ENOENT'); },
+      isFile: () => false,
+      head: () => '',
+    };
+    expect(listSshEntries('/Users/k', exploding)).toEqual([]);
+  });
+
+  it('passes ONLY the ticked keys — not the directory that holds the rest', () => {
+    // The point of the feature: a task that needs the deploy key must not also
+    // get the key that reaches production.
+    const resolved = resolvePassthrough(
+      { enabled: { ssh: { mode: 'mount', keys: ['github', 'known_hosts'] } } }, HOME, allExist,
+    );
+    const plan = credentialCopyPlan(resolved, 'cez-1');
+    expect(plan.map((c) => c[1])).toEqual([
+      `${HOME}/.ssh/github`,
+      `${HOME}/.ssh/github.pub`,
+      `${HOME}/.ssh/known_hosts`,
+    ]);
+    // Nothing is MOUNTED, so ~/.ssh as a whole never appears.
+    expect(credentialMountArgs(resolved)).toEqual([]);
+    expect(JSON.stringify(resolved)).not.toContain(`${HOME}/.ssh/gitlab`);
+  });
+
+  it('ticked keys are COPIED even when the mode says mount', () => {
+    // Narrowing is a containment choice: "may use this key" and "may overwrite
+    // this key on my disk" are different grants, and someone ticking one key out
+    // of five is asking for the first.
+    const resolved = resolvePassthrough(
+      { enabled: { ssh: { mode: 'mount', keys: ['github'] } } }, HOME, allExist,
+    );
+    expect(resolved.every((c) => c.mode === 'copy')).toBe(true);
+  });
+
+  it('declares 600 on a private key — ssh REFUSES one that is readable', () => {
+    // Not a warning: ssh declines to use the key, and the failure surfaces as
+    // "permission denied (publickey)" with nothing pointing back at the copy.
+    const resolved = resolvePassthrough({ enabled: { ssh: { keys: ['github'] } } }, HOME, allExist);
+    expect(resolved[0]?.perms).toEqual({ file: '600', dir: '700' });
+    expect(resolved[0]?.guestPath).toBe('/root/.ssh/github');
+  });
+
+  it('ticking nothing still means the whole directory — configs keep their meaning', () => {
+    const resolved = resolvePassthrough({ enabled: { ssh: { mode: 'mount' } } }, HOME, allExist);
+    expect(credentialMountArgs(resolved)).toEqual(['-v', `${HOME}/.ssh:/root/.ssh`]);
+    expect(resolvePassthrough({ enabled: { ssh: { mode: 'mount', keys: [] } } }, HOME, allExist))
+      .toEqual(resolved);
+  });
+
+  it('refuses a key name that is a path — it becomes a host AND a guest path', () => {
+    const resolved = resolvePassthrough(
+      { enabled: { ssh: { keys: ['../.aws/credentials', 'a/b', 'github'] } } }, HOME, allExist,
+    );
+    expect(resolved.map((c) => c.id)).toEqual(['ssh:github', 'ssh:github.pub']);
+  });
+
+  it('a ticked key that is gone is skipped with a reason, not mounted as an empty file', () => {
+    const resolved = resolvePassthrough({ enabled: { ssh: { keys: ['github'] } } }, HOME, noneExist);
+    expect(resolved[0]?.skipped).toMatch(/does not exist/);
+    expect(credentialCopyPlan(resolved, 'c')).toEqual([]);
+  });
+});
+
+describe('the copied ssh config', () => {
+  const MAC_CONFIG = [
+    'Host github.com',
+    '  User git',
+    '  IdentityFile ~/.ssh/github',
+    'Host azure',
+    '  AddKeysToAgent yes',
+    '  UseKeychain yes',
+  ].join('\n');
+
+  it('neutralizes UseKeychain, which Linux ssh REFUSES to start with', () => {
+    // Not ignored, not warned about: "Bad configuration option: usekeychain" and
+    // ssh terminates, for every host — including the ones the option had nothing
+    // to do with. Apple's own docs tell Mac users to add this line, so plenty of
+    // ~/.ssh/config files have it. Verified by running ssh in a container.
+    const out = sanitizeSshConfig(MAC_CONFIG);
+    expect(out).toContain('# UseKeychain yes');
+    expect(out).toMatch(/macOS-only/);
+    // Commented, not deleted: it is the operator's file, readable in the
+    // container, and a silently vanishing line is worse than an explained one.
+    expect(out).toContain('UseKeychain');
+  });
+
+  it('leaves every option Linux ssh DOES understand exactly as written', () => {
+    const out = sanitizeSshConfig(MAC_CONFIG).split('\n');
+    // AddKeysToAgent is portable (OpenSSH 7.2+) — rewriting it would be a
+    // behaviour change smuggled in under a compatibility fix.
+    expect(out).toContain('  AddKeysToAgent yes');
+    expect(out).toContain('  IdentityFile ~/.ssh/github');
+    expect(out).toContain('Host github.com');
+  });
+
+  it('is applied to config and to nothing else', () => {
+    const resolved = resolvePassthrough(
+      { enabled: { ssh: { keys: ['config', 'github', 'known_hosts'] } } }, HOME, allExist,
+    );
+    expect(resolved.find((c) => c.id === 'ssh:config')?.sanitize).toBe('ssh-config');
+    // A key file is bytes; rewriting one would corrupt it.
+    expect(resolved.find((c) => c.id === 'ssh:github')?.sanitize).toBeUndefined();
+    expect(resolved.find((c) => c.id === 'ssh:known_hosts')?.sanitize).toBeUndefined();
   });
 });
