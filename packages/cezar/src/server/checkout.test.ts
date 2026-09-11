@@ -20,8 +20,10 @@ import { clearProjectProbeCache, registerProject } from '../workspace/projects.t
 import {
   checkoutRepo,
   cleanupCheckout,
+  cloneRunnerFor,
   ghCloneArgs,
   ghCloneRunner,
+  gitlabCloneRunner,
   isValidCheckoutName,
   parseRepoRef,
   type CloneRunner,
@@ -64,18 +66,73 @@ describe('checkout — repo reference parsing', () => {
         repo: 'cezar',
         slug: 'open-mercato/cezar',
         cloneUrl: 'https://github.com/open-mercato/cezar.git',
+        // A bare `owner/repo` stays GitHub: every saved value and every existing
+        // caller keeps its meaning, and naming a forge means naming its host.
+        forge: 'github',
       });
     }
   });
 
-  it('refuses non-GitHub, malformed and argv-smuggling inputs', () => {
+  it('accepts the same spellings on gitlab.com, with a clone URL git can use', () => {
+    for (const input of [
+      'https://gitlab.com/open-mercato/cezar',
+      'https://gitlab.com/open-mercato/cezar.git',
+      'http://www.gitlab.com/open-mercato/cezar/',
+      'gitlab.com/open-mercato/cezar',
+      'git@gitlab.com:open-mercato/cezar.git',
+      'ssh://git@gitlab.com/open-mercato/cezar',
+    ]) {
+      expect(parseRepoRef(input), input).toEqual({
+        owner: 'open-mercato',
+        repo: 'cezar',
+        slug: 'open-mercato/cezar',
+        forge: 'gitlab',
+        // HTTPS even for an ssh spelling: it clones a public project with no key
+        // set up, which an ssh URL cannot.
+        cloneUrl: 'https://gitlab.com/open-mercato/cezar.git',
+      });
+    }
+  });
+
+  it('GitLab nests groups — a subgroup path is a repo, not a malformed one', () => {
+    // The difference that actually matters between the two forges. A flat
+    // two-segment rule rejects most real GitLab projects.
+    expect(parseRepoRef('https://gitlab.com/acme/backend/api')).toEqual({
+      owner: 'acme/backend',
+      repo: 'api',
+      slug: 'acme/backend/api',
+      forge: 'gitlab',
+      cloneUrl: 'https://gitlab.com/acme/backend/api.git',
+    });
+    // Every segment is still validated individually — nesting is not a hole.
+    expect(parseRepoRef('https://gitlab.com/acme/--upload-pack=x/api')).toBeNull();
+    expect(parseRepoRef('https://gitlab.com/acme/../api')).toBeNull();
+    // GitHub has no subgroups, so the flat rule still holds there.
+    expect(parseRepoRef('https://github.com/acme/backend/api')).toBeNull();
+  });
+
+  it('picks the clone command from the forge, never from the spelling', () => {
+    // `gh` resolves a slug against github.com and nothing else, so handing it a
+    // GitLab slug would clone a DIFFERENT repository that happens to share a
+    // name — the one failure here that is silent rather than loud.
+    const gh = parseRepoRef('open-mercato/cezar');
+    const gl = parseRepoRef('gitlab.com/open-mercato/cezar');
+    expect(cloneRunnerFor(gh!)).toBe(ghCloneRunner);
+    expect(cloneRunnerFor(gl!)).toBe(gitlabCloneRunner);
+  });
+
+  it('refuses unknown forges, malformed and argv-smuggling inputs', () => {
     for (const input of [
       '',
       '   ',
       'cezar',
       'open-mercato/cezar/extra',
-      'https://gitlab.com/owner/repo',
+      // Self-hosted is deliberately out: an unbounded instance URL makes "which
+      // host am I cloning from" unanswerable from the dialog.
+      'https://gitlab.example.com/owner/repo',
+      'https://git.sr.ht/~owner/repo',
       'https://evil.example/github.com/owner/repo',
+      'https://evil.example/gitlab.com/owner/repo',
       '--upload-pack=touch /tmp/pwned',
       'owner/--flag',
       '../../etc/passwd',
@@ -318,6 +375,32 @@ describe('checkoutRepo — clone, failure cleanup, existing target', () => {
     expect(existsSync(join(root, 'cezar'))).toBe(false);
   });
 
+  it('names the CLI that is actually missing, per forge', async () => {
+    // For GitLab this can only be `git`: an absent `glab` falls back rather than
+    // failing, so telling the user to install `gh` would send them nowhere.
+    const missing: CloneRunner = async () => ({ ok: false, error: 'spawn git ENOENT', notFound: true });
+    const result = await run({ url: 'https://gitlab.com/open-mercato/cezar', run: missing });
+    expect(result).toMatchObject({ ok: false, status: 503 });
+    expect(result).toHaveProperty('reason', expect.stringContaining('git not found'));
+  });
+
+  it('explains the GitLab 401, which git reports as an unreadable username prompt', async () => {
+    // gitlab.com answers 401 for a private project AND for one that does not
+    // exist, so git's own message ("could not read Username") names neither the
+    // cause nor the fix. Verified against gitlab.com, not imagined.
+    const denied: CloneRunner = async () => ({
+      ok: false,
+      error: "fatal: could not read Username for 'https://gitlab.com': terminal prompts disabled",
+    });
+    const result = await run({ url: 'https://gitlab.com/acme/private-thing', run: denied });
+    expect(result).toMatchObject({ ok: false, status: 500 });
+    const error = (result as { error: string }).error;
+    // git's own words are kept — the hint is appended, not substituted.
+    expect(error).toContain('could not read Username');
+    expect(error).toContain('glab auth login');
+    expect(error).toContain('acme/private-thing');
+  });
+
   it('409s on an existing target and does NOT touch it', async () => {
     const existing = join(root, 'cezar');
     mkdirSync(existing, { recursive: true });
@@ -508,10 +591,10 @@ describe('POST /api/v1/projects/checkout', () => {
     expect(body.error).toBe(body.reason);
   });
 
-  it('400s a non-GitHub url, a traversing name, and a malformed body — nothing written', async () => {
+  it('400s an unsupported forge, a traversing name, and a malformed body — nothing written', async () => {
     await useCheckoutRoot();
     for (const payload of [
-      { url: 'https://gitlab.com/owner/repo' },
+      { url: 'https://gitlab.example.com/owner/repo' },
       { url: 'not a repo' },
       { url: 'open-mercato/cezar', name: '../escape' },
       {},

@@ -29,7 +29,7 @@ import { SettingsField } from './settings-field'
 /**
  * Global settings → Projects (multi-project spec, step 4.4; mockup
  * `settings-global.html`): the two things that describe the WORKSPACE rather than any one repo —
- * where "Clone from GitHub" puts new checkouts, and the registry itself.
+ * where "Clone repository" puts new checkouts, and the registry itself.
  *
  * Two deliberate decisions live here:
  *
@@ -131,7 +131,7 @@ function ProjectsPane({
         configKey="projectsDir"
         value={config.projectsDir}
         title="Default checkout folder"
-        hint="Where “Clone from GitHub” puts new projects: <folder>/<project name>."
+        hint="Where “Clone repository” puts new projects: <folder>/<project name>."
         placeholder="~/cezar/projects"
         slot="checkout"
         savedLabel="Checkout folder"
