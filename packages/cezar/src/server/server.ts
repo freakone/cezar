@@ -2518,7 +2518,7 @@ export function createApp(deps: ServerDeps) {
       return c.json(body);
     })
 
-    .post('/projects/checkout', jsonZodValidator(() => checkoutSchema, { message: 'url must be a GitHub repository' }), async (c) => {
+    .post('/projects/checkout', jsonZodValidator(() => checkoutSchema, { message: 'url must be a GitHub or GitLab repository' }), async (c) => {
       if (capabilities().singleProject) {
         return c.json(singleProjectRefusal('adding projects'), 409);
       }
@@ -2776,7 +2776,7 @@ export function createApp(deps: ServerDeps) {
     });
 
   // ---- GUI clone (multi-project spec, step 4.3) ----------------------------
-  // "Add project → Clone from GitHub": clone into the checkout root, then
+  // "Add project → Clone": clone into the checkout root, then
   // register the result through `registerFolder` above (same guards, same
   // `project-added`). Everything dangerous — where the clone may land, and
   // what a failed clone is allowed to delete — lives in src/server/checkout.ts.

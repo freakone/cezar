@@ -710,7 +710,7 @@ function GlobalSettingsLink({
 /**
  * The "Add project" dropdown beside the New task CTA (multi-project spec, "Sidebar → Header").
  *
- * "Open local folder…" opens the folder-browser dialog (step 4.2); "Clone from GitHub…" opens
+ * "Open local folder…" opens the folder-browser dialog (step 4.2); "Clone repository…" opens
  * the checkout dialog (step 4.3).
  *
  * Neither item is gh-gated here, deliberately. The spec's "disabled with a reason when `gh` is
@@ -750,7 +750,7 @@ function AddProjectMenu() {
         </DropdownMenuItem>
         <DropdownMenuItem data-slot="add-project-clone" onSelect={() => setCloning(true)}>
           <GithubIcon aria-hidden="true" />
-          Clone from GitHub…
+          Clone repository…
         </DropdownMenuItem>
       </DropdownMenuContent>
       {browsing ? <AddProjectDialog open onOpenChange={setBrowsing} /> : null}
