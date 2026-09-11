@@ -1,12 +1,18 @@
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, statSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { BASE_IMAGE_TAG, agentClaudeHome, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import type { SandboxConfig } from '../config.ts';
-import { credentialCopyPlan, resolvePassthrough } from './credential-passthrough.ts';
+import {
+  credentialCopyPlan,
+  resolvePassthrough,
+  sanitizeSshConfig,
+  type ResolvedCredential,
+} from './credential-passthrough.ts';
 
 const run = promisify(execFile);
 
@@ -172,7 +178,12 @@ export async function startTaskContainer(
   // the tool being logged out, which is a far clearer symptom than a container
   // that refused to start.
   if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
-  for (const args of credentialCopyPlan(credentials, name)) {
+  for (const planned of credentialCopyPlan(credentials, name)) {
+    // A credential that has to be rewritten on the way in is copied from a
+    // temp file instead of straight from the operator's own.
+    const credential = credentials.find((c) => c.hostPath === planned[1]);
+    const staged = credential?.sanitize ? stageSanitized(credential) : undefined;
+    const args = staged ? ['cp', staged, planned[2] as string] : planned;
     // `podman cp` fails when the destination's parent is absent, and the base
     // image has no `/root/.config/gh` or `/root/.docker`. Without this the copy
     // failed silently and the agent reported the tool as logged out, with
@@ -180,8 +191,41 @@ export async function startTaskContainer(
     const dest = args[2]?.split(':')[1];
     if (dest) await run(bin, ['exec', name, 'mkdir', '-p', dirname(dest)]).catch(() => undefined);
     await run(bin, args).catch(() => undefined);
+    // And then the modes, where the credential declares them. An SSH private
+    // key that lands group-readable is REFUSED by ssh ("UNPROTECTED PRIVATE KEY
+    // FILE") — it does not warn and continue, it declines to use the key, which
+    // reads downstream as "permission denied (publickey)" with nothing
+    // connecting it to the copy.
+    const perms = dest ? permsFor(credentials, dest) : undefined;
+    if (dest && perms) {
+      await run(bin, ['exec', name, 'chmod', perms.dir, dirname(dest)]).catch(() => undefined);
+      await run(bin, ['exec', name, 'chmod', perms.file, dest]).catch(() => undefined);
+    }
+    if (staged) rmSync(staged, { force: true });
   }
   return { name, publishedPort: publishPort };
+}
+
+/**
+ * Write the rewritten form of a credential to a temp file, and answer its path.
+ * `undefined` when anything goes wrong — the caller then copies the original,
+ * which is the pre-existing behaviour rather than a new failure.
+ */
+function stageSanitized(credential: ResolvedCredential): string | undefined {
+  if (!credential.hostPath) return undefined;
+  try {
+    const dir = mkdtempSync(join(tmpdir(), 'cez-cred-'));
+    const staged = join(dir, basename(credential.hostPath));
+    writeFileSync(staged, sanitizeSshConfig(readFileSync(credential.hostPath, 'utf8')), { mode: 0o600 });
+    return staged;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The modes declared for whichever credential landed at `dest`, if any. */
+function permsFor(credentials: ResolvedCredential[], dest: string): { file: string; dir: string } | undefined {
+  return credentials.find((c) => c.guestPath === dest)?.perms;
 }
 
 /** What `startTaskContainer` hands back: where to exec, and the forwarded port. */

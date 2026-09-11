@@ -97,7 +97,15 @@ const sandboxSchema = z.object({
    */
   credentials: z
     .object({
-      enabled: z.record(z.string(), z.union([z.boolean(), z.object({ mode: z.enum(['mount', 'copy']).optional() })])).optional(),
+      enabled: z.record(z.string(), z.union([
+        z.boolean(),
+        z.object({
+          mode: z.enum(['mount', 'copy']).optional(),
+          // Narrow a directory credential to individual files — `~/.ssh` today.
+          // Each is one path segment: these become host AND guest paths.
+          keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+        }),
+      ])).optional(),
       custom: z
         .array(z.object({
           id: z.string().trim().min(1),

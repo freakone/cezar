@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -52,6 +52,14 @@ export interface CredentialSource {
   env?: string[];
   /** Default mechanism for this source; the user may override. */
   defaultMode: PassthroughMode;
+  /**
+   * This source can be narrowed to individual files, which the UI lists and the
+   * operator ticks. Only `~/.ssh` has this today, and it is the one credential
+   * where all-or-nothing is genuinely dangerous: a single `~/.ssh` mount hands
+   * the container every host every key reaches, production included, when the
+   * task needed one deploy key.
+   */
+  selectable?: 'ssh';
   /** Why this one needs mount, when it does — shown in the UI. */
   note?: string;
 }
@@ -89,7 +97,9 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
     hostPath: '.ssh',
     guestPath: '/root/.ssh',
     defaultMode: 'mount',
-    note: 'Grants the container everything your keys reach, including production. Enable deliberately.',
+    // Whole-directory is the fallback, not the recommendation: see `selectable`.
+    selectable: 'ssh',
+    note: 'Pick individual keys — the whole directory hands the container every host your keys reach.',
   },
   {
     id: 'gcloud',
@@ -154,6 +164,134 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
   },
 ];
 
+/**
+ * One file inside `~/.ssh` the operator can pass through on its own.
+ *
+ * Discovery reads the FILE, not its name: a private key is "starts with
+ * `-----BEGIN`", because these are called `id_ed25519`, `github`, `work-deploy`
+ * and anything else a person felt like, and a name-based guess would miss
+ * exactly the keys someone bothered to name well.
+ */
+export interface SshEntry {
+  /** File name inside `~/.ssh`. */
+  name: string;
+  kind: 'private-key' | 'config' | 'known-hosts';
+  /** `ed25519 · kamil@mac`, read from the matching `.pub` when there is one. */
+  detail?: string;
+}
+
+/** Injectable filesystem, so discovery is testable without a real `~/.ssh`. */
+export interface SshFs {
+  readdir(dir: string): string[];
+  isFile(path: string): boolean;
+  head(path: string, bytes: number): string;
+}
+
+const realSshFs: SshFs = {
+  readdir: (dir) => readdirSync(dir),
+  isFile: (path) => {
+    try {
+      return statSync(path).isFile();
+    } catch {
+      return false;
+    }
+  },
+  head: (path, bytes) => {
+    try {
+      return readFileSync(path, 'utf8').slice(0, bytes);
+    } catch {
+      return '';
+    }
+  },
+};
+
+/**
+ * What is in `~/.ssh` that an agent could use, as a list the UI can offer.
+ *
+ * Deliberately NOT listed:
+ *  - `authorized_keys` — that is who may log in to THIS machine. It grants the
+ *    container nothing, and it is a list of other people's keys.
+ *  - `*.pub` — a public key rides along with its private key automatically
+ *    (see `resolvePassthrough`); as its own checkbox it is a decision with no
+ *    consequence, and the point of this list is that every tick is a real one.
+ *  - `*.old` backups, sockets, and directories (`~/.ssh/agent`).
+ */
+export function listSshEntries(home = homedir(), fs: SshFs = realSshFs): SshEntry[] {
+  const dir = join(home, '.ssh');
+  let names: string[];
+  try {
+    names = fs.readdir(dir);
+  } catch {
+    return []; // no ~/.ssh at all — the caller shows "not on this machine"
+  }
+  const entries: SshEntry[] = [];
+  for (const name of names.sort()) {
+    if (name === 'authorized_keys' || name.endsWith('.pub') || name.endsWith('.old')) continue;
+    const path = join(dir, name);
+    if (!fs.isFile(path)) continue;
+    if (name === 'config') {
+      entries.push({ name, kind: 'config' });
+      continue;
+    }
+    if (name === 'known_hosts') {
+      entries.push({ name, kind: 'known-hosts' });
+      continue;
+    }
+    // The content test. 64 bytes covers every OpenSSH and PEM header.
+    if (!fs.head(path, 64).startsWith('-----BEGIN')) continue;
+    const pub = fs.head(`${path}.pub`, 4096).trim();
+    entries.push({ name, kind: 'private-key', ...(describeKey(pub) ? { detail: describeKey(pub) } : {}) });
+  }
+  return entries;
+}
+
+/** `ssh-ed25519 AAAA… kamil@mac` → `ed25519 · kamil@mac`. */
+function describeKey(pub: string): string | undefined {
+  if (pub === '') return undefined;
+  const [algorithm, , ...comment] = pub.split(/\s+/);
+  const kind = algorithm?.replace(/^ssh-/, '').replace(/^ecdsa-sha2-/, '') ?? '';
+  const who = comment.join(' ').trim();
+  return [kind, who].filter(Boolean).join(' · ') || undefined;
+}
+
+/** A selected file name is one segment of `~/.ssh` — never a path out of it. */
+const SSH_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** The `~/.ssh` files that are settings rather than keys, so no `.pub` pairing. */
+const SSH_NON_KEY = new Set(['config', 'known_hosts']);
+
+/**
+ * Options only Apple's OpenSSH understands. `UseKeychain` is the one that
+ * matters: Apple's own documentation tells Mac users to put it in `~/.ssh/config`,
+ * so it is in a great many of them.
+ */
+const MACOS_ONLY_SSH_OPTIONS = ['usekeychain'];
+
+/**
+ * Comment out the macOS-only options in a copied `~/.ssh/config`.
+ *
+ * Linux OpenSSH does not ignore an option it does not know — it refuses to
+ * start: `Bad configuration option: usekeychain` / `terminating, 1 bad
+ * configuration options`, for EVERY host, including the ones the option had
+ * nothing to do with. So a Mac operator who ticks `config` gets an ssh that
+ * cannot connect anywhere, and an error that names a line they wrote years ago
+ * on the advice of Apple's documentation. (Found by running it, not by reading
+ * about it.)
+ *
+ * Commented rather than deleted, with the reason inline: the file is the
+ * operator's, and it shows up in a container they can read.
+ */
+export function sanitizeSshConfig(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => {
+      const option = line.trim().split(/[\s=]+/)[0]?.toLowerCase() ?? '';
+      if (!MACOS_ONLY_SSH_OPTIONS.includes(option)) return line;
+      return `# ${line.trim()}  # cezar: macOS-only option, rejected by OpenSSH here`;
+    })
+    .join('\n');
+}
+
 /** A credential the operator defined themselves — a path, some env, or both. */
 export interface CustomCredential {
   id: string;
@@ -164,9 +302,20 @@ export interface CustomCredential {
   mode?: PassthroughMode;
 }
 
+/** What the operator chose for one catalog credential. */
+export interface CredentialChoice {
+  mode?: PassthroughMode;
+  /**
+   * For a `selectable` source: the individual files to pass, instead of the
+   * whole directory. Empty or absent means the whole directory — which is what
+   * every existing config says, so nothing changes underneath anyone.
+   */
+  keys?: string[];
+}
+
 export interface PassthroughSelection {
-  /** Catalog ids that are on, with an optional mode override. */
-  enabled?: Record<string, { mode?: PassthroughMode } | boolean>;
+  /** Catalog ids that are on, with an optional mode override and file picks. */
+  enabled?: Record<string, CredentialChoice | boolean>;
   /** Anything not in the catalog. */
   custom?: CustomCredential[];
 }
@@ -187,6 +336,14 @@ export interface ResolvedCredential {
   env: string[];
   /** Why it was skipped, when it was. */
   skipped?: string;
+  /**
+   * Modes to set inside the container after a copy. SSH refuses a private key
+   * it considers world-readable ("UNPROTECTED PRIVATE KEY FILE") and simply
+   * does not authenticate, so a copy that lands 0644 is a silent failure.
+   */
+  perms?: { file: string; dir: string };
+  /** Rewrite the file's CONTENT on the way in; see `sanitizeSshConfig`. */
+  sanitize?: 'ssh-config';
 }
 
 /**
@@ -209,6 +366,14 @@ export function resolvePassthrough(
     const choice = selection.enabled?.[source.id];
     if (!choice) continue;
     const mode = (typeof choice === 'object' && choice.mode) || source.defaultMode;
+    const keys = typeof choice === 'object' ? choice.keys ?? [] : [];
+    // A narrowed `selectable` source passes the named files instead of the
+    // directory. This is the whole point of picking keys: the container gets
+    // the deploy key it needs and not the one that reaches production.
+    if (source.selectable === 'ssh' && keys.length > 0) {
+      out.push(...resolveSshKeys(keys, home, exists, source.env ?? []));
+      continue;
+    }
     const hostPath = hostPathOf(source, home);
     const resolved: ResolvedCredential = {
       id: source.id,
@@ -232,6 +397,62 @@ export function resolvePassthrough(
     if (hostPath && exists(hostPath)) resolved.hostPath = hostPath;
     else if (hostPath) resolved.skipped = `${hostPath} does not exist on this machine`;
     out.push(resolved);
+  }
+  return out;
+}
+
+/**
+ * One selected `~/.ssh` file becomes one COPIED credential.
+ *
+ * Always copy, never mount, whatever mode the source carries — for two reasons
+ * that both point the same way:
+ *
+ *  - a key file is exactly the thing the module warns about mounting: static
+ *    until something rewrites it (`ssh-keygen -p`, a rotation script), and a
+ *    file bind mount does not survive that;
+ *  - narrowing is a containment feature. "The container may use this key" and
+ *    "the container may overwrite this key on my disk" are different grants,
+ *    and someone ticking one key out of five is plainly asking for the first.
+ *
+ * A private key brings its `.pub` along when there is one. That is not a
+ * widening — a public key is public — and some tooling still expects the pair.
+ */
+function resolveSshKeys(
+  keys: string[],
+  home: string,
+  exists: (p: string) => boolean,
+  env: string[],
+): ResolvedCredential[] {
+  const dir = join(home, '.ssh');
+  const out: ResolvedCredential[] = [];
+  const perms = { file: '600', dir: '700' };
+  for (const name of keys) {
+    // The name comes from config, which a person edits by hand. One segment,
+    // no traversal: this string becomes both a host path and a guest path.
+    if (!SSH_FILE.test(name)) continue;
+    const hostPath = join(dir, name);
+    const resolved: ResolvedCredential = {
+      id: `ssh:${name}`,
+      mode: 'copy',
+      guestPath: `/root/.ssh/${name}`,
+      env,
+      perms,
+      ...(name === 'config' ? { sanitize: 'ssh-config' as const } : {}),
+    };
+    if (exists(hostPath)) resolved.hostPath = hostPath;
+    else resolved.skipped = `${hostPath} does not exist on this machine`;
+    out.push(resolved);
+    const pub = `${hostPath}.pub`;
+    if (resolved.hostPath && !SSH_NON_KEY.has(name) && !name.endsWith('.pub') && exists(pub)) {
+      out.push({
+        id: `ssh:${name}.pub`,
+        mode: 'copy',
+        hostPath: pub,
+        guestPath: `/root/.ssh/${name}.pub`,
+        env: [],
+        perms: { file: '644', dir: '700' },
+      });
+    }
   }
   return out;
 }
