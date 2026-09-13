@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { applyCredentialsToRunning, taskContainerName } from './podman-lifecycle.ts';
+import { applyCredentialsToRunning, syncClaudeCredential, taskContainerName } from './podman-lifecycle.ts';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { SandboxConfig } from '../config.ts';
 
 describe('podman lifecycle', () => {
@@ -58,5 +61,55 @@ describe('applying a credential to containers that already exist', () => {
     const none = { credentials: {} } as unknown as SandboxConfig;
     const updated = await applyCredentialsToRunning(none, REPO, 'podman', podman({ 'cez-aaaaaaaa': [REPO] }));
     expect(updated).toEqual([]);
+  });
+});
+
+describe('the claude credential in a container from an older cezar', () => {
+  // These containers bind-MOUNTED the credential. A relogin on the host
+  // rewrites that file atomically, which unlinks the inode the mount holds:
+  // `ls` still reports 508 bytes and every read fails with ENOENT. The agent
+  // then says "Not logged in — please run /login", which is the one action that
+  // cannot help, because doing it rewrites the file and breaks the mount again.
+  const calls: string[][] = [];
+  // A real file, so the test exercises the same path a logged-in machine does
+  // and does not quietly skip itself on a machine that has never logged in.
+  const source = join(mkdtempSync(join(tmpdir(), 'cez-cred-test-')), '.credentials.json');
+  writeFileSync(source, '{"claudeAiOauth":{"accessToken":"sk-ant-test"}}');
+  const podman = (readable: boolean): (args: string[]) => Promise<string> => async (args) => {
+    calls.push(args);
+    if (args[0] === 'exec' && args[2] === 'head' && !readable) throw new Error('ENOENT');
+    return '';
+  };
+
+  it('restarts the container when the credential cannot be READ, and copies again', async () => {
+    calls.length = 0;
+    await syncClaudeCredential('cez-old', 'podman', podman(false), source);
+    expect(calls.some((c) => c[0] === 'restart' && c[1] === 'cez-old')).toBe(true);
+    // And the copy is redone AFTER the restart, or the container would come
+    // back up holding whatever the stale mount resolves to.
+    const restartAt = calls.findIndex((c) => c[0] === 'restart');
+    expect(calls.slice(restartAt).some((c) => c[0] === 'cp')).toBe(true);
+  });
+
+  it('does NOT restart when the credential reads fine — the normal case', async () => {
+    calls.length = 0;
+    await syncClaudeCredential('cez-new', 'podman', podman(true), source);
+    expect(calls.some((c) => c[0] === 'restart')).toBe(false);
+  });
+
+  it('checks by READING, never by ls — a deleted inode still stats', async () => {
+    calls.length = 0;
+    await syncClaudeCredential('cez-new', 'podman', podman(true), source);
+    const probe = calls.find((c) => c[0] === 'exec' && c.includes('head'));
+    expect(probe).toBeDefined();
+    expect(calls.some((c) => c.includes('ls'))).toBe(false);
+  });
+
+  it('syncs nothing when the host has no credential — the Keychain case', async () => {
+    // The container may hold its own login; overwriting it with nothing, or
+    // restarting it in a loop, would be worse than leaving it alone.
+    calls.length = 0;
+    await syncClaudeCredential('cez-new', 'podman', podman(false), join(tmpdir(), 'cez-absent-credential'));
+    expect(calls).toEqual([]);
   });
 });

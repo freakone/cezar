@@ -354,11 +354,52 @@ async function publishedPortOf(name: string, bin: string): Promise<number | unde
  * Silent when the host has no credential: that is the Keychain case, and the
  * container may hold its own login.
  */
-export async function syncClaudeCredential(container: string, bin = 'podman'): Promise<void> {
-  const source = hostClaudeCredential();
+export async function syncClaudeCredential(
+  container: string,
+  bin = 'podman',
+  /** Injectable for tests; defaults to running the real `podman`. */
+  ask: PodmanQuery = (args) => run(bin, args).then(({ stdout }) => stdout),
+  /** The host file to sync; injectable so this is testable off a real login. */
+  source = hostClaudeCredential(),
+): Promise<void> {
   if (!existsSync(source)) return;
-  await run(bin, ['exec', container, 'mkdir', '-p', '/root/.claude']).catch(() => undefined);
-  await run(bin, ['cp', source, `${container}:/root/.claude/.credentials.json`]).catch(() => undefined);
+  await ask(['exec', container, 'mkdir', '-p', GUEST_CREDENTIAL_DIR]).catch(() => undefined);
+  await ask(['cp', source, `${container}:${GUEST_CREDENTIAL}`]).catch(() => undefined);
+  if (await credentialReadable(container, ask)) return;
+  // Unreadable after a successful copy means a container from an older cezar,
+  // which BIND-MOUNTED this file. The mount holds an inode; Claude Code
+  // rewrites the credential with temp-file-plus-rename when it refreshes or
+  // when the operator logs in again, which unlinks it. The container is then
+  // left holding a deleted file: `ls` still shows 508 bytes and every read
+  // fails with ENOENT.
+  //
+  // The agent reports this as "Not logged in — please run /login", which sends
+  // the operator to do the one thing that CANNOT help: logging in again on the
+  // host rewrites the file once more and breaks the mount again. Seen twice.
+  //
+  // Restarting re-resolves the mount to the file that exists now. It is safe
+  // here because this runs between turns, and it is narrow: only when the host
+  // HAS a credential and the container still cannot read it.
+  await ask(['restart', container]).catch(() => undefined);
+  await ask(['cp', source, `${container}:${GUEST_CREDENTIAL}`]).catch(() => undefined);
+}
+
+const GUEST_CREDENTIAL_DIR = '/root/.claude';
+const GUEST_CREDENTIAL = `${GUEST_CREDENTIAL_DIR}/.credentials.json`;
+
+/**
+ * Can the agent actually READ the credential?
+ *
+ * `ls` is not the question and never was: a bind mount of an unlinked inode
+ * still stats, with the right size and date. Only a read tells the truth.
+ */
+async function credentialReadable(container: string, ask: PodmanQuery): Promise<boolean> {
+  try {
+    await ask(['exec', container, 'head', '-c', '1', GUEST_CREDENTIAL]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Remove this task's container. Never throws — teardown must not fail a run. */
