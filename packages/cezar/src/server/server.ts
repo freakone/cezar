@@ -160,6 +160,7 @@ import {
 import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { mergeWriteWorkspaceUiState, readWorkspaceUiState } from '../workspace/ui-state.ts';
 import { checkoutRepo, type CloneRunner } from './checkout.ts';
+import { createProject, type GitRunner } from './create-project.ts';
 import { ProjectContextError, ProjectContexts, type ProjectContext } from './project-context.ts';
 import { reviewGateEnabled } from '../runs/review-gate.ts';
 import { readUiState, uiStatePath } from '../ui-state.ts';
@@ -233,6 +234,10 @@ export interface ServerDeps {
    *  route's guards, cleanup and error surfacing are exercised for real
    *  against real temp dirs, without a network or a `gh` binary. */
   cloneRunner?: CloneRunner;
+  /** How `POST /api/projects/create` runs git. Defaults to the real binary;
+   *  injected by tests so the route's guards and cleanup are exercised without
+   *  depending on the runner's git identity being configured. */
+  gitRunner?: GitRunner;
   /** Host-wide model discovery service. Tests inject a deterministic adapter. */
   modelCatalog?: RunnerModelCatalog;
   /** Host-wide provider authentication discovery. Tests inject deterministic probes. */
@@ -2518,6 +2523,34 @@ export function createApp(deps: ServerDeps) {
       return c.json(body);
     })
 
+    /**
+     * "Add project → New project" — create an empty, initialized repo in the
+     * checkout root and register it. Same guards as the checkout route (that is
+     * what `createProject` is built on), and the same division of labour: the
+     * module owns the filesystem, this route owns the registry write.
+     */
+    .post('/projects/create', jsonZodValidator(() => createProjectSchema, { message: 'name must be a single folder name' }), async (c) => {
+      if (capabilities().singleProject) {
+        return c.json(singleProjectRefusal('adding projects'), 409);
+      }
+      const result = await createProject({
+        name: c.req.valid('json').name,
+        projectsDir: expandTilde(await workspaceProjectsDir()),
+        ...(deps.gitRunner ? { git: deps.gitRunner } : {}),
+      });
+      if (!result.ok) return c.json({ error: result.error }, result.status);
+      const registered = await registerFolder(result.target, 'checkout');
+      if (registered.status !== 200) {
+        // The repo EXISTS and is the user's; an unregisterable project is a
+        // registry problem, not a reason to delete what was just created. Say
+        // where it is, as the checkout route does.
+        const { body } = registered;
+        const error = 'error' in body && body.error ? body.error : 'could not register the new project';
+        return c.json({ error: `${error} (the project is at ${result.target})` }, registered.status);
+      }
+      return c.json(registered.body, 200);
+    })
+
     .post('/projects/checkout', jsonZodValidator(() => checkoutSchema, { message: 'url must be a GitHub or GitLab repository' }), async (c) => {
       if (capabilities().singleProject) {
         return c.json(singleProjectRefusal('adding projects'), 409);
@@ -2790,6 +2823,11 @@ export function createApp(deps: ServerDeps) {
     url: z.string().trim().min(1).max(512),
     name: z.string().trim().max(128).optional(),
     checkoutId: z.string().trim().max(128).optional(),
+  });
+  // "New project": a name and nothing else. Where it lands is the workspace's
+  // checkout root, so there is one answer to "where do my projects live".
+  const createProjectSchema = z.object({
+    name: z.string().trim().min(1).max(128),
   });
   // ---- workspace settings (multi-project spec, step 2.7) -------------------
   // WORKSPACE-level routes: single-mount (never mirrored under /api/p/),

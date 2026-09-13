@@ -194,3 +194,16 @@ export const launchKeyResponseSchema = z.object({
   key: z.string(),
 });
 export type LaunchKeyResponse = z.infer<typeof launchKeyResponseSchema>;
+
+/**
+ * `POST /api/v1/projects/create` — "Add project → New project": start a project
+ * that does not exist yet, in the checkout root, as an initialized git repo.
+ *
+ * Only a name. The location is the workspace's checkout root, the same place
+ * clones land, so there is one answer to "where do my projects live" rather
+ * than a per-dialog one.
+ */
+export const createProjectInputSchema = z.object({
+  name: z.string().trim().min(1).max(128),
+});
+export type CreateProjectInput = z.infer<typeof createProjectInputSchema>;

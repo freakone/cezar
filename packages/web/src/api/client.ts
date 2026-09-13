@@ -26,6 +26,7 @@ import type {
   CancelResponse,
   ChangesPayload,
   CheckoutProjectInput,
+  CreateProjectInput,
   ConfigResponse,
   IsolationStatusResponse,
   ReclaimWorktreesResponse,
@@ -1062,6 +1063,19 @@ export async function registerProject(root: string): Promise<RegisterProjectResp
  */
 export async function checkoutProject(input: CheckoutProjectInput): Promise<RegisterProjectResponse> {
   return unwrap(await cez.api.v1.projects.checkout.$post({ json: input }), '/projects/checkout')
+}
+
+/**
+ * Create an empty, initialized project in the checkout root and register it
+ * (`POST /api/projects/create`).
+ *
+ * Same contract as `checkoutProject`: every non-2xx is a failure the dialog must show (409 =
+ * the folder exists), and the server's `{ error }` — git's own words, when git is what failed
+ * — is what gets rendered. No progress stream: creating a repo is one fast local operation,
+ * so there is nothing to watch.
+ */
+export async function createProject(input: CreateProjectInput): Promise<RegisterProjectResponse> {
+  return unwrap(await cez.api.v1.projects.create.$post({ json: input }), '/projects/create')
 }
 
 /**

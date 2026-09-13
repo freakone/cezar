@@ -1,5 +1,6 @@
 import {
   FolderIcon,
+  FolderPlusIcon,
   FolderOpenIcon,
   LayersIcon,
   MenuIcon,
@@ -14,6 +15,7 @@ import { Link as RouterLink, matchPath, useLocation } from 'react-router'
 
 import { AddProjectDialog } from '@/components/add-project-dialog'
 import { CloneProjectDialog } from '@/components/clone-project-dialog'
+import { CreateProjectDialog } from '@/components/create-project-dialog'
 import { openCommandPalette } from '@/components/command-palette'
 import { GithubIcon } from '@/components/icons'
 import { commandShortcutHint } from '@/lib/use-command-shortcut'
@@ -728,6 +730,7 @@ function GlobalSettingsLink({
 function AddProjectMenu() {
   const [browsing, setBrowsing] = React.useState(false)
   const [cloning, setCloning] = React.useState(false)
+  const [creating, setCreating] = React.useState(false)
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -752,9 +755,14 @@ function AddProjectMenu() {
           <GithubIcon aria-hidden="true" />
           Clone repository…
         </DropdownMenuItem>
+        <DropdownMenuItem data-slot="add-project-create" onSelect={() => setCreating(true)}>
+          <FolderPlusIcon aria-hidden="true" />
+          New project…
+        </DropdownMenuItem>
       </DropdownMenuContent>
       {browsing ? <AddProjectDialog open onOpenChange={setBrowsing} /> : null}
       {cloning ? <CloneProjectDialog open onOpenChange={setCloning} /> : null}
+      {creating ? <CreateProjectDialog open onOpenChange={setCreating} /> : null}
     </DropdownMenu>
   )
 }
