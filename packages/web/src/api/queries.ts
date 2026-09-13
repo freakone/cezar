@@ -8,6 +8,7 @@ import {
   ApiError,
   browseFs,
   checkoutProject,
+  createProject,
   connectProvider,
   continueRun,
   continueProjectRun,
@@ -98,6 +99,7 @@ import { normalizeTagsForDisplay } from '@/lib/project-tags'
 import type { ContinueOptions } from './client'
 import type {
   CheckoutProjectInput,
+  CreateProjectInput,
   CreateAgentProfileInput,
   ApiRun,
   HealthResponse,
@@ -819,6 +821,16 @@ export function useCheckoutProject() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (input: CheckoutProjectInput) => checkoutProject(input),
+    retry: false,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: workspaceQueryKeys.projects }),
+  })
+}
+
+/** "Add project → New project": create an empty repo and register it. */
+export function useCreateProject() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: CreateProjectInput) => createProject(input),
     retry: false,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: workspaceQueryKeys.projects }),
   })
