@@ -5556,6 +5556,16 @@ export function createApp(deps: ServerDeps) {
     workflow: run.workflow,
     ...(run.branch !== undefined ? { branch: run.branch } : {}),
     ...(run.startedAt !== undefined ? { startedAt: run.startedAt } : {}),
+    // Slimmed to the two fields a row's marker reads: the container's name is
+    // detail the task's own header carries.
+    ...(run.isolation !== undefined
+      ? {
+        isolation: {
+          effective: run.isolation.effective,
+          ...(run.isolation.reason !== undefined ? { reason: run.isolation.reason } : {}),
+        },
+      }
+      : {}),
     // The tracker-reference inputs, verbatim — the cockpit's `taskReference()` owns the rule
     // that picks between them (see the schema's note).
     ...(run.pullRequestUrl !== undefined ? { pullRequestUrl: run.pullRequestUrl } : {}),

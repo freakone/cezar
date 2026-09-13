@@ -256,6 +256,33 @@ export const runRecordSchema = z.object({
    * cannot silently continue on the host, where its conversation does not exist.
    */
   isolated: z.boolean().optional(),
+  /**
+   * Where the agent ACTUALLY executed, recorded when the decision is made.
+   *
+   * Separate from `isolated`, which is the request, because the two disagree
+   * more often than is comfortable: `prepareSandbox` falls back to the host
+   * when the provider is not podman, when the backend has no launcher, and
+   * when the container cannot be prepared at all. An indicator driven by the
+   * request would then claim isolation for a run that executed on this machine
+   * — the same lie the isolation settings avoid by separating `enabled` from
+   * `effective`.
+   *
+   * The request is deliberately NOT overwritten with the outcome: a Continue
+   * reads `isolated` as its override, so a run whose container failed once
+   * would otherwise be pinned to the host forever.
+   *
+   * Absent on runs from before this existed, and on runs that never asked.
+   */
+  isolation: z
+    .object({
+      /** True only when a container was actually brought up for this run. */
+      effective: z.boolean(),
+      /** Its name, when there is one. */
+      container: z.string().optional(),
+      /** Why isolation was wanted but not obtained — shown on the indicator. */
+      reason: z.string().optional(),
+    })
+    .optional(),
   /** Task worktree (spec 006) — absent for in-place runs and after explicit cleanup. */
   worktreePath: z.string().optional(),
   /** The task's own branch (`cez/<id8>`), created off `baseBranch`. */
@@ -650,6 +677,13 @@ export class RunStore extends EventEmitter {
       generateFollowups: input.generateFollowups,
       autonomous: input.autonomous,
       worktree: input.worktree,
+      // The per-task isolation override. Declared on the input since the
+      // composer toggle landed, and — until this line — never copied onto the
+      // record, so `getRun(id).isolated` was ALWAYS undefined: a task marked
+      // isolated fell back to the project default on its first step, and a task
+      // that opted out could still be containerized. The toggle looked wired at
+      // every layer above and did nothing.
+      isolated: input.isolated,
       groupId: input.groupId,
       variant: input.variant,
       status: 'queued',
