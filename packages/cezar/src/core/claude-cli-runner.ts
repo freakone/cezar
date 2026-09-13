@@ -1,4 +1,5 @@
-import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { localLauncher, type ProcessLauncher } from './process-launcher.ts';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as resolvePath } from 'node:path';
 import type {
@@ -44,6 +45,12 @@ export interface ClaudeCliRunnerOptions {
   bin?: string;
   /** Wall-clock timeout for a run (ms); per-spec `timeoutMs` still wins. */
   timeoutMs?: number;
+  /**
+   * WHERE the CLI runs. Defaults to this machine; an `SbxLauncher` puts the
+   * identical argv inside a sandbox instead. The runner is unaware of which —
+   * it only needs spawn + signal.
+   */
+  launcher?: ProcessLauncher;
 }
 
 /**
@@ -63,6 +70,7 @@ export class ClaudeCliRunner implements AgentRunner {
 
   private readonly bin: string;
   private readonly timeoutMs: number;
+  private readonly launcher: ProcessLauncher;
   private lastSession: AgentSession | null = null;
 
   constructor(opts: ClaudeCliRunnerOptions = {}) {
@@ -73,6 +81,7 @@ export class ClaudeCliRunner implements AgentRunner {
       (process.env.CEZ_DRY_RUN === '1' ? mockClaudePath() : 'claude');
     this.bin = opts.bin ?? defaultBin;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    this.launcher = opts.launcher ?? localLauncher;
   }
 
   /** One-shot run: start a session and auto-end it after the first turn. */
@@ -93,7 +102,7 @@ export class ClaudeCliRunner implements AgentRunner {
 
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = nodeSpawn(this.bin, args, {
+      child = this.launcher.spawn(this.bin, args, {
         cwd: spec.cwd,
         env: buildChildEnv({ backend: this.backend, extraEnv: spec.env }),
       });
@@ -154,7 +163,11 @@ export class ClaudeCliRunner implements AgentRunner {
     let terminatedByCezar = false;
     const signalChild = (signal: 'SIGTERM' | 'SIGKILL'): void => {
       terminatedByCezar = true;
-      child.kill(signal);
+      // Through the launcher, not `child.kill`: when the agent runs in a
+      // sandbox the child is an `sbx exec` client, and killing it leaves the
+      // agent alive inside the container. Fire-and-forget by design — the
+      // caller's SIGTERM→SIGKILL escalation already owns the timing.
+      void this.launcher.signal(child, signal);
     };
     // Every watchdog below asks "is the child still alive?" — and that question
     // is NOT `child.killed`, which only reports signal delivery. claude handles

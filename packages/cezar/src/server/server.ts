@@ -104,6 +104,12 @@ import {
   readWorktreePath,
 } from './git-changes.ts';
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
+import { detectContainerRuntime } from '../core/container-probe.ts';
+import { applyCredentialsToRunning, removeTaskContainer } from '../core/podman-lifecycle.ts';
+import { CREDENTIAL_CATALOG, hostPathOf, listSshEntries } from '../core/credential-passthrough.ts';
+import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
+import { renderContainerfile } from '../core/containerfile-suggest.ts';
+import { imageTag } from '../core/podman-launcher.ts';
 import { findConfigFile } from '../agent-config/catalog.ts';
 import { readConfigFile, statConfigPath, writeConfigFile } from '../agent-config/files.ts';
 import { readAgentModelDefaults } from '../agent-config/models.ts';
@@ -154,6 +160,7 @@ import {
 import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { mergeWriteWorkspaceUiState, readWorkspaceUiState } from '../workspace/ui-state.ts';
 import { checkoutRepo, type CloneRunner } from './checkout.ts';
+import { createProject, type GitRunner } from './create-project.ts';
 import { ProjectContextError, ProjectContexts, type ProjectContext } from './project-context.ts';
 import { reviewGateEnabled } from '../runs/review-gate.ts';
 import { readUiState, uiStatePath } from '../ui-state.ts';
@@ -227,6 +234,10 @@ export interface ServerDeps {
    *  route's guards, cleanup and error surfacing are exercised for real
    *  against real temp dirs, without a network or a `gh` binary. */
   cloneRunner?: CloneRunner;
+  /** How `POST /api/projects/create` runs git. Defaults to the real binary;
+   *  injected by tests so the route's guards and cleanup are exercised without
+   *  depending on the runner's git identity being configured. */
+  gitRunner?: GitRunner;
   /** Host-wide model discovery service. Tests inject a deterministic adapter. */
   modelCatalog?: RunnerModelCatalog;
   /** Host-wide provider authentication discovery. Tests inject deterministic probes. */
@@ -497,6 +508,7 @@ export interface WorkspaceConfigResponse {
   /** What a repo that has set none of its own runs (spec 2026-07-29-agent-profiles). Both keys
    *  optional: absent means "no opinion", which must stay distinguishable from a chosen value. */
   agentDefaults: {
+    isolation?: boolean;
     runner?: ProviderId;
     models?: { claude?: string; codex?: string; opencode?: string };
   };
@@ -575,6 +587,8 @@ const startRunSchema = z
     // Composer worktree opt-out (#worktree-toggle): false runs in the repo
     // working tree. Ignored when variants > 1.
     worktree: z.boolean().optional(),
+    /** Per-task isolation override; absent = the project's Settings switch. */
+    isolated: z.boolean().optional(),
     // Autonomous mode (#autonomous): the run never parks at `waiting` — it
     // auto-continues until the agent signals done. No "needs you" is raised.
     autonomous: z.boolean().optional(),
@@ -2509,7 +2523,35 @@ export function createApp(deps: ServerDeps) {
       return c.json(body);
     })
 
-    .post('/projects/checkout', jsonZodValidator(() => checkoutSchema, { message: 'url must be a GitHub repository' }), async (c) => {
+    /**
+     * "Add project → New project" — create an empty, initialized repo in the
+     * checkout root and register it. Same guards as the checkout route (that is
+     * what `createProject` is built on), and the same division of labour: the
+     * module owns the filesystem, this route owns the registry write.
+     */
+    .post('/projects/create', jsonZodValidator(() => createProjectSchema, { message: 'name must be a single folder name' }), async (c) => {
+      if (capabilities().singleProject) {
+        return c.json(singleProjectRefusal('adding projects'), 409);
+      }
+      const result = await createProject({
+        name: c.req.valid('json').name,
+        projectsDir: expandTilde(await workspaceProjectsDir()),
+        ...(deps.gitRunner ? { git: deps.gitRunner } : {}),
+      });
+      if (!result.ok) return c.json({ error: result.error }, result.status);
+      const registered = await registerFolder(result.target, 'checkout');
+      if (registered.status !== 200) {
+        // The repo EXISTS and is the user's; an unregisterable project is a
+        // registry problem, not a reason to delete what was just created. Say
+        // where it is, as the checkout route does.
+        const { body } = registered;
+        const error = 'error' in body && body.error ? body.error : 'could not register the new project';
+        return c.json({ error: `${error} (the project is at ${result.target})` }, registered.status);
+      }
+      return c.json(registered.body, 200);
+    })
+
+    .post('/projects/checkout', jsonZodValidator(() => checkoutSchema, { message: 'url must be a GitHub or GitLab repository' }), async (c) => {
       if (capabilities().singleProject) {
         return c.json(singleProjectRefusal('adding projects'), 409);
       }
@@ -2767,7 +2809,7 @@ export function createApp(deps: ServerDeps) {
     });
 
   // ---- GUI clone (multi-project spec, step 4.3) ----------------------------
-  // "Add project → Clone from GitHub": clone into the checkout root, then
+  // "Add project → Clone": clone into the checkout root, then
   // register the result through `registerFolder` above (same guards, same
   // `project-added`). Everything dangerous — where the clone may land, and
   // what a failed clone is allowed to delete — lives in src/server/checkout.ts.
@@ -2781,6 +2823,11 @@ export function createApp(deps: ServerDeps) {
     url: z.string().trim().min(1).max(512),
     name: z.string().trim().max(128).optional(),
     checkoutId: z.string().trim().max(128).optional(),
+  });
+  // "New project": a name and nothing else. Where it lands is the workspace's
+  // checkout root, so there is one answer to "where do my projects live".
+  const createProjectSchema = z.object({
+    name: z.string().trim().min(1).max(128),
   });
   // ---- workspace settings (multi-project spec, step 2.7) -------------------
   // WORKSPACE-level routes: single-mount (never mirrored under /api/p/),
@@ -2820,6 +2867,7 @@ export function createApp(deps: ServerDeps) {
     // `JSON.stringify` drops it, which is the exact drift `contract-parity` catches. And absent has
     // to keep meaning "no opinion" here, or the fallback collapses into "always claude".
     agentDefaults: {
+      ...(config.agentDefaults.isolation !== undefined ? { isolation: config.agentDefaults.isolation } : {}),
       ...(config.agentDefaults.runner !== undefined ? { runner: config.agentDefaults.runner } : {}),
       ...(config.agentDefaults.models !== undefined ? { models: config.agentDefaults.models } : {}),
     },
@@ -2890,6 +2938,8 @@ export function createApp(deps: ServerDeps) {
           }
           // `null` CLEARS back to "no opinion" — a partial patch cannot say that by omission,
           // and leaving a stale runner behind would keep overriding repos that never chose.
+          if (agentDefaults?.isolation === null) delete config.agentDefaults.isolation;
+          else if (agentDefaults?.isolation !== undefined) config.agentDefaults.isolation = agentDefaults.isolation;
           if (agentDefaults?.runner === null) delete config.agentDefaults.runner;
           else if (agentDefaults?.runner !== undefined) config.agentDefaults.runner = agentDefaults.runner;
           for (const runner of PROVIDER_IDS) {
@@ -2967,6 +3017,8 @@ export function createApp(deps: ServerDeps) {
     // the next load's `.catch`. `null` clears a key back to "no opinion".
     agentDefaults: z
       .object({
+        /** Machine-wide isolation default; `null` clears it to "no opinion". */
+        isolation: z.boolean().nullable().optional(),
         runner: z.enum(PROVIDER_IDS).nullable().optional(),
         models: z
           .object({
@@ -3566,6 +3618,10 @@ export function createApp(deps: ServerDeps) {
         images,
         systemPrompt: parsed.data.systemPrompt,
         worktree: parsed.data.worktree,
+        // The composer's per-task isolation override. Absent = the project's
+        // Settings → Isolation switch decides; dropping it here made the chip
+        // decorative and left a Continue with nothing to land back into.
+        isolated: parsed.data.isolated,
         autonomous: parsed.data.autonomous,
         // Opt-in inbox (#471): the capability is the ceiling, so a client asking
         // for follow-ups on a server that has them off gets a plain `false`
@@ -4245,6 +4301,10 @@ export function createApp(deps: ServerDeps) {
       if (!run) return c.json({ error: 'not found' }, 404);
       if (manager.isActive(id)) return c.json({ error: 'run is active — cancel it first' }, 409);
       if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
+      // The container is this task's materialized state exactly as the worktree
+      // is, so it goes wherever the worktree goes. Removing it in retention
+      // alone leaked one per deleted task, running forever.
+      await removeTaskContainer(id);
       store.updateRun(id, { worktreePath: undefined, branch: undefined });
       return c.json({ removed: true });
     })
@@ -4257,6 +4317,7 @@ export function createApp(deps: ServerDeps) {
       if (!run) return c.json({ error: 'not found' }, 404);
       // Delete cleans up after itself: worktree + branch go with the run (spec 006).
       if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
+      await removeTaskContainer(id);
       return store.deleteRun(id) ? c.json({ deleted: true }) : c.json({ error: 'not found' }, 404);
     });
 
@@ -4339,6 +4400,7 @@ export function createApp(deps: ServerDeps) {
       for (const loser of losers) {
         if (manager.isActive(loser.id)) manager.cancel(loser.id);
         if (loser.worktreePath) await removeWorktree(repoRoot, loser.worktreePath, loser.branch);
+        await removeTaskContainer(loser.id);
         store.updateRun(loser.id, { worktreePath: undefined, branch: undefined });
         store.setArchived(loser.id, true);
         store.appendEvent(loser.id, {
@@ -5094,6 +5156,70 @@ export function createApp(deps: ServerDeps) {
       return c.json(await configAnswer(repoRoot, await loadConfig(repoRoot)));
     })
 
+    /**
+     * Agent isolation: what this MACHINE can do, and what this PROJECT asks for.
+     * Two questions, deliberately answered separately — a toggle that reads
+     * "on" while the container VM is stopped is a lie the run would then have
+     * to correct in its own log, so the composer renders `effective`.
+     */
+    .get('/isolation', async (c) => {
+      const repoRoot = c.get('project').root;
+      const config = await loadConfig(repoRoot);
+      const sandbox = config.sandbox;
+      const runtime = await detectContainerRuntime();
+      const enabled = sandbox?.enabled === true;
+      const containerfile = join(repoRoot, sandbox?.containerfile ?? '.ai/cezar/Containerfile');
+      return c.json({
+        runtime,
+        enabled,
+        effective: enabled && runtime.ready,
+        image: sandbox ? imageTag(sandbox) : '',
+        hasContainerfile: existsSync(containerfile),
+        suggestions: loadProposal(c.get('project').dataDir).pending,
+        resources: sandbox?.resources ?? { shmSize: '1g' },
+        credentials: {
+          catalog: CREDENTIAL_CATALOG.map((source) => ({
+            id: source.id,
+            label: source.label,
+            hostPath: hostPathOf(source),
+            env: source.env ?? [],
+            defaultMode: source.defaultMode,
+            note: source.note,
+            // Whether it is actually on this machine: a credential the operator
+            // does not have should read as unavailable, not as "off".
+            present: source.hostPath ? existsSync(hostPathOf(source) ?? '') : true,
+            // What the operator could tick instead of the whole directory.
+            // Read fresh on every request rather than cached: a key generated a
+            // minute ago should appear without restarting the cockpit.
+            entries: source.selectable === 'ssh' ? listSshEntries() : [],
+          })),
+          enabled: sandbox?.credentials?.enabled ?? {},
+          custom: sandbox?.credentials?.custom ?? [],
+        },
+      });
+    })
+
+    /**
+     * Accept or dismiss the "your agents installed these" proposal.
+     *
+     * Accepting WRITES the Containerfile but does NOT rebuild the image: the
+     * container running right now already has these tools — that is where the
+     * suggestion came from — so a rebuild here would pay for an image nobody is
+     * waiting on. `ensureImage` sees the newer file and rebuilds before the NEXT
+     * task instead.
+     */
+    .post('/isolation/suggestions', jsonZodValidator(() => suggestionDecisionSchema), async (c) => {
+      const { root: repoRoot, dataDir } = c.get('project');
+      const { accept, dismiss } = c.req.valid('json');
+      const sandbox = (await loadConfig(repoRoot)).sandbox;
+      const relPath = sandbox?.containerfile ?? '.ai/cezar/Containerfile';
+      if (dismiss?.length) dismissSuggestions(dataDir, dismiss);
+      if (accept?.length) {
+        acceptSuggestions(dataDir, repoRoot, relPath, accept, (all) => renderContainerfile(all));
+      }
+      return c.json({ pending: loadProposal(dataDir).pending });
+    })
+
     .put('/config', jsonZodValidator(() => setConfigSchema), async (c) => {
       const { root: repoRoot, dataDir } = c.get('project');
       const parsed = { data: c.req.valid('json') };
@@ -5111,6 +5237,29 @@ export function createApp(deps: ServerDeps) {
       if (parsed.data.baseBranch !== undefined) {
         if (parsed.data.baseBranch === null) delete raw.baseBranch;
         else raw.baseBranch = parsed.data.baseBranch;
+      }
+      if (parsed.data.sandbox !== undefined) {
+        // Merge, never replace: the block also carries image, cacheVolumes and
+        // credential wiring that the cockpit does not send and must not drop.
+        const existingSandbox = raw.sandbox && typeof raw.sandbox === 'object' && !Array.isArray(raw.sandbox)
+          ? raw.sandbox as Record<string, unknown>
+          : {};
+        // Nested blocks merge too: a page that edits only `resources.memory`
+        // must not drop the credential selection sitting beside it.
+        const patch = { ...parsed.data.sandbox } as Record<string, unknown>;
+        for (const key of ['resources', 'credentials'] as const) {
+          const incoming = patch[key];
+          if (incoming === undefined) continue;
+          const existing = existingSandbox[key];
+          const base = existing && typeof existing === 'object' && !Array.isArray(existing)
+            ? existing as Record<string, unknown>
+            : {};
+          const merged: Record<string, unknown> = { ...base, ...(incoming as Record<string, unknown>) };
+          // `null` clears a key rather than storing a null the schema would reject.
+          for (const [k, v] of Object.entries(merged)) if (v === null) delete merged[k];
+          patch[key] = merged;
+        }
+        raw.sandbox = { ...existingSandbox, ...patch };
       }
       if (parsed.data.defaultRunner !== undefined) raw.defaultRunner = parsed.data.defaultRunner;
       if (parsed.data.systemPrompt !== undefined) {
@@ -5164,8 +5313,22 @@ export function createApp(deps: ServerDeps) {
       } catch (err) {
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
       }
+      const saved = await loadConfig(repoRoot);
+      // Ticking a credential applies to the task you are IN, not just the next
+      // one. Copies can be refreshed in a running container, so a selection
+      // that only ever took effect at container creation would look broken for
+      // exactly as long as the current task lasts — which is how long anyone
+      // would be looking at it. Best-effort: a container that cannot be
+      // updated still gets the credential when its next turn starts.
+      if (parsed.data.sandbox?.credentials !== undefined && saved.sandbox) {
+        try {
+          await applyCredentialsToRunning(saved.sandbox, repoRoot);
+        } catch {
+          // podman missing, VM down — the save itself is unaffected.
+        }
+      }
       // Pre-R6 answer shape ({baseBranch, defaultRunner}) + additive R6 fields.
-      return c.json(await configAnswer(repoRoot, await loadConfig(repoRoot)));
+      return c.json(await configAnswer(repoRoot, saved));
     });
 
   // Set/clear the agents' config knobs (Settings → Agents; the Repo tab's
@@ -5174,7 +5337,53 @@ export function createApp(deps: ServerDeps) {
   // the file. All fields optional + additive: `null` (and `''` for the
   // R6 keys) clears a knob back to its default.
   const modelPresetSchema = z.string().trim().max(200).nullable().optional();
+  const suggestionDecisionSchema = z.object({
+    accept: z.array(z.string().min(1)).optional(),
+    dismiss: z.array(z.string().min(1)).optional(),
+  });
+
   const setConfigSchema = z.object({
+    /**
+     * Agent isolation. Only `enabled` is settable from the cockpit: the rest of
+     * the block (image, mounts, credentials) is repo configuration a person
+     * edits deliberately, and a switch that could rewrite mount paths would be
+     * a much larger blast radius than a switch needs.
+     */
+    sandbox: z
+      .object({
+        enabled: z.boolean().optional(),
+        resources: z
+          .object({
+            memory: z.string().trim().min(1).max(20).nullable().optional(),
+            cpus: z.number().positive().max(256).nullable().optional(),
+            shmSize: z.string().trim().min(1).max(20).optional(),
+          })
+          .optional(),
+        credentials: z
+          .object({
+            enabled: z.record(z.string(), z.union([
+        z.boolean(),
+        z.object({
+          mode: z.enum(['mount', 'copy']).optional(),
+          // Narrow a directory credential to individual files — `~/.ssh` today.
+          // Each is one path segment: these become host AND guest paths.
+          keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+        }),
+      ])).optional(),
+            custom: z
+              .array(z.object({
+                id: z.string().trim().min(1),
+                label: z.string().trim().optional(),
+                hostPath: z.string().trim().optional(),
+                guestPath: z.string().trim().optional(),
+                env: z.array(z.string().trim().min(1)).optional(),
+                mode: z.enum(['mount', 'copy']).optional(),
+              }))
+              .optional(),
+          })
+          .optional(),
+      })
+      .optional(),
     baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
     defaultRunner: z.enum(RUNNER_IDS).optional(),
     systemPrompt: z.string().trim().max(20_000, 'must be at most 20000 characters').nullable().optional(),
@@ -5347,6 +5556,16 @@ export function createApp(deps: ServerDeps) {
     workflow: run.workflow,
     ...(run.branch !== undefined ? { branch: run.branch } : {}),
     ...(run.startedAt !== undefined ? { startedAt: run.startedAt } : {}),
+    // Slimmed to the two fields a row's marker reads: the container's name is
+    // detail the task's own header carries.
+    ...(run.isolation !== undefined
+      ? {
+        isolation: {
+          effective: run.isolation.effective,
+          ...(run.isolation.reason !== undefined ? { reason: run.isolation.reason } : {}),
+        },
+      }
+      : {}),
     // The tracker-reference inputs, verbatim — the cockpit's `taskReference()` owns the rule
     // that picks between them (see the schema's note).
     ...(run.pullRequestUrl !== undefined ? { pullRequestUrl: run.pullRequestUrl } : {}),

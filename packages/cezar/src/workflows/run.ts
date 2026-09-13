@@ -11,7 +11,11 @@ import {
 import { type AgentSession } from '../core/claude-cli-runner.ts';
 import { onUsage, registerRunProcess, unregisterRunProcess, type ProcessUsage } from '../core/process-usage.ts';
 import { parseUsageLimit } from '../core/usage-limit.ts';
-import { createRunner } from '../core/runner-factory.ts';
+import { backendSupportsLauncher, createRunner } from '../core/runner-factory.ts';
+import type { AgentBackend } from '../core/agent-runner.ts';
+import { createLauncher } from '../core/launcher-factory.ts';
+import { PodmanUnavailable, removeTaskContainer, startTaskContainer, type TaskContainer } from '../core/podman-lifecycle.ts';
+import { noteInstalls } from '../core/containerfile-store.ts';
 import type { RunnerId } from '../core/agent-runner.ts';
 import { modelConflictsWithRunner } from '../core/model-presets.ts';
 import { AGENT_MODELS_LOCKED_ERROR, agentModelsLocked } from '../core/agent-model-policy.ts';
@@ -34,7 +38,7 @@ import { discoverSkills, type Skill } from '../skills.ts';
 import { materializeSkillDir } from '../skills-remote.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
-import { loadConfig, resolveWorktreeRetention } from '../config.ts';
+import { loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
 import { autosaveCommit, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows } from './load.ts';
@@ -307,6 +311,13 @@ function formatWakeInstant(at: Date): string {
 export interface StartRunInput {
   task: string;
   model?: string;
+  /**
+   * Per-task isolation override from the composer. Absent = the project's
+   * Settings → Isolation switch decides. Persisted on the record so a Continue
+   * lands where the first turn did — a task that started in a container must
+   * not silently continue on the host, where its conversation does not exist.
+   */
+  isolated?: boolean;
   /** Agent backend chosen for this task (GUI). Unset = the config default. */
   runner?: RunnerId;
   /** Agent account for this task (spec 2026-07-29-agent-profiles), applying to steps that run
@@ -741,6 +752,10 @@ export class RunManager {
       // Persist the explicit opt-out so queued-run restart recovery and the
       // session Git routes can distinguish it from a removed isolated worktree.
       worktree: !group && input.worktree === false ? false : undefined,
+      // Per-task isolation override, persisted so a Continue on a resumed run
+      // lands in the same place the first turn did — a task that started
+      // isolated must not silently continue on the host.
+      isolated: input.isolated,
       groupId: group?.groupId,
       variant: group?.variant,
       steps: workflow.steps.map((s) => ({ id: s.id, name: s.name ?? s.id, kind: stepKind(s) })),
@@ -1168,7 +1183,7 @@ export class RunManager {
     // Enforce count-based retention (#483) here so a single hook covers every
     // terminal path. Fire-and-forget: retention must never delay or throw into
     // the lifecycle.
-    void this.enforceRetention();
+    void this.enforceRetention(runId);
     // The run's temp directory (#785) goes on the same terminal transition, and
     // unconditionally — it is scratch, not an artifact, so unlike a worktree
     // there is no keep-count to respect and nothing left to recover from it. A
@@ -1497,13 +1512,111 @@ export class RunManager {
     }
   }
 
+  /**
+   * A `Bash` tool call may have installed a system-wide tool. Record it as a
+   * Containerfile suggestion for this project.
+   *
+   * Only the SHAPE of the command is read — never its output — and only
+   * global installs count: a project's own `npm install` belongs to its
+   * lockfile, not to the image.
+   */
+  private noteToolInstall(event: { tool: string; input: unknown }): void {
+    if (event.tool !== 'Bash') return;
+    const command = (event.input as { command?: unknown } | null)?.command;
+    if (typeof command !== 'string' || command.length === 0) return;
+    noteInstalls(this.dataDir, command);
+  }
+
+  /**
+   * Bring up this task's container, or explain in the run's own event log why
+   * it could not. Returns the container name, or `undefined` to run locally.
+   *
+   * A failure here is deliberately NOT fatal — a broken podman should not make
+   * the cockpit unusable — but it is deliberately loud: the run says, in the
+   * transcript the user reads, that it is executing unisolated. Silence would
+   * let a config that promises a sandbox quietly run agents on the host.
+   */
+  private async prepareSandbox(
+    runId: string,
+    sandbox: SandboxConfig | undefined,
+    backend: AgentBackend | undefined,
+    stepId: string,
+    override?: boolean,
+  ): Promise<TaskContainer | undefined> {
+    // The per-task override wins over the project switch in BOTH directions:
+    // a task explicitly marked isolated runs in a container even if the project
+    // default is off, and one marked not-isolated stays on the host.
+    const wanted = override ?? sandbox?.enabled === true;
+    // Every exit from here records where the agent actually ends up, because a
+    // run that WANTED a container and did not get one is indistinguishable
+    // afterwards from one that never asked — and those need different words in
+    // front of a person deciding whether to trust the task's blast radius.
+    if (!wanted) {
+      this.store.updateRun(runId, { isolation: { effective: false } });
+      return undefined;
+    }
+    if (sandbox?.provider !== 'podman') {
+      this.store.updateRun(runId, {
+        isolation: { effective: false, reason: 'isolation is on, but no container provider is configured' },
+      });
+      return undefined;
+    }
+    if (!backendSupportsLauncher(backend)) {
+      this.store.updateRun(runId, {
+        isolation: {
+          effective: false,
+          reason: `the ${backend ?? 'selected'} runner cannot run in a container yet`,
+        },
+      });
+      return undefined;
+    }
+    try {
+      const container = await startTaskContainer(sandbox, this.repoRoot, runId);
+      this.store.updateRun(runId, { isolation: { effective: true, container: container.name } });
+      return container;
+    } catch (err) {
+      const why = err instanceof PodmanUnavailable ? err.message : String(err);
+      this.store.appendEvent(runId, {
+        type: 'note',
+        stepId,
+        message: `⚠ sandbox requested but the container could not be prepared — running UNISOLATED on this machine.\n${why}`,
+      });
+      this.store.updateRun(runId, {
+        isolation: { effective: false, reason: `the container could not be prepared — ${why}` },
+      });
+      return undefined;
+    }
+  }
+
   /** Reclaim finished worktrees beyond the keep-limit (#483) — directory only,
    *  `cez/<id8>` branch kept. Best-effort; a failure never affects run
    *  lifecycle. `review`/live runs are excluded by the selector. */
-  private async enforceRetention(): Promise<void> {
+  private async enforceRetention(runId?: string): Promise<void> {
     try {
       const keep = await resolveWorktreeRetention(this.repoRoot);
-      await reclaimWorktrees(this.repoRoot, this.store, keep);
+      const reclaimed = await reclaimWorktrees(this.repoRoot, this.store, keep);
+      // A task's container has the same lifetime as its worktree: both are the
+      // task's materialized state, and both are recoverable only while they
+      // exist. Removing the container on every terminal transition — which is
+      // what this used to do — threw away an environment the next Continue
+      // needed, and a run that FAILS is exactly the one most likely to be
+      // continued. An hour of installed services died with each failure.
+      //
+      // Retention already answers "is this task still live enough to keep its
+      // disk state?", so the container follows that answer rather than
+      // inventing a second, harsher policy.
+      for (const runId of reclaimed) void removeTaskContainer(runId);
+      // A run with `worktree: false` has no worktreePath, so retention skips it
+      // entirely and its container would live forever. Its container is scratch
+      // the moment the run is finished: there is no worktree to inspect, so
+      // nothing about it is worth keeping warm for a Continue that has no
+      // isolated tree to return to.
+      // `runId` is absent when retention runs at startup rather than on a
+      // terminal transition; there is no single run to special-case then.
+      if (runId) {
+        const run = this.store.getRun(runId);
+        if (run?.worktree === false) void removeTaskContainer(runId);
+      }
     } catch {
       // retention is best-effort; swallow so terminal transitions never break.
     }
@@ -2412,7 +2525,17 @@ export class RunManager {
     }
     this.store.updateStep(runId, stepId, { profileId: continueProfile.profileId });
 
-    const runner = createRunner(continueBackend);
+    // A Continue MUST land in a container too, and for a reason beyond
+    // isolation: the conversation it resumes lives in the AGENT's `~/.claude`,
+    // which is mounted into the container. Running it on the host sends claude
+    // looking in the operator's own `~/.claude`, where that session id has never
+    // existed — "No conversation found with session ID …", on a task that is
+    // perfectly intact.
+    const continueSandbox = (await loadConfig(this.repoRoot)).sandbox;
+    const continueContainer = await this.prepareSandbox(runId, continueSandbox, continueBackend, stepId, this.store.getRun(runId)?.isolated);
+    const runner = createRunner(continueBackend, {
+      launcher: createLauncher(continueSandbox, continueContainer),
+    });
     state.currentStepId = stepId;
     this.beginUsageInvocation(runId, state, stepId);
     // A continuation's opening message becomes the session's `userPrompt` and never passes
@@ -2874,6 +2997,11 @@ export class RunManager {
         if (text) emit({ type: 'text', text, stepId: step.id });
         return;
       }
+      // Watch what the agent installs, so a repo with no Containerfile can be
+      // offered one built from the toolchain its own tasks needed. Observation
+      // only — it never writes anything a person has not accepted, and never
+      // throws into the run.
+      if (event.type === 'tool-call') this.noteToolInstall(event);
       emit({ ...event, stepId: step.id });
       if (event.type === 'error') {
         sessionError ??= event.message;
@@ -3000,7 +3128,22 @@ export class RunManager {
     }
     this.store.updateStep(runId, step.id, { profileId: stepProfile.profileId });
 
-    const runner = createRunner(stepBackend);
+    // WHERE this step runs (this machine, or the repo's sandbox) is config, and
+    // orthogonal to WHICH agent runs it. Read per step so a config edit takes
+    // effect on the next task without a cockpit restart.
+    const sandbox = (await loadConfig(this.repoRoot)).sandbox;
+    // Never let "sandbox: enabled" read as isolation on a backend that spawns
+    // locally regardless — silence there would be the dangerous kind.
+    const isolationWanted = this.store.getRun(runId)?.isolated ?? sandbox?.enabled === true;
+    if (isolationWanted && !backendSupportsLauncher(stepBackend)) {
+      this.store.appendEvent(runId, {
+        type: 'note',
+        stepId: step.id,
+        message: `⚠ sandbox is configured, but the ${stepBackend} runner does not support it yet — this step runs on this machine, unisolated`,
+      });
+    }
+    const container = await this.prepareSandbox(runId, sandbox, stepBackend, step.id, this.store.getRun(runId)?.isolated);
+    const runner = createRunner(stepBackend, { launcher: createLauncher(sandbox, container) });
     let session: AgentSession;
     state.currentStepId = step.id;
     this.beginUsageInvocation(runId, state, step.id);

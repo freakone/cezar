@@ -18,20 +18,21 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 
 /**
- * "Add project → Clone from GitHub" (multi-project spec, "Add project" option B / step 4.3).
+ * "Add project → Clone from GitHub or GitLab" (multi-project spec, "Add project" option B / step 4.3).
  *
  * The mockup's three parts, and what each one is faithful to:
  *
- * - **The repo input** takes `owner/repo` or any GitHub URL spelling. It is NOT validated here
- *   beyond "non-empty": the server parses it with the one parser that also decides what `gh`
- *   is handed, and a second, looser copy in the browser would only disagree with it.
+ * - **The repo input** takes `owner/repo` or any GitHub or GitLab URL spelling. It is NOT
+ *   validated here beyond "non-empty": the server parses it with the one parser that also
+ *   decides which clone command is handed what, and a second, looser copy in the browser would
+ *   only disagree with it.
  * - **The target preview** (`<projectsDir>/<name>`) is assembled from the registry response's
  *   `projectsDir` plus the editable name. It is a preview of the server's own composition rule,
  *   which is why the name defaults to the repo half of whatever was typed.
  * - **Progress** is the `checkout-progress` stream, filtered to THIS dialog's `checkoutId`.
  *   Without it a clone of a large repo is an indistinguishable-from-hung spinner for minutes.
  *
- * Errors are shown verbatim (`{ error }`): a clone fails for reasons — `gh` missing, not
+ * Errors are shown verbatim (`{ error }`): a clone fails for reasons — `gh`/`git` missing, not
  * authenticated, no such repo, target folder exists, DNS down — that only the server can name,
  * and paraphrasing them into "could not clone" is exactly the silent-spinner failure this
  * dialog exists to avoid.
@@ -104,9 +105,10 @@ export function CloneProjectDialog({
     <Dialog open={open} onOpenChange={(next) => (checkout.isPending ? undefined : onOpenChange(next))}>
       <DialogContent data-slot="clone-project-dialog" className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Clone from GitHub</DialogTitle>
+          <DialogTitle>Clone a repository</DialogTitle>
           <DialogDescription>
-            cezar clones with <code>gh</code> into your checkout root and adds the result as a project.
+            cezar clones from GitHub (with <code>gh</code>) or GitLab (with <code>glab</code>, or{' '}
+            <code>git</code>) into your checkout root and adds the result as a project.
           </DialogDescription>
         </DialogHeader>
 
@@ -116,7 +118,7 @@ export function CloneProjectDialog({
             id="clone-url"
             data-slot="clone-url"
             autoFocus
-            placeholder="owner/repo or https://github.com/owner/repo"
+            placeholder="owner/repo, or a github.com / gitlab.com URL"
             value={url}
             disabled={checkout.isPending}
             onChange={(event) => setUrl(event.target.value)}

@@ -70,6 +70,7 @@ describe('the new-task draft store', () => {
       variants: 1,
       planFirst: false,
       worktree: null,
+      isolated: null,
       autonomous: null,
       generateFollowups: null,
     })
@@ -85,6 +86,7 @@ describe('the new-task draft store', () => {
       variants: 2,
       planFirst: false,
       worktree: false,
+      isolated: null,
       autonomous: null,
       generateFollowups: false,
     })
@@ -106,6 +108,7 @@ describe('the new-task draft store', () => {
       variants: 3,
       planFirst: true,
       worktree: null,
+      isolated: null,
       autonomous: null,
       generateFollowups: true,
     })
@@ -121,6 +124,7 @@ describe('the new-task draft store', () => {
       variants: 3,
       planFirst: true,
       worktree: null,
+      isolated: null,
       autonomous: null,
       generateFollowups: true,
     })
@@ -136,6 +140,7 @@ describe('the new-task draft store', () => {
       variants: 2,
       planFirst: true,
       worktree: false,
+      isolated: null,
       autonomous: null,
       generateFollowups: false,
     })
@@ -146,6 +151,7 @@ describe('the new-task draft store', () => {
       text: 'do not lose me',
       variants: 2,
       worktree: false,
+      isolated: null,
       autonomous: null,
       generateFollowups: false,
       planFirst: true,
@@ -165,6 +171,7 @@ describe('the new-task draft store', () => {
       variants: 1,
       planFirst: false,
       worktree: null,
+      isolated: null,
       autonomous: null,
       generateFollowups: null,
     })
@@ -180,6 +187,7 @@ describe('the new-task draft store', () => {
       variants: 1,
       planFirst: false,
       worktree: null,
+      isolated: null,
       autonomous: null,
       generateFollowups: null,
     })

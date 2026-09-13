@@ -58,6 +58,8 @@ export const workspaceConfigResponseSchema = z.object({
    * the repo's own `.ai/cezar/config.json` is silent — a repo that chose is never overruled.
    */
   agentDefaults: z.object({
+    /** Whether a repo that has said nothing isolates its agents. */
+    isolation: z.boolean().optional(),
     runner: runnerSchema.optional(),
     models: z.object({
       claude: z.string().optional(),
@@ -90,6 +92,7 @@ export const setWorkspaceConfigInputSchema = z.object({
    *  absent key cannot say in a partial patch. */
   agentDefaults: z
     .object({
+      isolation: z.boolean().nullable().optional(),
       runner: runnerSchema.nullable().optional(),
       models: z
         .object({
@@ -347,6 +350,39 @@ export type SetConfigResponse = z.infer<typeof setConfigResponseSchema>;
  * another runner's preset.
  */
 export const setConfigInputSchema = z.object({
+  /**
+   * Agent isolation. Only `enabled` crosses the wire: the rest of the repo's
+   * `sandbox` block (image, mounts, credential wiring) is configuration a
+   * person edits deliberately, and the server MERGES this patch rather than
+   * replacing the block, so a switch can never drop those keys.
+   */
+  sandbox: z
+    .object({
+      enabled: z.boolean().optional(),
+      resources: z
+        .object({
+          memory: z.string().trim().min(1).max(20).nullable().optional(),
+          cpus: z.number().positive().max(256).nullable().optional(),
+          shmSize: z.string().trim().min(1).max(20).optional(),
+        })
+        .optional(),
+      credentials: z
+        .object({
+          enabled: z.record(z.string(), z.union([z.boolean(), z.object({ mode: z.enum(['mount', 'copy']).optional() })])).optional(),
+          custom: z
+            .array(z.object({
+              id: z.string().trim().min(1),
+              label: z.string().trim().optional(),
+              hostPath: z.string().trim().optional(),
+              guestPath: z.string().trim().optional(),
+              env: z.array(z.string().trim().min(1)).optional(),
+              mode: z.enum(['mount', 'copy']).optional(),
+            }))
+            .optional(),
+        })
+        .optional(),
+    })
+    .optional(),
   baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
   defaultRunner: runnerSchema.optional(),
   systemPrompt: z.string().trim().max(20_000).nullable().optional(),
