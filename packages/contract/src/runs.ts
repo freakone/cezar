@@ -253,6 +253,33 @@ export const runRecordSchema = z.object({
   worktree: z.literal(false).optional(),
   /** Per-task isolation override, when the composer set one (additive). */
   isolated: z.boolean().optional(),
+  /**
+   * Where the agent ACTUALLY executed, recorded when the decision is made.
+   *
+   * Separate from `isolated`, which is the request, because the two disagree
+   * more often than is comfortable: `prepareSandbox` falls back to the host
+   * when the provider is not podman, when the backend has no launcher, and
+   * when the container cannot be prepared at all. An indicator driven by the
+   * request would then claim isolation for a run that executed on this machine
+   * — the same lie the isolation settings avoid by separating `enabled` from
+   * `effective`.
+   *
+   * The request is deliberately NOT overwritten with the outcome: a Continue
+   * reads `isolated` as its override, so a run whose container failed once
+   * would otherwise be pinned to the host forever.
+   *
+   * Absent on runs from before this existed, and on runs that never asked.
+   */
+  isolation: z
+    .object({
+      /** True only when a container was actually brought up for this run. */
+      effective: z.boolean(),
+      /** Its name, when there is one. */
+      container: z.string().optional(),
+      /** Why isolation was wanted but not obtained — shown on the indicator. */
+      reason: z.string().optional(),
+    })
+    .optional(),
   /** Absent for in-place runs and after an isolated worktree is removed. */
   worktreePath: z.string().optional(),
   branch: z.string().optional(),
@@ -369,6 +396,13 @@ export const runIndexEntrySchema = z.object({
    *  page needs to nest a child under its parent, and the child's `kind` so a row can say
    *  `review` or `implement` next to its title. Absent on a plain task. */
   dispatch: dispatchSchema.pick({ rootRunId: true, parentRunId: true, kind: true }).optional(),
+  /**
+   * Where the agent actually ran, so a cross-project row can mark the isolated
+   * ones. Slimmer than the record's field on purpose — the container's NAME is
+   * detail for the task's own header, not for a list — but the same three
+   * states: a container (`effective`), a fallback (`reason`), or neither.
+   */
+  isolation: z.object({ effective: z.boolean(), reason: z.string().optional() }).optional(),
   /** When the agent actually started, as opposed to when the task was created. The global page's
    *  age column prefers it and falls back to `createdAt`, exactly as the per-project table does. */
   startedAt: z.string().optional(),

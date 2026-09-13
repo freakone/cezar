@@ -56,6 +56,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { IsolationBadge } from '@/components/isolation-indicator'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -852,6 +853,7 @@ function MetaRow({
               {part}
             </Fragment>
           ))}
+          <IsolationBadge run={run} />
           <AgentBadge run={run} continuationEngine={continuationEngine} />
         </span>
       </div>

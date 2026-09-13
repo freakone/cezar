@@ -2595,16 +2595,42 @@ export class RunManager {
     // a task explicitly marked isolated runs in a container even if the project
     // default is off, and one marked not-isolated stays on the host.
     const wanted = override ?? sandbox?.enabled === true;
-    if (!wanted || sandbox?.provider !== 'podman') return undefined;
-    if (!backendSupportsLauncher(backend)) return undefined;
+    // Every exit from here records where the agent actually ends up, because a
+    // run that WANTED a container and did not get one is indistinguishable
+    // afterwards from one that never asked — and those need different words in
+    // front of a person deciding whether to trust the task's blast radius.
+    if (!wanted) {
+      this.store.updateRun(runId, { isolation: { effective: false } });
+      return undefined;
+    }
+    if (sandbox?.provider !== 'podman') {
+      this.store.updateRun(runId, {
+        isolation: { effective: false, reason: 'isolation is on, but no container provider is configured' },
+      });
+      return undefined;
+    }
+    if (!backendSupportsLauncher(backend)) {
+      this.store.updateRun(runId, {
+        isolation: {
+          effective: false,
+          reason: `the ${backend ?? 'selected'} runner cannot run in a container yet`,
+        },
+      });
+      return undefined;
+    }
     try {
-      return await startTaskContainer(sandbox, this.repoRoot, runId);
+      const container = await startTaskContainer(sandbox, this.repoRoot, runId);
+      this.store.updateRun(runId, { isolation: { effective: true, container: container.name } });
+      return container;
     } catch (err) {
       const why = err instanceof PodmanUnavailable ? err.message : String(err);
       this.store.appendEvent(runId, {
         type: 'note',
         stepId,
         message: `⚠ sandbox requested but the container could not be prepared — running UNISOLATED on this machine.\n${why}`,
+      });
+      this.store.updateRun(runId, {
+        isolation: { effective: false, reason: `the container could not be prepared — ${why}` },
       });
       return undefined;
     }

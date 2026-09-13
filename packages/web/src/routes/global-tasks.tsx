@@ -77,6 +77,7 @@ import { runTitle, type ListView } from '@/lib/task-groups'
 import { usageMetricVisibility } from '@/lib/token-metrics'
 import { useNow } from '@/lib/use-now'
 import { cn } from '@/lib/utils'
+import { IsolationMark } from '@/components/isolation-indicator'
 
 /**
  * The global Tasks page at `/tasks` — every registered project's work in one table.
@@ -879,6 +880,10 @@ function TaskRow({
               className="shrink-0"
             />
           ) : null}
+          {/* Where the agent ran, when it is worth saying — nothing for an
+              ordinary host run, so this costs the title column no width on the
+              rows that are the majority. */}
+          <IsolationMark run={run} />
         </span>
       </td>
       {showProject ? (
