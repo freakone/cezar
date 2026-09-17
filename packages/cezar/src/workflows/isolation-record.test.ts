@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RunStore } from '../runs/store.ts';
 import { RunManager } from './run.ts';
-import type { SandboxConfig } from '../config.ts';
+import { defaultSandboxFor, type SandboxConfig } from '../config.ts';
 import type { TaskContainer } from '../core/podman-lifecycle.ts';
 
 /**
@@ -102,6 +102,30 @@ describe('what a run records about where it ran', () => {
     // overwriting it with the outcome would pin a task to the host forever
     // after one bad turn.
     expect(run?.isolated).toBe(true);
+  });
+
+  it('an explicit request in an UNCONFIGURED repo gets the default sandbox', async () => {
+    // The override is documented as winning in both directions. Before this it
+    // could only ever turn isolation OFF: a repo with no `sandbox` block has no
+    // provider, so the request fell through to the host with the task marked
+    // isolated. Every project made through "New project" starts that way.
+    //
+    // Asserted through `defaultSandboxFor` rather than by running a container:
+    // reaching podman is what this suite must not do.
+    const sandbox = defaultSandboxFor('commetria');
+    expect(sandbox.enabled).toBe(true);
+    expect(sandbox.provider).toBe('podman');
+    expect(sandbox.name).toBe('commetria');
+    // The same configuration the Settings switch would have written — the
+    // shm default included, since podman's 64m kills a headless browser.
+    expect(sandbox.resources?.shmSize).toBe('1g');
+  });
+
+  it('a name that is not a legal container name is cleaned, never passed through', () => {
+    // It becomes an image tag (`cezar-agent/<name>:latest`); a directory called
+    // "My Repo (v2)" would produce one podman refuses.
+    expect(defaultSandboxFor('My Repo (v2)').name).toBe('my-repo-v2');
+    expect(defaultSandboxFor('...').name).toBe('cezar');
   });
 
   it('a task that opts OUT records the host outcome even where the project isolates', async () => {

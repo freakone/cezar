@@ -65,7 +65,7 @@ import { getTeamSkillsCached, materializeSkillDir, waitForTeamSkills } from '../
 import { provisionSkills } from '../skills-provision.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
-import { loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
+import { defaultSandboxFor, loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
 import {
   autosaveCommit,
   chooseForkBase,
@@ -3024,6 +3024,7 @@ export class RunManager {
    */
   private async prepareSandbox(
     runId: string,
+    // Reassigned when an explicit per-task request meets an unconfigured repo.
     sandbox: SandboxConfig | undefined,
     backend: AgentBackend | undefined,
     stepId: string,
@@ -3033,6 +3034,17 @@ export class RunManager {
     // a task explicitly marked isolated runs in a container even if the project
     // default is off, and one marked not-isolated stays on the host.
     const wanted = override ?? sandbox?.enabled === true;
+    // A task that ASKS for isolation in a repo that has never configured a
+    // sandbox gets the default one. Without this the override could only ever
+    // turn isolation off: no `sandbox` block means no provider, the check below
+    // bails, and the task runs on the host having been marked isolated. Every
+    // project created through "New project" starts in exactly that state.
+    //
+    // Only for an EXPLICIT request. A repo that is silent about isolation still
+    // means "no" — this reads a deliberate per-task choice, not a default.
+    if (override === true && sandbox === undefined) {
+      sandbox = defaultSandboxFor(basename(this.repoRoot));
+    }
     // Every exit from here records where the agent actually ends up, because a
     // run that WANTED a container and did not get one is indistinguishable
     // afterwards from one that never asked — and those need different words in
