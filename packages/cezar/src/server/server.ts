@@ -3384,6 +3384,7 @@ export function createApp(deps: ServerDeps) {
     // to keep meaning "no opinion" here, or the fallback collapses into "always claude".
     agentDefaults: {
       ...(config.agentDefaults.isolation !== undefined ? { isolation: config.agentDefaults.isolation } : {}),
+      ...(config.agentDefaults.sandbox !== undefined ? { sandbox: config.agentDefaults.sandbox } : {}),
       ...(config.agentDefaults.runner !== undefined ? { runner: config.agentDefaults.runner } : {}),
       ...(config.agentDefaults.models !== undefined ? { models: config.agentDefaults.models } : {}),
     },
@@ -3473,6 +3474,27 @@ export function createApp(deps: ServerDeps) {
           // and leaving a stale runner behind would keep overriding repos that never chose.
           if (agentDefaults?.isolation === null) delete config.agentDefaults.isolation;
           else if (agentDefaults?.isolation !== undefined) config.agentDefaults.isolation = agentDefaults.isolation;
+          // The sandbox template merges key by key, like the per-project block:
+          // a page that edits only `resources.shmSize` must not drop the
+          // credential grants sitting beside it. `null` clears a key.
+          if (agentDefaults?.sandbox !== undefined) {
+            const current = { ...(config.agentDefaults.sandbox ?? {}) } as Record<string, unknown>;
+            for (const [key, value] of Object.entries(agentDefaults.sandbox)) {
+              if (value === null) { delete current[key]; continue; }
+              if (value === undefined) continue;
+              const nested = typeof value === 'object' && !Array.isArray(value) ? value : undefined;
+              const existing = current[key];
+              if (nested && existing && typeof existing === 'object' && !Array.isArray(existing)) {
+                const merged = { ...(existing as Record<string, unknown>), ...nested } as Record<string, unknown>;
+                for (const [k, v] of Object.entries(merged)) if (v === null) delete merged[k];
+                current[key] = merged;
+              } else {
+                current[key] = value;
+              }
+            }
+            if (Object.keys(current).length === 0) delete config.agentDefaults.sandbox;
+            else config.agentDefaults.sandbox = current as never;
+          }
           if (agentDefaults?.runner === null) delete config.agentDefaults.runner;
           else if (agentDefaults?.runner !== undefined) config.agentDefaults.runner = agentDefaults.runner;
           for (const runner of PROVIDER_IDS) {
