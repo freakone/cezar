@@ -22,6 +22,7 @@ import { AgentConfigSection } from './agent-config-section'
 import { AgentsSection } from './agents-section'
 import { AppearanceSection } from './appearance'
 import { BookmarkletsSection } from './bookmarklets-section'
+import { IsolationDefaultsSection } from './isolation-defaults-section'
 import { IsolationSection } from './isolation-section'
 import { NotificationsSection } from './notifications-section'
 import { ProjectsSection } from './projects-section'
@@ -53,6 +54,7 @@ export type SettingsSectionId =
   | 'agents'
   | 'agent-config'
   | 'isolation'
+  | 'isolation-defaults'
   | 'resources'
   | 'worktrees'
   | 'projects'
@@ -165,6 +167,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     description: 'Parallel tasks and per-task memory limit, across every project.',
     icon: GaugeIcon,
     component: ResourcesSection,
+    scope: 'global',
+  },
+  {
+    id: 'isolation-defaults',
+    title: 'Isolation defaults',
+    description: 'What a project inherits when it has not configured isolation itself.',
+    icon: ShieldIcon,
+    component: IsolationDefaultsSection,
     scope: 'global',
   },
   {
