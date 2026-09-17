@@ -143,8 +143,15 @@ export function isPinnedSha(ref: string): boolean {
   return /^[0-9a-f]{40}$/i.test(ref) || /^[0-9a-f]{64}$/i.test(ref);
 }
 
-/** Stable cache directory name: the last two path segments, `owner__name`. */
-export function bareDirFor(repo: string): string {
+/**
+ * Stable cache directory name: the last two path segments, `owner__name`.
+ *
+ * Under `CEZ_HOME` when it is set — the same rule every other piece of cezar
+ * state follows, and what lets a test exercise the real clone-and-extract path
+ * without seeding a bare repo into the developer's actual `~/.cache`. Unset
+ * (the normal case) keeps the existing location exactly, so nothing re-clones.
+ */
+export function bareDirFor(repo: string, env: NodeJS.ProcessEnv = process.env): string {
   const trimmed = repo
     .replace(/\/+$/, '')
     .replace(/\.git$/, '')
@@ -152,7 +159,8 @@ export function bareDirFor(repo: string): string {
     .replace(/^~\//, '');
   const segments = trimmed.split(/[/:]/).filter(Boolean).map(sanitizeSegment);
   const key = segments.slice(-2).join('__') || 'skills';
-  return join(homedir(), '.cache', 'cez', 'skills', key);
+  const base = env.CEZ_HOME || undefined;
+  return base ? join(base, 'cache', 'skills', key) : join(homedir(), '.cache', 'cez', 'skills', key);
 }
 
 function sanitizeSegment(s: string): string {
@@ -333,6 +341,28 @@ export async function listRemoteSkills(src: SkillsRepoSource): Promise<Skill[]> 
 
 // ---- materialization (directory skills) ---------------------------------------
 
+/** How many `git show` calls run at once. Bounded so a big collection cannot
+ *  fork a few hundred processes at the same instant. */
+const EXTRACT_CONCURRENCY = 16;
+
+/** Map with a bounded number of in-flight operations, preserving input order. */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      out[index] = await fn(items[index] as T);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 /**
  * Copy a directory skill (SKILL.md + references/…) out of the bare clone into
  * `<repoRoot>/.claude/skills/<name>/` so claude sees the references on disk,
@@ -350,22 +380,53 @@ export async function materializeSkillDir(repoRoot: string, skill: Skill): Promi
   if (!ls.ok) return false;
 
   const destDir = join(repoRoot, '.claude', 'skills', skill.name);
-  let wrote = 0;
-  for (const file of ls.stdout.split('\n').filter(Boolean)) {
+  const files = ls.stdout.split('\n').filter(Boolean);
+  // One `git show` per file, in a bounded pool. Serially this is the whole cost
+  // of materializing: each file is a subprocess, and a collection of ~40 skills
+  // is ~300 of them — measured at 4s, which is not a price a run can pay at
+  // every start. The pool puts the same work under a second.
+  const written = await mapWithConcurrency(files, EXTRACT_CONCURRENCY, async (file) => {
     const rel = file.slice(srcDir.length + 1);
     // git paths are repo-relative and normalized, but never trust them blindly.
-    if (!rel || rel.split('/').includes('..')) continue;
+    if (!rel || rel.split('/').includes('..')) return false;
     const show = await git(['show', `${ref}:${file}`], LIST_TIMEOUT_MS, bareDir);
-    if (!show.ok) continue;
+    if (!show.ok) return false;
     const target = join(destDir, rel);
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, show.stdout, 'utf8');
-    wrote++;
-  }
+    return true;
+  });
+  const wrote = written.filter(Boolean).length;
   if (wrote === 0) return false;
   await excludeFromGit(repoRoot, `.claude/skills/${skill.name}/`);
   return true;
 }
+
+/**
+ * Materialize a whole set of directory skills, skills in parallel as well as
+ * files.
+ *
+ * Answers the names that landed. Used to put an entire imported collection on
+ * disk for a run that selects ONE of its skills: these collections delegate to
+ * each other constantly — `om-code-review` stops and names
+ * `om-setup-agent-pipeline`, `om-auto-review-pr` is a wrapper around
+ * `om-code-review` — and materializing only the selected skill left the agent
+ * reporting the whole collection as "not installed" on a machine where every
+ * one of them was imported.
+ *
+ * Measured on the open-mercato collection: 37 skills, 300 files. Serial and
+ * file-at-a-time it took 4.0s; with both levels pooled it is well under a
+ * second, which is what makes "materialize the collection" affordable at all.
+ */
+export async function materializeSkillDirs(repoRoot: string, skills: readonly Skill[]): Promise<string[]> {
+  const eligible = skills.filter((s) => s.source === 'team' && s.team?.dir);
+  const done = await mapWithConcurrency(eligible, SKILL_CONCURRENCY, async (skill) =>
+    (await materializeSkillDir(repoRoot, skill).catch(() => false)) ? skill.name : null);
+  return done.filter((name): name is string => name !== null);
+}
+
+/** How many skills are materialized at once; each also pools its own files. */
+const SKILL_CONCURRENCY = 8;
 
 /** Append a pattern to git's `info/exclude` (idempotent, non-fatal). */
 async function excludeFromGit(repoRoot: string, pattern: string): Promise<void> {

@@ -167,6 +167,44 @@ const sandboxSchema = z.object({
 
 export type SandboxConfig = z.infer<typeof sandboxSchema>;
 
+/**
+ * The sandbox a repo gets when it has never configured one, for a task that
+ * asks for isolation anyway.
+ *
+ * Without this, the per-task toggle could only ever turn isolation OFF. It is
+ * documented as winning "in both directions", but a repo with no `sandbox`
+ * block has no provider, and `prepareSandbox` bails before it reaches podman —
+ * so a task marked isolated in a fresh project ran on the host. Every project
+ * created through "New project" is in exactly that state, as is any repo whose
+ * owner never opened Settings → Isolation.
+ *
+ * Everything but the name comes from the schema's own defaults, so this is the
+ * same configuration the Settings switch would have written.
+ */
+export function defaultSandboxFor(name: string): SandboxConfig {
+  return sandboxSchema.parse({ enabled: true, name: sandboxName(name) });
+}
+
+/**
+ * A container/image name from a repo directory.
+ *
+ * This becomes an image tag (`cezar-agent/<name>:latest`), so it has to satisfy
+ * podman's rules and not merely the config schema's: lowercase, and it must
+ * START with an alphanumeric. A directory called `My Repo (v2)` or `...` would
+ * otherwise produce a tag podman refuses, and the failure would surface as an
+ * unbuildable image rather than as a bad name.
+ */
+function sandboxName(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    // Separators are legal inside the name and illegal at either end.
+    .replace(/^[._-]+/, '')
+    .replace(/[._-]+$/, '');
+  return cleaned.slice(0, 120) || 'cezar';
+}
+
 const configSchema = z.object({
   /**
    * Agent isolation (opt-in). `.catch(undefined)` keeps the key additive-safe:

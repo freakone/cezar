@@ -48,10 +48,10 @@ import type { AgentEvent, ContentBlock } from '../core/agent-runner.ts';
 import { discoverSkills, type Skill } from '../skills.ts';
 import { automationsReachable } from '../automations/builtin-skill.ts';
 import { AUTOMATIONS_PROMPT } from '../automations/prompts.ts';
-import { materializeSkillDir } from '../skills-remote.ts';
+import { materializeSkillDirs } from '../skills-remote.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
-import { loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
+import { defaultSandboxFor, loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
 import { autosaveCommit, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows } from './load.ts';
@@ -2586,6 +2586,7 @@ export class RunManager {
    */
   private async prepareSandbox(
     runId: string,
+    // Reassigned when an explicit per-task request meets an unconfigured repo.
     sandbox: SandboxConfig | undefined,
     backend: AgentBackend | undefined,
     stepId: string,
@@ -2595,6 +2596,17 @@ export class RunManager {
     // a task explicitly marked isolated runs in a container even if the project
     // default is off, and one marked not-isolated stays on the host.
     const wanted = override ?? sandbox?.enabled === true;
+    // A task that ASKS for isolation in a repo that has never configured a
+    // sandbox gets the default one. Without this the override could only ever
+    // turn isolation off: no `sandbox` block means no provider, the check below
+    // bails, and the task runs on the host having been marked isolated. Every
+    // project created through "New project" starts in exactly that state.
+    //
+    // Only for an EXPLICIT request. A repo that is silent about isolation still
+    // means "no" — this reads a deliberate per-task choice, not a default.
+    if (override === true && sandbox === undefined) {
+      sandbox = defaultSandboxFor(basename(this.repoRoot));
+    }
     // Every exit from here records where the agent actually ends up, because a
     // run that WANTED a container and did not get one is indistinguishable
     // afterwards from one that never asked — and those need different words in
@@ -4250,12 +4262,27 @@ export class RunManager {
         // is one — so claude sees the companion files on disk; the shared
         // info/exclude keeps them out of git (and out of autosave commits).
         if (skill.source === 'team' && skill.team?.dir) {
-          const seeded = await materializeSkillDir(state.cwd, skill).catch(() => false);
-          if (seeded) {
+          // The selected skill AND the rest of the collection it came with.
+          // These collections delegate constantly — om-code-review stops and
+          // names om-setup-agent-pipeline, om-auto-review-pr wraps
+          // om-code-review — and materializing only the SELECTED skill left the
+          // agent reporting the whole collection as "not installed" on a machine
+          // where every one of them was imported.
+          //
+          // The whole imported set rather than a computed delegation closure:
+          // measured against the open-mercato collection, every skill's closure
+          // reached the cap anyway, so "just the ones it needs" was false
+          // precision with a non-deterministic cut. `skills` is the project's
+          // resolved catalog, so nothing the project did not import is written.
+          const seededNames = await materializeSkillDirs(state.cwd, skills);
+          if (seededNames.length > 0) {
             emit({
               type: 'note',
               stepId: step.id,
-              message: `team skill "${skill.name}" materialized to .claude/skills/${skill.name}/`,
+              // One note: a line per skill would bury the step's real output.
+              message: seededNames.length === 1
+                ? `team skill "${seededNames[0]}" materialized to .claude/skills/${seededNames[0]}/`
+                : `${seededNames.length} team skills materialized to .claude/skills/ (selected: ${skill.name})`,
             });
           }
         }
