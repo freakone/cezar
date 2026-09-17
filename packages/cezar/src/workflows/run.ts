@@ -2600,7 +2600,19 @@ export class RunManager {
     // The per-task override wins over the project switch in BOTH directions:
     // a task explicitly marked isolated runs in a container even if the project
     // default is off, and one marked not-isolated stays on the host.
-    const wanted = override ?? sandbox?.enabled === true;
+    // WHERE THIS RUN ALREADY WENT WINS. A run's conversation lives in the home
+    // of whoever wrote it — the operator's `~/.claude` on the host, the agent's
+    // own inside a container — and `claude --resume` on a session it cannot see
+    // fails with an opaque `error_during_execution`. So once a run has executed
+    // somewhere, every later turn goes back there, even if the request, the
+    // project setting, or cezar's own code has changed meaning in between.
+    //
+    // That last case is not hypothetical: a task created before the per-task
+    // override worked ran its first turn on the host, and the turn after the fix
+    // honoured the request, moved into a container and could not find its own
+    // conversation.
+    const recorded = this.store.getRun(runId)?.isolation;
+    const wanted = recorded ? recorded.effective : (override ?? sandbox?.enabled === true);
     // A task that ASKS for isolation in a repo that has never configured a
     // sandbox gets the default one. Without this the override could only ever
     // turn isolation off: no `sandbox` block means no provider, the check below
@@ -2644,11 +2656,22 @@ export class RunManager {
       this.store.appendEvent(runId, {
         type: 'note',
         stepId,
-        message: `⚠ sandbox requested but the container could not be prepared — running UNISOLATED on this machine.\n${why}`,
+        message: recorded?.effective
+          // A turn that already ran in a container has its conversation there.
+          // Saying "unisolated" alone would understate it: this turn will also
+          // fail to find the session it is resuming.
+          ? `⚠ this task's container could not be started, and its conversation lives inside it — `
+            + `this turn runs UNISOLATED and may not find the session to resume.\n${why}`
+          : `⚠ sandbox requested but the container could not be prepared — running UNISOLATED on this machine.\n${why}`,
       });
-      this.store.updateRun(runId, {
-        isolation: { effective: false, reason: `the container could not be prepared — ${why}` },
-      });
+      // The record keeps the FIRST outcome when there is one: flipping it to
+      // `false` here would send every later turn to the host permanently, away
+      // from the conversation, over what may be a stopped VM.
+      if (!recorded?.effective) {
+        this.store.updateRun(runId, {
+          isolation: { effective: false, reason: `the container could not be prepared — ${why}` },
+        });
+      }
       return undefined;
     }
   }

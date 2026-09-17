@@ -104,6 +104,27 @@ describe('what a run records about where it ran', () => {
     expect(run?.isolated).toBe(true);
   });
 
+  it('a run that already executed goes BACK where it went, not where it asked', async () => {
+    // The failure this prevents, seen for real: a task created before the
+    // per-task override worked ran turn 1 on the host, so its conversation was
+    // written to the operator's ~/.claude. The turn after the fix honoured
+    // `isolated: true`, started a container whose home is ~/.claude-agent, and
+    // `claude --resume` on a session it could not see failed with an opaque
+    // `error_during_execution`.
+    const { store, seam, runId } = harness();
+    const id = runId(true);
+    // Turn 1: no provider, so it ran here.
+    await seam.prepareSandbox(id, { ...podman(), provider: 'sbx' } as SandboxConfig, 'claude', 'step', true);
+    expect(store.getRun(id)?.isolation?.effective).toBe(false);
+
+    // Turn 2, with podman available and the task still marked isolated. It must
+    // NOT move: the conversation is on this machine.
+    await seam.prepareSandbox(id, podman(), 'claude', 'step', true);
+    expect(store.getRun(id)?.isolation?.effective).toBe(false);
+    // And the request is still intact — this is about where it RAN.
+    expect(store.getRun(id)?.isolated).toBe(true);
+  });
+
   it('an explicit request in an UNCONFIGURED repo gets the default sandbox', async () => {
     // The override is documented as winning in both directions. Before this it
     // could only ever turn isolation OFF: a repo with no `sandbox` block has no
