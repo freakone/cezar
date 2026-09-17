@@ -151,6 +151,52 @@ const agentDefaultsSchema = z
      * collapses into "always off".
      */
     isolation: z.boolean().optional().catch(undefined),
+    /**
+     * The sandbox settings a repo inherits when it has none of its own.
+     *
+     * Machine-wide for the same reason `isolation` is: which credentials this
+     * machine's agents may use, how big a container may get, and which package
+     * caches they share are properties of the MACHINE, not of any one checkout.
+     * Without this they had to be re-picked per repo, so a fresh project's
+     * isolated agent had no ssh key and a cold npm cache — while the operator
+     * had configured both, next door.
+     *
+     * Deliberately not here: `enabled` (that IS `isolation`), and the three
+     * keys that describe a specific repo rather than this machine — `name`,
+     * `image`/`containerfile` (its toolchain) and `ephemeralPaths` (its build
+     * output). A machine-wide answer to those would be wrong everywhere.
+     */
+    sandbox: z
+      .object({
+        provider: z.enum(['podman', 'sbx']).optional().catch(undefined),
+        claudeCredentialPassthrough: z.boolean().optional().catch(undefined),
+        cacheVolumes: z.record(z.string(), z.string()).optional().catch(undefined),
+        resources: z
+          .object({
+            memory: z.string().trim().min(1).max(20).optional().catch(undefined),
+            cpus: z.number().positive().max(256).optional().catch(undefined),
+            shmSize: z.string().trim().min(1).max(20).optional().catch(undefined),
+          })
+          .optional()
+          .catch(undefined),
+        credentials: z
+          .object({
+            enabled: z
+              .record(z.string(), z.union([
+                z.boolean(),
+                z.object({
+                  mode: z.enum(['mount', 'copy']).optional(),
+                  keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+                }),
+              ]))
+              .optional(),
+            custom: z.array(z.record(z.string(), z.unknown())).optional(),
+          })
+          .optional()
+          .catch(undefined),
+      })
+      .optional()
+      .catch(undefined),
     runner: z.enum(PROVIDER_IDS).optional().catch(undefined),
     models: z
       .object({

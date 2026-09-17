@@ -60,6 +60,32 @@ export const workspaceConfigResponseSchema = z.object({
   agentDefaults: z.object({
     /** Whether a repo that has said nothing isolates its agents. */
     isolation: z.boolean().optional(),
+    /**
+     * Sandbox settings a repo inherits when it has none of its own — which
+     * credentials this machine's agents may use, how big a container may get,
+     * which caches they share. Properties of the MACHINE, so they are picked
+     * once here instead of per checkout; a repo that states a key wins for that
+     * key. `enabled` is not here — that is `isolation` above.
+     */
+    sandbox: z.object({
+      provider: z.enum(['podman', 'sbx']).optional(),
+      claudeCredentialPassthrough: z.boolean().optional(),
+      cacheVolumes: z.record(z.string(), z.string()).optional(),
+      resources: z.object({
+        memory: z.string().optional(),
+        cpus: z.number().optional(),
+        shmSize: z.string().optional(),
+      }).optional(),
+      credentials: z.object({
+        enabled: z.record(z.string(), z.union([
+          z.boolean(),
+          z.object({
+            mode: z.enum(['mount', 'copy']).optional(),
+            keys: z.array(z.string()).optional(),
+          }),
+        ])).optional(),
+      }).optional(),
+    }).optional(),
     runner: runnerSchema.optional(),
     models: z.object({
       claude: z.string().optional(),
@@ -93,6 +119,32 @@ export const setWorkspaceConfigInputSchema = z.object({
   agentDefaults: z
     .object({
       isolation: z.boolean().nullable().optional(),
+      /** The machine-wide sandbox template; `null` on a key clears it. */
+      sandbox: z
+        .object({
+          provider: z.enum(['podman', 'sbx']).nullable().optional(),
+          claudeCredentialPassthrough: z.boolean().nullable().optional(),
+          cacheVolumes: z.record(z.string(), z.string()).nullable().optional(),
+          resources: z
+            .object({
+              memory: z.string().trim().min(1).max(20).nullable().optional(),
+              cpus: z.number().positive().max(256).nullable().optional(),
+              shmSize: z.string().trim().min(1).max(20).nullable().optional(),
+            })
+            .optional(),
+          credentials: z
+            .object({
+              enabled: z.record(z.string(), z.union([
+                z.boolean(),
+                z.object({
+                  mode: z.enum(['mount', 'copy']).optional(),
+                  keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+                }),
+              ])).optional(),
+            })
+            .optional(),
+        })
+        .optional(),
       runner: runnerSchema.nullable().optional(),
       models: z
         .object({

@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { z } from 'zod';
 import { loadWorkspaceConfig, type WorkspaceConfig } from './workspace/config.ts';
 import { RUNNER_IDS } from './core/agent-runner.ts';
@@ -303,7 +303,55 @@ export type CezConfig = z.infer<typeof configSchema>;
  * A repo key always wins, and `models` merges per RUNNER rather than wholesale: pinning claude's
  * model in one repo must not silently discard the machine's codex preset.
  */
-function withMachineDefaults(raw: unknown, machine: WorkspaceConfig['agentDefaults']): unknown {
+/** A plain object, or undefined — the only shape either side may contribute. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/**
+ * Lay the repo's sandbox block over the machine's template.
+ *
+ * Repo wins per key, never wholesale: a repo that sets `resources.memory` must
+ * not lose the machine's `shmSize` (podman's 64m default kills any headless
+ * browser), and one that turns a single credential on must not discard the
+ * others the operator granted this machine. Two levels is all that is needed —
+ * `resources` and `credentials.enabled` — and merging deeper would start
+ * merging a repo's per-credential CHOICE with the machine's, where the repo
+ * plainly means to replace it.
+ */
+function mergeSandboxTemplate(
+  machine: unknown,
+  own: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  const base = asRecord(machine);
+  if (!base) return own;
+  if (!own) return { ...base };
+  const out: Record<string, unknown> = { ...base, ...own };
+  const resources = { ...asRecord(base.resources), ...asRecord(own.resources) };
+  if (Object.keys(resources).length > 0) out.resources = resources;
+  const baseCredentials = asRecord(base.credentials);
+  const ownCredentials = asRecord(own.credentials);
+  if (baseCredentials || ownCredentials) {
+    const enabled = { ...asRecord(baseCredentials?.enabled), ...asRecord(ownCredentials?.enabled) };
+    out.credentials = {
+      ...baseCredentials,
+      ...ownCredentials,
+      ...(Object.keys(enabled).length > 0 ? { enabled } : {}),
+    };
+  }
+  const cacheVolumes = { ...asRecord(base.cacheVolumes), ...asRecord(own.cacheVolumes) };
+  if (Object.keys(cacheVolumes).length > 0) out.cacheVolumes = cacheVolumes;
+  return out;
+}
+
+function withMachineDefaults(
+  raw: unknown,
+  machine: WorkspaceConfig['agentDefaults'],
+  /** The repo directory, used to name a sandbox the repo did not name itself. */
+  repoName?: string,
+): unknown {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
   const own = raw as Record<string, unknown>;
   const ownModels = own.defaultModels && typeof own.defaultModels === 'object'
@@ -316,9 +364,23 @@ function withMachineDefaults(raw: unknown, machine: WorkspaceConfig['agentDefaul
   const ownSandbox = own.sandbox && typeof own.sandbox === 'object' && !Array.isArray(own.sandbox)
     ? own.sandbox as Record<string, unknown>
     : undefined;
-  const sandbox = machine.isolation !== undefined && ownSandbox?.enabled === undefined
-    ? { ...(ownSandbox ?? {}), enabled: machine.isolation }
-    : ownSandbox;
+  // The machine's sandbox TEMPLATE is the base the repo writes over. Which
+  // credentials agents may use, how big a container may get and which caches
+  // they share are properties of this machine; a repo that states one wins for
+  // that key, and a repo that says nothing inherits instead of getting the bare
+  // schema default. `credentials.enabled` and `resources` merge one level down,
+  // so a repo that pins only `resources.memory` keeps the machine's shm.
+  const merged = mergeSandboxTemplate(machine.sandbox, ownSandbox);
+  let sandbox = machine.isolation !== undefined && merged?.enabled === undefined
+    ? { ...(merged ?? {}), enabled: machine.isolation }
+    : merged;
+  // Name the sandbox after the repo unless the repo named it. The schema's
+  // literal default would otherwise have every project that never picked a name
+  // share one image tag (`cezar-agent/cezar:latest`) — which, once machine-wide
+  // defaults exist, is every unconfigured project on the machine.
+  if (sandbox && sandbox.name === undefined && repoName) {
+    sandbox = { ...sandbox, name: sandboxName(repoName) };
+  }
 
   return {
     ...own,
@@ -339,19 +401,20 @@ function withMachineDefaults(raw: unknown, machine: WorkspaceConfig['agentDefaul
  */
 export async function loadConfig(repoRoot: string): Promise<CezConfig> {
   const machine = (await loadWorkspaceConfig()).agentDefaults;
+  const repoName = basename(repoRoot);
   let raw: string;
   try {
     raw = await readFile(join(repoRoot, '.ai/cezar', 'config.json'), 'utf8');
   } catch {
-    return configSchema.parse(withMachineDefaults({}, machine));
+    return configSchema.parse(withMachineDefaults({}, machine, repoName));
   }
   try {
-    const parsed = configSchema.safeParse(withMachineDefaults(JSON.parse(raw), machine));
+    const parsed = configSchema.safeParse(withMachineDefaults(JSON.parse(raw), machine, repoName));
     if (parsed.success) return parsed.data;
   } catch {
     // fall through — malformed JSON degrades to the default
   }
-  return configSchema.parse(withMachineDefaults({}, machine));
+  return configSchema.parse(withMachineDefaults({}, machine, repoName));
 }
 
 /**

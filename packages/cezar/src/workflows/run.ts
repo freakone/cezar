@@ -39,6 +39,7 @@ import { materializeSkillDirs } from '../skills-remote.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
 import { defaultSandboxFor, loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
+import { bootstrapRepoSandbox } from '../core/sandbox-bootstrap.ts';
 import { autosaveCommit, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows } from './load.ts';
@@ -1184,6 +1185,10 @@ export class RunManager {
     // terminal path. Fire-and-forget: retention must never delay or throw into
     // the lifecycle.
     void this.enforceRetention(runId);
+    // A repo that isolated without ever being configured writes down what it
+    // learned — see `bootstrapRepoSandbox`. Same terminal hook, same
+    // fire-and-forget terms: this must never delay or throw into the lifecycle.
+    void this.bootstrapSandboxConfig(runId);
     // The run's temp directory (#785) goes on the same terminal transition, and
     // unconditionally — it is scratch, not an artifact, so unlike a worktree
     // there is no keep-count to respect and nothing left to recover from it. A
@@ -1597,6 +1602,35 @@ export class RunManager {
         isolation: { effective: false, reason: `the container could not be prepared — ${why}` },
       });
       return undefined;
+    }
+  }
+
+  /**
+   * Persist the sandbox a first isolated run used, and the packages it
+   * installed, for a repo that has no config of its own.
+   *
+   * Only for a run that ACTUALLY isolated: a fallback to the host installed its
+   * packages on this machine, and writing a Containerfile from that would
+   * describe an image nothing ever built.
+   */
+  private async bootstrapSandboxConfig(runId: string): Promise<void> {
+    try {
+      const run = this.store.getRun(runId);
+      if (!run?.isolation?.effective) return;
+      const sandbox = (await loadConfig(this.repoRoot)).sandbox
+        ?? defaultSandboxFor(basename(this.repoRoot));
+      const written = bootstrapRepoSandbox(this.repoRoot, this.dataDir, sandbox);
+      if (!written.config) return;
+      this.store.appendEvent(runId, {
+        type: 'note',
+        message: written.containerfile
+          ? `isolation saved to .ai/cezar/config.json, with ${written.installs} install`
+            + `${written.installs === 1 ? '' : 's'} this task performed written to ${sandbox.containerfile}`
+            + ' — the next task starts from an image that already has them'
+          : 'isolation saved to .ai/cezar/config.json — this project now isolates by default',
+      });
+    } catch {
+      // Bookkeeping. A repo that cannot be written to still ran its task.
     }
   }
 
