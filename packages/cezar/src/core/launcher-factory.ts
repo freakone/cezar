@@ -16,6 +16,8 @@ export function createLauncher(
   sandbox: SandboxConfig | undefined,
   /** The per-task container podman execs into; the engine creates it per run. */
   container?: { name: string; publishedPort?: number },
+  /** Secrets fetched on the host for this turn — see `PodmanLauncher`. */
+  fetchedEnv: readonly string[] = [],
 ): ProcessLauncher {
   if (!sandbox?.enabled) return localLauncher;
   switch (sandbox.provider) {
@@ -24,7 +26,7 @@ export function createLauncher(
       // local would run the agent UNISOLATED while the config says otherwise,
       // so the caller must supply one — see the engine's per-task creation.
       if (!container) return localLauncher;
-      return new PodmanLauncher(sandbox, container.name, 'podman', container.publishedPort);
+      return new PodmanLauncher(sandbox, container.name, 'podman', container.publishedPort, fetchedEnv);
     case 'sbx':
       return new SbxLauncher(sandbox);
     default:

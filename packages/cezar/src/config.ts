@@ -114,6 +114,11 @@ const sandboxSchema = z.object({
           guestPath: z.string().trim().optional(),
           env: z.array(z.string().trim().min(1)).optional(),
           mode: z.enum(['mount', 'copy']).optional(),
+          // Where the VALUE is fetched from when it is not on disk or in the
+          // cockpit's env — `vault://<mount>/<path>#<field>`. Only a reference
+          // is ever stored; the secret itself never lands in a config file.
+          valueFrom: z.string().trim().min(1).max(512).optional(),
+          required: z.boolean().optional(),
         }))
         .optional(),
     })

@@ -300,6 +300,26 @@ export interface CustomCredential {
   guestPath?: string;
   env?: string[];
   mode?: PassthroughMode;
+  /**
+   * Where the VALUE comes from, when it is not already in the cockpit's own
+   * environment — today `vault://<mount>/<path>#<field>`.
+   *
+   * The value is fetched on the host and injected; the container never gets the
+   * credential that fetched it. Every name in `env` receives the same value,
+   * which in practice is one name.
+   */
+  valueFrom?: string;
+  /**
+   * Fail the step when this secret cannot be resolved, instead of running
+   * without it.
+   *
+   * Off by default, matching how a missing credential FILE is handled — skipped
+   * with a reason. But a secret the task genuinely needs is different: absent,
+   * the agent gets three tool calls into the work before failing at something
+   * that names neither the secret nor Vault, so the operator can say "this one
+   * is load-bearing" and get the honest error at the start.
+   */
+  required?: boolean;
 }
 
 /** What the operator chose for one catalog credential. */
@@ -336,6 +356,10 @@ export interface ResolvedCredential {
   env: string[];
   /** Why it was skipped, when it was. */
   skipped?: string;
+  /** Where the value must be fetched from, for a secret that is not on disk. */
+  valueFrom?: string;
+  /** Fail the step rather than run without it. */
+  required?: boolean;
   /**
    * Modes to set inside the container after a copy. SSH refuses a private key
    * it considers world-readable ("UNPROTECTED PRIVATE KEY FILE") and simply
@@ -393,6 +417,8 @@ export function resolvePassthrough(
       mode: custom.mode ?? 'copy',
       guestPath: custom.guestPath,
       env: custom.env ?? [],
+      ...(custom.valueFrom ? { valueFrom: custom.valueFrom } : {}),
+      ...(custom.required ? { required: true } : {}),
     };
     if (hostPath && exists(hostPath)) resolved.hostPath = hostPath;
     else if (hostPath) resolved.skipped = `${hostPath} does not exist on this machine`;
@@ -477,6 +503,58 @@ export function credentialCopyPlan(resolved: ResolvedCredential[], container: st
   return plan;
 }
 
+/** One secret that could not be fetched, and why — for the run log and status. */
+export interface SecretProblem {
+  id: string;
+  reason: string;
+  /** The operator marked it load-bearing; the caller should fail the step. */
+  required: boolean;
+}
+
+/**
+ * Fetch the values of every credential that names a `valueFrom`, as `-e` pairs.
+ *
+ * Separate from `credentialEnvPairs` because this one is ASYNC: it talks to a
+ * secret store. Keeping it out of the argv builders is what lets those stay
+ * synchronous and pure, which is the property their tests rely on.
+ *
+ * A fetch that fails never yields an empty pair. An empty value SHADOWS a
+ * credential the container already holds — exactly how sbx's
+ * `ANTHROPIC_API_KEY=proxy-managed` placeholder broke the claude login — so a
+ * failure is reported and the variable is simply absent.
+ */
+export async function resolveSecretEnv(
+  resolved: readonly ResolvedCredential[],
+  fetch: (reference: string) => Promise<string>,
+): Promise<{ pairs: string[]; problems: SecretProblem[] }> {
+  const pairs: string[] = [];
+  const problems: SecretProblem[] = [];
+  for (const credential of resolved) {
+    if (!credential.valueFrom) continue;
+    let value: string;
+    try {
+      value = await fetch(credential.valueFrom);
+    } catch (err) {
+      problems.push({
+        id: credential.id,
+        reason: err instanceof Error ? err.message : String(err),
+        required: credential.required === true,
+      });
+      continue;
+    }
+    if (value === '') {
+      problems.push({
+        id: credential.id,
+        reason: `${credential.valueFrom} resolved to an empty value`,
+        required: credential.required === true,
+      });
+      continue;
+    }
+    for (const name of credential.env) pairs.push(`${name}=${value}`);
+  }
+  return { pairs, problems };
+}
+
 /** `KEY=VALUE` pairs for every forwarded variable that is actually set. */
 export function credentialEnvPairs(
   resolved: ResolvedCredential[],
@@ -484,6 +562,10 @@ export function credentialEnvPairs(
 ): string[] {
   const pairs: string[] = [];
   for (const c of resolved) {
+    // A credential with a `valueFrom` is fetched, not read from the host env —
+    // see `resolveSecretEnv`. Forwarding the host's value too would silently
+    // prefer a stale local export over the store the operator pointed at.
+    if (c.valueFrom) continue;
     for (const name of c.env) {
       const value = env[name];
       // Only forward what the host actually has. Passing an empty value would
