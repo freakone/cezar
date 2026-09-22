@@ -226,6 +226,20 @@ export async function vaultStatus(
       fix: 'set it in Settings → Isolation defaults',
     };
   }
+  // The seal BEFORE the token. A sealed Vault answers every token lookup with
+  // 503, so asking about the token first reported "no usable Vault token —
+  // vault login": the wrong fix, and one that cannot work until the seal is
+  // gone. Vault re-seals on every restart, so after a redeploy this is the
+  // common case, not the rare one.
+  if (await isSealed(exec)) {
+    return {
+      installed: true,
+      address,
+      authenticated: false,
+      reason: `Vault at ${address} is sealed — it seals itself again on every restart`,
+      fix: 'vault operator unseal',
+    };
+  }
   try {
     await exec(['token', 'lookup']);
   } catch {
@@ -238,6 +252,25 @@ export async function vaultStatus(
     };
   }
   return { installed: true, address, authenticated: true, reason: '' };
+}
+
+/**
+ * Is the server sealed? `vault status` exits 2 when it is and still prints the
+ * JSON, so the answer is read from the failure too. Anything unreadable is
+ * "not known to be sealed": the token lookup then decides, as it did before.
+ */
+async function isSealed(exec: VaultRunner): Promise<boolean> {
+  let raw: string;
+  try {
+    raw = await exec(['status', '-format=json']);
+  } catch (err) {
+    raw = (err as { stdout?: string }).stdout ?? '';
+  }
+  try {
+    return (JSON.parse(raw) as { sealed?: unknown }).sealed === true;
+  } catch {
+    return false;
+  }
 }
 
 /** The KV mounts this token can see. */
