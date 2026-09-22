@@ -31,12 +31,20 @@ interface RegisteredWorktree {
 }
 
 /** Run git, never throw — degradation is the caller's policy. */
-function git(cwd: string, args: string[]): Promise<GitResult> {
+function git(cwd: string, args: string[], timeoutMs?: number): Promise<GitResult> {
   return new Promise((resolve) => {
     execFile(
       'git',
       args,
-      { cwd, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8' },
+      {
+        cwd,
+        maxBuffer: 32 * 1024 * 1024,
+        encoding: 'utf8',
+        ...(timeoutMs ? { timeout: timeoutMs } : {}),
+        // Only the network calls can prompt, and a prompt nobody can answer is
+        // a hang: a task that starts must not wait on a password.
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      },
       (err, stdout, stderr) => resolve({ ok: !err, stdout: stdout ?? '', stderr: stderr ?? '' }),
     );
   });
@@ -65,6 +73,74 @@ export function branchFor(runId: string): string {
  * re-applies the same rule at read time through `freshestBaseRef`
  * (`git-diff-base.ts`). Keep the two in agreement.
  */
+/** What `fetchBase` did, for the run log. */
+export interface BaseFetch {
+  /** The remote-tracking ref moved, or was already current. */
+  ok: boolean;
+  remote?: string;
+  /** Why it did not happen — absent when it did. */
+  reason?: string;
+  /** The remote-tracking ref before and after, when it moved. */
+  moved?: { from: string; to: string };
+}
+
+/**
+ * Update `origin/<base>` from the remote before a task forks from it.
+ *
+ * `resolveBaseRef` already prefers the remote-tracking ref over a stale local
+ * branch — but that ref is only as fresh as the last `git fetch`, and nothing
+ * in cezar ran one. So a machine whose `origin/main` was last fetched a week
+ * ago started every task a week behind, and the task then "changed" everything
+ * that had landed in the meantime.
+ *
+ * Deliberately a FETCH and never a pull: the operator's own working tree is
+ * theirs, may have uncommitted work in it, and a task starting is not a licence
+ * to merge anything into it. Fetching moves only the remote-tracking ref.
+ *
+ * Best-effort and time-bounded. cezar has to work on a plane, behind a VPN that
+ * is down, and against a remote that wants a password nobody can type — so a
+ * failure is reported and the task forks from what is already on disk.
+ */
+export async function fetchBase(
+  repoRoot: string,
+  base: string,
+  timeoutMs = 30_000,
+): Promise<BaseFetch> {
+  if (!isSafeGitRef(base)) return { ok: false, reason: `refusing option-like base ref: ${base}` };
+  // The branch's own upstream when it has one, so a fork or a second remote is
+  // fetched from where the branch actually tracks rather than from a guess.
+  const configured = await git(repoRoot, ['config', '--get', `branch.${base}.remote`]);
+  const remote = configured.ok ? configured.stdout.trim() : 'origin';
+  if (remote === '' || !isSafeGitRef(remote)) return { ok: false, reason: 'no remote configured' };
+  const known = await git(repoRoot, ['remote', 'get-url', remote]);
+  if (!known.ok) return { ok: false, reason: `no remote named "${remote}"` };
+
+  const before = await git(repoRoot, ['rev-parse', '--verify', '--quiet', `${remote}/${base}^{commit}`]);
+  const fetched = await git(
+    repoRoot,
+    // `--no-tags`: a task needs one branch, not every tag the remote has.
+    ['fetch', '--quiet', '--no-tags', remote, base],
+    timeoutMs,
+  );
+  if (!fetched.ok) {
+    return {
+      ok: false,
+      remote,
+      // git's own words: "could not read Username", "Could not resolve host",
+      // "couldn't find remote ref" each say more than a paraphrase.
+      reason: (fetched.stderr.trim() || fetched.stdout.trim() || 'git fetch failed').split('\n')[0],
+    };
+  }
+  const after = await git(repoRoot, ['rev-parse', '--verify', '--quiet', `${remote}/${base}^{commit}`]);
+  const from = before.ok ? before.stdout.trim().slice(0, 8) : '';
+  const to = after.ok ? after.stdout.trim().slice(0, 8) : '';
+  return {
+    ok: true,
+    remote,
+    ...(from && to && from !== to ? { moved: { from, to } } : {}),
+  };
+}
+
 export async function resolveBaseRef(repoRoot: string, base: string): Promise<string | null> {
   if (!isSafeGitRef(base)) return null;
   const verify = (ref: string) =>

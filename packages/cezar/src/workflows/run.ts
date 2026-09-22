@@ -53,10 +53,25 @@ import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
 import { defaultSandboxFor, loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
 import { bootstrapRepoSandbox } from '../core/sandbox-bootstrap.ts';
+import { loadWorkspaceConfig } from '../workspace/config.ts';
 import { resolvePassthrough, resolveSecretEnv } from '../core/credential-passthrough.ts';
-import { cachingVaultReader, parseVaultRef, VaultUnavailable } from '../core/vault-secrets.ts';
+import {
+  cachingVaultReader,
+  effectiveVaultAddress,
+  parseVaultRef,
+  readWith,
+  VaultUnavailable,
+  type VaultReader,
+} from '../core/vault-secrets.ts';
 import { registerSecretValues } from '../core/secret-redaction.ts';
-import { autosaveCommit, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
+import {
+  autosaveCommit,
+  createWorktree,
+  fetchBase,
+  resolveBaseRef,
+  worktreeDiff,
+  worktreeShortstat,
+} from '../git-worktree.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows } from './load.ts';
 import type { QueuedMessage, RunRecord, RunStore, StepState } from '../runs/store.ts';
@@ -2699,10 +2714,11 @@ export class RunManager {
   ): Promise<{ env: string[]; fatal: string | null }> {
     const resolved = resolvePassthrough(sandbox?.credentials);
     if (!resolved.some((c) => c.valueFrom)) return { env: [], fatal: null };
+    const read = await this.readerForVault();
     const { pairs, problems } = await resolveSecretEnv(resolved, async (reference) => {
       const ref = parseVaultRef(reference);
       if (!ref) throw new VaultUnavailable(`not a secret reference cezar can fetch: ${reference}`);
-      return this.vaultReader(ref);
+      return read(ref);
     });
     registerSecretValues(pairs.map((pair) => pair.slice(pair.indexOf('=') + 1)));
 
@@ -2787,9 +2803,26 @@ export class RunManager {
     }
   }
 
-  /** One Vault reader per manager, so its short TTL cache is shared by every
-   *  step of every run in this project rather than re-fetching per step. */
-  private readonly vaultReader = cachingVaultReader();
+  /**
+   * One Vault reader per manager, so its short TTL cache is shared by every
+   * step of every run in this project rather than re-fetching per step.
+   *
+   * Rebuilt whenever the machine's Vault address changes, because the address
+   * is a SETTING: an operator who fixes it in Settings must not have to restart
+   * the cockpit for the next task to use it.
+   */
+  private vaultReader = cachingVaultReader();
+  private vaultReaderAddress: string | undefined;
+
+  private async readerForVault(): Promise<VaultReader> {
+    const settings = (await loadWorkspaceConfig()).agentDefaults.vault ?? {};
+    const address = effectiveVaultAddress(settings);
+    if (address !== this.vaultReaderAddress) {
+      this.vaultReaderAddress = address;
+      this.vaultReader = cachingVaultReader(readWith(settings));
+    }
+    return this.vaultReader;
+  }
 
   /** Last live-refresh namer inputs per run — unchanged inputs skip the call. */
   private lastNamerKey = new Map<string, string>();
@@ -4074,6 +4107,29 @@ export class RunManager {
       let base = recorded ?? repo.branch;
       const configured = recorded ? undefined : config.baseBranch;
       if (configured) {
+        // Update the remote-tracking ref FIRST. `resolveBaseRef` prefers
+        // `origin/<base>` over a stale local branch, but only as of the last
+        // fetch — and nothing else here ever fetches, so without this a task
+        // forks from however far behind this checkout happens to be.
+        if (config.fetchBaseBeforeTask) {
+          const fetched = await fetchBase(this.repoRoot, configured);
+          if (fetched.ok && fetched.moved) {
+            emit({
+              type: 'note',
+              message: `base "${configured}" updated from ${fetched.remote} `
+                + `(${fetched.moved.from} → ${fetched.moved.to})`,
+            });
+          } else if (!fetched.ok) {
+            // Loud, and not fatal: cezar has to work offline. The task forks
+            // from what is on disk, and the operator can see why it might be
+            // older than they expect.
+            emit({
+              type: 'note',
+              message: `could not fetch base "${configured}" — ${fetched.reason}; `
+                + 'forking from what is already in this checkout',
+            });
+          }
+        }
         const resolved = await resolveBaseRef(this.repoRoot, configured);
         if (resolved) {
           base = resolved;

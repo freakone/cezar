@@ -131,7 +131,7 @@ import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig 
 import { detectContainerRuntime } from '../core/container-probe.ts';
 import { applyCredentialsToRunning, removeTaskContainer } from '../core/podman-lifecycle.ts';
 import { CREDENTIAL_CATALOG, hostPathOf, listSshEntries } from '../core/credential-passthrough.ts';
-import { listFields, listMounts, listPaths, vaultStatus } from '../core/vault-secrets.ts';
+import { listFields, listMounts, listPaths, vaultCli, vaultStatus } from '../core/vault-secrets.ts';
 import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
 import { renderContainerfile } from '../core/containerfile-suggest.ts';
 import { imageTag } from '../core/podman-launcher.ts';
@@ -2991,6 +2991,7 @@ export function createApp(deps: ServerDeps) {
     agentDefaults: {
       ...(config.agentDefaults.isolation !== undefined ? { isolation: config.agentDefaults.isolation } : {}),
       ...(config.agentDefaults.sandbox !== undefined ? { sandbox: config.agentDefaults.sandbox } : {}),
+      ...(config.agentDefaults.vault !== undefined ? { vault: config.agentDefaults.vault } : {}),
       ...(config.agentDefaults.runner !== undefined ? { runner: config.agentDefaults.runner } : {}),
       ...(config.agentDefaults.models !== undefined ? { models: config.agentDefaults.models } : {}),
     },
@@ -3007,10 +3008,12 @@ export function createApp(deps: ServerDeps) {
      * project's overrides.
      */
     .get('/vault/status', async (c) => {
-      const status = await vaultStatus();
+      const settings = (await loadWorkspaceConfig()).agentDefaults.vault ?? {};
+      const exec = vaultCli(settings);
+      const status = await vaultStatus(exec, process.env, settings);
       // Mounts need a working token, so they ride on the same probe rather
       // than making the page fire a second request that will just fail.
-      const mounts = status.authenticated ? await listMounts().catch(() => []) : [];
+      const mounts = status.authenticated ? await listMounts(exec).catch(() => []) : [];
       return c.json({ ...status, mounts });
     })
 
@@ -3023,10 +3026,11 @@ export function createApp(deps: ServerDeps) {
       if (path !== '' && (!/^[A-Za-z0-9][A-Za-z0-9._\-/]*$/.test(path) || path.split('/').includes('..'))) {
         return c.json({ error: 'path must be a KV path' }, 400);
       }
-      const entries = await listPaths(mount, path).catch(() => []);
+      const exec = vaultCli((await loadWorkspaceConfig()).agentDefaults.vault ?? {});
+      const entries = await listPaths(mount, path, exec).catch(() => []);
       // A leaf has fields; a folder has none. Asking for both in one call is
       // what lets the picker show a level without a round trip per row.
-      const fields = path === '' ? [] : await listFields(mount, path).catch(() => []);
+      const fields = path === '' ? [] : await listFields(mount, path, exec).catch(() => []);
       return c.json({ mount, path, entries, fields });
     })
 
@@ -3116,6 +3120,15 @@ export function createApp(deps: ServerDeps) {
             }
             if (Object.keys(current).length === 0) delete config.agentDefaults.sandbox;
             else config.agentDefaults.sandbox = current as never;
+          }
+          if (agentDefaults?.vault !== undefined) {
+            const current = { ...(config.agentDefaults.vault ?? {}) } as Record<string, unknown>;
+            for (const [key, value] of Object.entries(agentDefaults.vault)) {
+              if (value === null) delete current[key];
+              else if (value !== undefined) current[key] = value;
+            }
+            if (Object.keys(current).length === 0) delete config.agentDefaults.vault;
+            else config.agentDefaults.vault = current as never;
           }
           if (agentDefaults?.runner === null) delete config.agentDefaults.runner;
           else if (agentDefaults?.runner !== undefined) config.agentDefaults.runner = agentDefaults.runner;
@@ -3228,6 +3241,13 @@ export function createApp(deps: ServerDeps) {
               })).max(64).optional(),
             })
             .optional(),
+          })
+          .optional(),
+        /** Where this machine's Vault is; `null` clears a key. Never a token. */
+        vault: z
+          .object({
+            address: z.string().trim().min(1).max(512).nullable().optional(),
+            namespace: z.string().trim().min(1).max(256).nullable().optional(),
           })
           .optional(),
         runner: z.enum(PROVIDER_IDS).nullable().optional(),

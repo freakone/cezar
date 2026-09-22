@@ -94,6 +94,11 @@ export const workspaceConfigResponseSchema = z.object({
         })).optional(),
       }).optional(),
     }).optional(),
+    /** Where this machine's Vault is. An address, never a token. */
+    vault: z.object({
+      address: z.string().optional(),
+      namespace: z.string().optional(),
+    }).optional(),
     runner: runnerSchema.optional(),
     models: z.object({
       claude: z.string().optional(),
@@ -159,6 +164,13 @@ export const setWorkspaceConfigInputSchema = z.object({
               })).max(64).optional(),
             })
             .optional(),
+        })
+        .optional(),
+      /** `null` on a key clears it. Never carries a token. */
+      vault: z
+        .object({
+          address: z.string().trim().min(1).max(512).nullable().optional(),
+          namespace: z.string().trim().min(1).max(256).nullable().optional(),
         })
         .optional(),
       runner: runnerSchema.nullable().optional(),

@@ -201,6 +201,22 @@ const agentDefaultsSchema = z
       })
       .optional()
       .catch(undefined),
+    /**
+     * Where this machine's Vault lives. An address, not a secret — the token
+     * still comes from `~/.vault-token`, written by `vault login`.
+     *
+     * Here rather than in the cockpit's environment because under launchd that
+     * environment is the launch agent's plist: `export VAULT_ADDR` in a shell
+     * never reaches the running cockpit, and editing a plist to name a server
+     * is not a setting, it is a workaround.
+     */
+    vault: z
+      .object({
+        address: z.string().trim().min(1).max(512).optional().catch(undefined),
+        namespace: z.string().trim().min(1).max(256).optional().catch(undefined),
+      })
+      .optional()
+      .catch(undefined),
     runner: z.enum(PROVIDER_IDS).optional().catch(undefined),
     models: z
       .object({

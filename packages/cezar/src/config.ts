@@ -217,6 +217,19 @@ const configSchema = z.object({
    * of the config — and failing OPEN to local is the honest default, because a
    * half-parsed sandbox config must never silently look like isolation.
    */
+  /**
+   * Fetch the base branch from its remote before a task forks from it.
+   *
+   * On by default: `resolveBaseRef` already prefers `origin/<base>` over a
+   * stale local branch, but that ref is only as fresh as the last fetch, and
+   * nothing ran one — so a machine that had not fetched in a week started every
+   * task a week behind, and the task then "changed" everything that had landed
+   * since.
+   *
+   * Turn it off for a repo worked on offline, or one whose base deliberately
+   * lives only on this machine. A failed fetch is never fatal either way.
+   */
+  fetchBaseBeforeTask: z.boolean().default(true).catch(true),
   sandbox: sandboxSchema.optional().catch(undefined),
   skillsRepos: z.array(skillsRepoSchema).default(DEFAULT_SKILLS_REPOS),
   /** How many tasks may run at once (spec 006). Non-git dirs always run 1. */

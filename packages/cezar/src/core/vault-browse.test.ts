@@ -39,19 +39,32 @@ describe('what the secret picker is allowed to see', () => {
     const missing = await vaultStatus(async () => { throw new Error('ENOENT'); }, {});
     expect(missing).toMatchObject({ installed: false, authenticated: false, fix: 'brew install vault' });
 
-    // The launchd trap: the cockpit's environment is the plist's, not the
-    // shell's, so "it works in my terminal" is the expected confusion.
+    // No address anywhere: the fix is the SETTING, not a plist. Under launchd
+    // the cockpit's environment is the launch agent's, so telling someone to
+    // export a variable would send them somewhere that cannot work.
     const noAddr = await vaultStatus(async () => '', {});
-    expect(noAddr.reason).toMatch(/VAULT_ADDR is not set in the environment cezar was started with/);
+    expect(noAddr).toMatchObject({ reason: 'no Vault address configured', fix: 'set it in Settings → Isolation defaults' });
 
     const loggedOut = await vaultStatus(async (args) => {
       if (args[0] === 'token') throw new Error('permission denied');
       return '';
-    }, { VAULT_ADDR: 'http://127.0.0.1:8200' });
+    }, {}, { address: 'https://vault.example.com' });
     expect(loggedOut).toMatchObject({ authenticated: false, fix: 'vault login' });
 
-    const ready = await vaultStatus(async () => '', { VAULT_ADDR: 'http://127.0.0.1:8200' });
-    expect(ready).toMatchObject({ installed: true, authenticated: true, reason: '' });
+    const ready = await vaultStatus(async () => '', {}, { address: 'https://vault.example.com' });
+    expect(ready).toMatchObject({ installed: true, authenticated: true, reason: '', address: 'https://vault.example.com' });
+  });
+
+  it('the SETTING wins over the environment', async () => {
+    // Otherwise the setting would be the one that silently does nothing on the
+    // machine it was added for — a cockpit started with a stale VAULT_ADDR in
+    // its plist would keep using it forever.
+    const { effectiveVaultAddress } = await import('./vault-secrets.ts');
+    expect(effectiveVaultAddress({ address: 'https://configured' }, { VAULT_ADDR: 'http://inherited' }))
+      .toBe('https://configured');
+    // And an inherited one still works for a machine that never set it.
+    expect(effectiveVaultAddress({}, { VAULT_ADDR: 'http://inherited' })).toBe('http://inherited');
+    expect(effectiveVaultAddress({}, {})).toBeUndefined();
   });
 
   it('formats the reference the resolver parses', async () => {
