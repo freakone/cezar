@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyCredentialsToRunning, syncClaudeCredential, taskContainerName } from './podman-lifecycle.ts';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SandboxConfig } from '../config.ts';
@@ -14,6 +14,34 @@ describe('podman lifecycle', () => {
       .toBe(taskContainerName('ab57117a-607c-4393-8bfc-b9c99145dac8'));
   });
 });
+
+
+/**
+ * A stand-in `podman` binary: records every call, and keeps each container's
+ * credential manifest in a directory so a later `cat` sees an earlier `cp`.
+ * Tests pass its path as `bin`, so nothing here can reach a real podman.
+ */
+function fakePodman(): { bin: string; calls: () => string[]; dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'cez-fake-podman-'));
+  const bin = join(dir, 'podman');
+  const log = join(dir, 'calls.log');
+  writeFileSync(bin, `#!/bin/sh
+echo "$*" >> "${log}"
+if [ "$1" = exec ] && [ "$3" = cat ]; then
+  [ -f "${dir}/manifest-$2" ] && cat "${dir}/manifest-$2" && exit 0
+  exit 1
+fi
+if [ "$1" = cp ]; then
+  case "$3" in *:/root/.cezar-credentials.json) cp "$2" "${dir}/manifest-\${3%%:*}";; esac
+fi
+exit 0
+`, { mode: 0o755 });
+  return {
+    bin,
+    dir,
+    calls: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []),
+  };
+}
 
 describe('applying a credential to containers that already exist', () => {
   const REPO = '/Users/k/work/app';
@@ -36,7 +64,7 @@ describe('applying a credential to containers that already exist', () => {
     // only statement about which repo it belongs to that cannot drift. Pushing
     // one project's keys into another project's container is the failure this
     // is designed against.
-    const updated = await applyCredentialsToRunning(cfg, REPO, 'podman', podman({
+    const updated = await applyCredentialsToRunning(cfg, REPO, fakePodman().bin, podman({
       'cez-aaaaaaaa': [REPO, '/Users/k/.claude-agent'],
       'cez-bbbbbbbb': [OTHER],
       'cez-cccccccc': [REPO],
@@ -45,7 +73,7 @@ describe('applying a credential to containers that already exist', () => {
   });
 
   it('ignores containers that are not cezar\'s', async () => {
-    const updated = await applyCredentialsToRunning(cfg, REPO, 'podman', podman({
+    const updated = await applyCredentialsToRunning(cfg, REPO, fakePodman().bin, podman({
       'postgres-dev': [REPO],
       'cez-aaaaaaaa': [REPO],
     }));
@@ -54,13 +82,41 @@ describe('applying a credential to containers that already exist', () => {
 
   it('answers empty when podman is not there — a save must not fail on it', async () => {
     const broken = async (): Promise<string> => { throw new Error('podman: command not found'); };
-    await expect(applyCredentialsToRunning(cfg, REPO, 'podman', broken)).resolves.toEqual([]);
+    await expect(applyCredentialsToRunning(cfg, REPO, fakePodman().bin, broken)).resolves.toEqual([]);
   });
 
-  it('does nothing at all when no credentials are selected', async () => {
+  it('still reaches running containers when NOTHING is selected any more', async () => {
+    // This used to return early — so "revoke everything", the one change that
+    // most needs to reach a running container, never did.
     const none = { credentials: {} } as unknown as SandboxConfig;
-    const updated = await applyCredentialsToRunning(none, REPO, 'podman', podman({ 'cez-aaaaaaaa': [REPO] }));
-    expect(updated).toEqual([]);
+    const updated = await applyCredentialsToRunning(none, REPO, fakePodman().bin, podman({ 'cez-aaaaaaaa': [REPO] }));
+    expect(updated).toEqual(['cez-aaaaaaaa']);
+  });
+
+  it('REMOVES a credential that was revoked since the last apply', async () => {
+    // Before, this only ever copied: an un-ticked ssh key stayed usable in the
+    // running container while the page said the change applied to it.
+    const fake = fakePodman();
+    const home = mkdtempSync(join(tmpdir(), 'cez-cred-home-'));
+    const keyA = join(home, 'a');
+    const keyB = join(home, 'b');
+    writeFileSync(keyA, 'A');
+    writeFileSync(keyB, 'B');
+    const grant = (ids: string[]) => ({
+      credentials: {
+        custom: ids.map((id) => ({ id, hostPath: id === 'a' ? keyA : keyB, guestPath: `/root/.keys/${id}` })),
+      },
+    }) as unknown as SandboxConfig;
+    const containers = podman({ 'cez-aaaaaaaa': [REPO] });
+
+    await applyCredentialsToRunning(grant(['a', 'b']), REPO, fake.bin, containers);
+    expect(fake.calls().some((c) => c.includes('rm -f'))).toBe(false);
+
+    await applyCredentialsToRunning(grant(['a']), REPO, fake.bin, containers);
+    const removed = fake.calls().filter((c) => c.startsWith('exec cez-aaaaaaaa rm -f'));
+    expect(removed).toEqual(['exec cez-aaaaaaaa rm -f /root/.keys/b']);
+    // And what is still granted is left alone.
+    expect(removed.some((c) => c.endsWith('/root/.keys/a'))).toBe(false);
   });
 });
 

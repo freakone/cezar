@@ -29,10 +29,13 @@ export interface SecretEntry {
 export function SecretPicker({
   value,
   onChange,
+  inherited = [],
   busy = false,
 }: {
   value: SecretEntry[]
   onChange: (next: SecretEntry[]) => void
+  /** Secrets that come from elsewhere (the machine) — listed, not editable. */
+  inherited?: SecretEntry[]
   busy?: boolean
 }) {
   const status = useVaultStatus()
@@ -46,6 +49,17 @@ export function SecretPicker({
 
   return (
     <div data-slot="secret-picker" className="flex flex-col gap-3">
+      {inherited.length > 0 ? (
+        <ul data-slot="secret-inherited" className="flex flex-col gap-1">
+          {inherited.map((entry) => (
+            <li key={entry.id} className="flex items-center gap-2 text-xs text-muted-foreground">
+              <KeyRoundIcon className="size-3 shrink-0" aria-hidden="true" />
+              <code>{entry.env?.[0] ?? entry.id}</code>
+              <span>from Isolation defaults</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
       <ul className="flex flex-col gap-1.5">
         {value.map((entry) => (
           <li
@@ -88,7 +102,7 @@ export function SecretPicker({
             ) : null}
           </li>
         ))}
-        {value.length === 0 ? (
+        {value.length === 0 && inherited.length === 0 ? (
           <li className="text-xs text-muted-foreground">Nothing passed yet.</li>
         ) : null}
       </ul>
