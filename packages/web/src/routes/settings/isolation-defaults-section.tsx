@@ -109,6 +109,18 @@ export function IsolationDefaultsSection() {
           + 'the ability to read more. Only the reference is stored.'
         }
       >
+        {/* The address lives HERE, not in the cockpit's launch agent: under
+            launchd the process environment is the plist's, so exporting
+            VAULT_ADDR in a shell never reaches the running cockpit — and
+            editing a plist to name a server is a workaround, not a setting.
+            The token is not here and never will be: `vault login` writes it to
+            ~/.vault-token and the CLI reads it. */}
+        <VaultAddress
+          address={defaults.vault?.address ?? ''}
+          namespace={defaults.vault?.namespace ?? ''}
+          busy={save.isPending}
+          onChange={(vault) => save.mutate({ agentDefaults: { vault } })}
+        />
         <SecretPicker
           value={(template.credentials?.custom ?? []) as SecretEntry[]}
           busy={save.isPending}
@@ -194,6 +206,52 @@ function ResourceInputs({
           disabled={busy}
           onChange={(e) => setShm(e.target.value)}
           onBlur={() => onChange({ shmSize: shm.trim() === '' ? null : shm.trim() })}
+        />
+      </label>
+    </div>
+  )
+}
+
+/** Where this machine's Vault is. Committed on blur, so a keystroke is not a write. */
+function VaultAddress({
+  address,
+  namespace,
+  busy,
+  onChange,
+}: {
+  address: string
+  namespace: string
+  busy: boolean
+  onChange: (next: { address?: string | null; namespace?: string | null }) => void
+}) {
+  const [addr, setAddr] = useState(address)
+  const [ns, setNs] = useState(namespace)
+  return (
+    <div className="mb-3 grid gap-3 sm:grid-cols-2">
+      <label className="grid gap-1.5 text-xs text-muted-foreground">
+        Vault address
+        <Input
+          data-slot="vault-address"
+          className="font-mono text-xs"
+          placeholder="https://vault.example.com:8200"
+          value={addr}
+          disabled={busy}
+          onChange={(e) => setAddr(e.target.value)}
+          // Empty CLEARS, so an address can be removed; a blank field cannot
+          // mean "keep the old one" or it could never be unset.
+          onBlur={() => onChange({ address: addr.trim() === '' ? null : addr.trim() })}
+        />
+      </label>
+      <label className="grid gap-1.5 text-xs text-muted-foreground">
+        Namespace (optional)
+        <Input
+          data-slot="vault-namespace"
+          className="font-mono text-xs"
+          placeholder="admin/team"
+          value={ns}
+          disabled={busy}
+          onChange={(e) => setNs(e.target.value)}
+          onBlur={() => onChange({ namespace: ns.trim() === '' ? null : ns.trim() })}
         />
       </label>
     </div>
