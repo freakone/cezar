@@ -4,6 +4,41 @@ import { promisify } from 'node:util';
 const run = promisify(execFile);
 
 /**
+ * Where this machine's Vault is, as cezar stores it.
+ *
+ * A SETTING rather than an environment variable, because the alternative is
+ * editing the cockpit's launch agent: under launchd the process environment is
+ * the plist's, not the shell's, so `export VAULT_ADDR` in a terminal never
+ * reaches the cockpit. An address is not a secret — the token still comes from
+ * `~/.vault-token`, written by `vault login` — so it belongs in config.
+ *
+ * The setting WINS over the environment when both exist. Anything else and the
+ * setting would be the one that silently does nothing on the machine it was
+ * added for.
+ */
+export interface VaultSettings {
+  address?: string | undefined;
+  namespace?: string | undefined;
+}
+
+/** The environment a `vault` invocation runs with. */
+function vaultEnv(settings: VaultSettings = {}, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...base,
+    ...(settings.address ? { VAULT_ADDR: settings.address } : {}),
+    ...(settings.namespace ? { VAULT_NAMESPACE: settings.namespace } : {}),
+  };
+}
+
+/** The address in force: the setting, else whatever the process was given. */
+export function effectiveVaultAddress(
+  settings: VaultSettings = {},
+  base: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  return settings.address || base.VAULT_ADDR || undefined;
+}
+
+/**
  * Resolve development secrets from HashiCorp Vault, on the HOST, so an isolated
  * agent receives values and never access.
  *
@@ -77,12 +112,16 @@ const CACHE_TTL_MS = 60_000;
  * instead of the whole secret, so a sibling field never lands in a buffer, an
  * error message, or a crash dump.
  */
-export const vaultCliReader: VaultReader = async (ref) => {
+export const vaultCliReader: VaultReader = (ref) => readWith({})(ref);
+
+/** The real reader, bound to the machine's Vault settings. */
+export function readWith(settings: VaultSettings): VaultReader {
+  return async (ref) => {
   try {
     const { stdout } = await run(
       'vault',
       ['kv', 'get', `-mount=${ref.mount}`, `-field=${ref.field}`, ref.path],
-      { timeout: 15_000, maxBuffer: 1024 * 1024 },
+      { timeout: 15_000, maxBuffer: 1024 * 1024, env: vaultEnv(settings) },
     );
     // `-field` prints the raw value; Vault adds no trailing newline for it, but
     // a shell wrapper on PATH might.
@@ -95,7 +134,8 @@ export const vaultCliReader: VaultReader = async (ref) => {
     const detail = (e.stderr || e.message || 'vault failed').trim().split('\n')[0] ?? 'vault failed';
     throw new VaultUnavailable(detail);
   }
-};
+  };
+}
 
 interface CacheEntry {
   value: string;
@@ -147,14 +187,27 @@ export interface VaultStatus {
 /** Runs a vault subcommand and answers stdout; injectable for tests. */
 export type VaultRunner = (args: string[]) => Promise<string>;
 
-const cli: VaultRunner = async (args) => {
-  const { stdout } = await run('vault', args, { timeout: 15_000, maxBuffer: 4 * 1024 * 1024 });
-  return stdout;
-};
+/** A runner bound to the machine's Vault settings. */
+export function vaultCli(settings: VaultSettings = {}): VaultRunner {
+  return async (args) => {
+    const { stdout } = await run('vault', args, {
+      timeout: 15_000,
+      maxBuffer: 4 * 1024 * 1024,
+      env: vaultEnv(settings),
+    });
+    return stdout;
+  };
+}
+
+const cli: VaultRunner = vaultCli();
 
 /** Can cezar read secrets right now, and if not, what fixes it? */
-export async function vaultStatus(exec: VaultRunner = cli, env = process.env): Promise<VaultStatus> {
-  const address = env.VAULT_ADDR;
+export async function vaultStatus(
+  exec: VaultRunner = cli,
+  env: NodeJS.ProcessEnv = process.env,
+  settings: VaultSettings = {},
+): Promise<VaultStatus> {
+  const address = effectiveVaultAddress(settings, env);
   try {
     await exec(['version']);
   } catch {
@@ -169,10 +222,8 @@ export async function vaultStatus(exec: VaultRunner = cli, env = process.env): P
     return {
       installed: true,
       authenticated: false,
-      // Named precisely: under launchd the cockpit's environment is the plist's,
-      // not the shell's, so "it works in my terminal" is expected here.
-      reason: 'VAULT_ADDR is not set in the environment cezar was started with',
-      fix: 'set VAULT_ADDR in the cockpit launch agent, then restart cezar',
+      reason: 'no Vault address configured',
+      fix: 'set it in Settings → Isolation defaults',
     };
   }
   try {
