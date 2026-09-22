@@ -31,7 +31,13 @@ interface RegisteredWorktree {
 }
 
 /** Run git, never throw — degradation is the caller's policy. */
-function git(cwd: string, args: string[], timeoutMs?: number): Promise<GitResult> {
+function git(
+  cwd: string,
+  args: string[],
+  timeoutMs?: number,
+  /** Extra environment for this one call. */
+  extraEnv?: Record<string, string>,
+): Promise<GitResult> {
   return new Promise((resolve) => {
     execFile(
       'git',
@@ -43,7 +49,7 @@ function git(cwd: string, args: string[], timeoutMs?: number): Promise<GitResult
         ...(timeoutMs ? { timeout: timeoutMs } : {}),
         // Only the network calls can prompt, and a prompt nobody can answer is
         // a hang: a task that starts must not wait on a password.
-        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extraEnv },
       },
       (err, stdout, stderr) => resolve({ ok: !err, stdout: stdout ?? '', stderr: stderr ?? '' }),
     );
@@ -73,6 +79,26 @@ export function branchFor(runId: string): string {
  * re-applies the same rule at read time through `freshestBaseRef`
  * (`git-diff-base.ts`). Keep the two in agreement.
  */
+/**
+ * The ssh command for a fetch that must never wait on a person.
+ *
+ * `GIT_TERMINAL_PROMPT=0` stops git's own prompts, not ssh's: a key with a
+ * passphrase, or a host key it has not seen, makes ssh open the terminal and
+ * wait — up to the whole fetch timeout, at every task start, in a cockpit
+ * started from a shell. `BatchMode` makes ssh fail instead, and the task forks
+ * from what is on disk.
+ *
+ * EXTENDS the operator's command rather than replacing it. A repo whose
+ * `core.sshCommand` names a key, or an exported `GIT_SSH_COMMAND`, is using it
+ * to authenticate at all; overriding it with a bare `ssh` would turn a working
+ * fetch into a failing one.
+ */
+async function nonInteractiveSsh(repoRoot: string): Promise<string> {
+  const configured = await git(repoRoot, ['config', '--get', 'core.sshCommand']);
+  const own = (configured.ok && configured.stdout.trim()) || process.env.GIT_SSH_COMMAND || 'ssh';
+  return `${own} -o BatchMode=yes -o ConnectTimeout=10`;
+}
+
 /** What `fetchBase` did, for the run log. */
 export interface BaseFetch {
   /** The remote-tracking ref moved, or was already current. */
@@ -121,6 +147,7 @@ export async function fetchBase(
     // `--no-tags`: a task needs one branch, not every tag the remote has.
     ['fetch', '--quiet', '--no-tags', remote, base],
     timeoutMs,
+    { GIT_SSH_COMMAND: await nonInteractiveSsh(repoRoot) },
   );
   if (!fetched.ok) {
     return {

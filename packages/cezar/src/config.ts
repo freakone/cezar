@@ -353,10 +353,22 @@ function mergeSandboxTemplate(
   const ownCredentials = asRecord(own.credentials);
   if (baseCredentials || ownCredentials) {
     const enabled = { ...asRecord(baseCredentials?.enabled), ...asRecord(ownCredentials?.enabled) };
+    // Secrets merge by id too. Letting the repo's list replace the machine's
+    // meant a project that added ONE secret silently lost every machine-wide
+    // one — the opposite of "the repo wins per key".
+    const byId = new Map<string, unknown>();
+    for (const list of [baseCredentials?.custom, ownCredentials?.custom]) {
+      if (!Array.isArray(list)) continue;
+      for (const entry of list) {
+        const id = asRecord(entry)?.id;
+        if (typeof id === 'string') byId.set(id, entry);
+      }
+    }
     out.credentials = {
       ...baseCredentials,
       ...ownCredentials,
       ...(Object.keys(enabled).length > 0 ? { enabled } : {}),
+      ...(byId.size > 0 ? { custom: [...byId.values()] } : {}),
     };
   }
   const cacheVolumes = { ...asRecord(base.cacheVolumes), ...asRecord(own.cacheVolumes) };

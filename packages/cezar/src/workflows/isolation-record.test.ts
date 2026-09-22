@@ -2,43 +2,46 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The container lifecycle is mocked, never run: an earlier version of this
+// suite reached a real podman and left four containers on the developer's
+// machine. Mocking is also what lets the podman branch be tested at all.
+const lifecycle = vi.hoisted(() => ({
+  start: vi.fn(),
+}));
+vi.mock('../core/podman-lifecycle.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../core/podman-lifecycle.ts')>();
+  return { ...actual, startTaskContainer: lifecycle.start };
+});
+
 import { RunStore } from '../runs/store.ts';
 import { RunManager } from './run.ts';
 import { defaultSandboxFor, type SandboxConfig } from '../config.ts';
-import type { TaskContainer } from '../core/podman-lifecycle.ts';
+import { PodmanUnavailable } from '../core/podman-lifecycle.ts';
+import type { ProcessLauncher } from '../core/process-launcher.ts';
 
 /**
- * What a task records about WHERE its agent ran.
+ * Where a task's agent ACTUALLY runs, and what the record says about it.
  *
- * The request (`isolated`) and the outcome (`isolation`) are two different
- * facts, and the cockpit's indicator reads the second. They disagree whenever a
- * container was wanted and not obtained — a stopped VM, a runner with no
- * launcher, a build that fails — which is the one case where reporting the
- * request would actively mislead: someone reads "isolated" and gives the task
- * work they would not give an agent running on their laptop.
- *
- * Exercised at `prepareSandbox`, the seam that makes the decision. The decision
- * lives in the agent-step path, so a workflow of shell commands never reaches
- * it and records nothing — correctly, since no agent ran there.
- *
- * Every case here returns BEFORE `startTaskContainer`. That is deliberate: this
- * suite must not talk to a real podman, and an earlier draft that let one case
- * through left four containers running on the developer's machine. The
- * container-failure reason is covered by `podman-lifecycle`'s own tests.
+ * The request (`isolated`) and the outcome (`isolation`) are different facts,
+ * and the cockpit's indicator reads the second. They disagree whenever a
+ * container was wanted and not obtained — and they disagreed in a worse way
+ * before this: a container was started for a task marked isolated, the record
+ * said so, and the agent then ran on the host because the launcher was built
+ * from the config the caller had read instead of the placement just decided.
  */
 
 const GIT_ID = ['-c', 'user.name=test', '-c', 'user.email=test@local'];
 const roots: string[] = [];
 
 type Seam = {
-  prepareSandbox(
+  launcherForTurn(
     runId: string,
     sandbox: SandboxConfig | undefined,
-    backend: 'claude' | 'codex' | undefined,
+    backend: 'claude' | undefined,
     stepId: string,
-    override?: boolean,
-  ): Promise<TaskContainer | undefined>;
+  ): Promise<{ launcher: ProcessLauncher; fatal: string | null }>;
 };
 
 function harness(): { store: RunStore; seam: Seam; runId: (isolated?: boolean) => string } {
@@ -62,7 +65,7 @@ function harness(): { store: RunStore; seam: Seam; runId: (isolated?: boolean) =
   };
 }
 
-const podman = (): SandboxConfig => ({
+const podman = (over: Partial<SandboxConfig> = {}): SandboxConfig => ({
   enabled: true,
   provider: 'podman',
   name: 'x',
@@ -73,88 +76,151 @@ const podman = (): SandboxConfig => ({
   containerfile: '.ai/cezar/Containerfile',
   claudeCredentialPassthrough: false,
   resources: { shmSize: '1g' },
+  ...over,
+} as SandboxConfig);
+
+beforeEach(() => {
+  lifecycle.start.mockReset();
+  lifecycle.start.mockImplementation(async (_cfg: SandboxConfig, _root: string, runId: string) => ({
+    name: `cez-${runId.slice(0, 8)}`,
+  }));
 });
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+describe('a task marked isolated runs its agent IN the container', () => {
+  it('when the project switch is OFF', async () => {
+    // The regression: `prepareSandbox` started the container and recorded
+    // `effective: true`, then the caller built the launcher from ITS sandbox —
+    // `enabled: false` — and the launcher factory answered with the local one.
+    const { store, seam, runId } = harness();
+    const id = runId(true);
+    const turn = await seam.launcherForTurn(id, podman({ enabled: false }), 'claude', 'step');
+    expect(lifecycle.start).toHaveBeenCalledTimes(1);
+    expect(turn.launcher.id).toBe('podman');
+    expect(store.getRun(id)?.isolation).toMatchObject({ effective: true });
+  });
+
+  it('when the project has no sandbox config at all', async () => {
+    const { store, seam, runId } = harness();
+    const id = runId(true);
+    const turn = await seam.launcherForTurn(id, undefined, 'claude', 'step');
+    expect(turn.launcher.id).toBe('podman');
+    expect(store.getRun(id)?.isolation?.effective).toBe(true);
+  });
+
+  it('and the record never claims isolation for a turn that is not isolated', async () => {
+    // The invariant the indicator depends on, checked from both ends.
+    const { store, seam, runId } = harness();
+    for (const [isolated, sandbox] of [
+      [true, podman({ enabled: false })],
+      [undefined, podman()],
+      [false, podman()],
+      [undefined, undefined],
+    ] as const) {
+      const id = runId(isolated);
+      const turn = await seam.launcherForTurn(id, sandbox, 'claude', 'step');
+      expect(turn.launcher.id !== 'local', JSON.stringify({ isolated, sandbox: !!sandbox }))
+        .toBe(store.getRun(id)?.isolation?.effective === true);
+    }
+  });
+});
+
 describe('what a run records about where it ran', () => {
   it('records "not isolated" with no reason when nobody asked', async () => {
     const { store, seam, runId } = harness();
     const id = runId();
-    await seam.prepareSandbox(id, undefined, 'claude', 'step');
-    // `effective: false` and NO reason is the ordinary host run, which the
-    // cockpit renders differently from a fallback — and differently again from
-    // a run so old that nothing was recorded at all.
+    const turn = await seam.launcherForTurn(id, undefined, 'claude', 'step');
+    expect(turn.launcher.id).toBe('local');
+    expect(store.getRun(id)?.isolation).toEqual({ effective: false });
+  });
+
+  it('a task that opts OUT stays on the host even where the project isolates', async () => {
+    const { store, seam, runId } = harness();
+    const id = runId(false);
+    const turn = await seam.launcherForTurn(id, podman(), 'claude', 'step');
+    expect(lifecycle.start).not.toHaveBeenCalled();
+    expect(turn.launcher.id).toBe('local');
     expect(store.getRun(id)?.isolation).toEqual({ effective: false });
   });
 
   it('records WHY a wanted container did not happen, and keeps the request intact', async () => {
+    lifecycle.start.mockRejectedValueOnce(new PodmanUnavailable('podman machine is stopped'));
     const { store, seam, runId } = harness();
     const id = runId(true);
-    await seam.prepareSandbox(id, { ...podman(), provider: 'sbx' } as SandboxConfig, 'claude', 'step', true);
-
-    const run = store.getRun(id);
-    expect(run?.isolation?.effective).toBe(false);
-    expect(run?.isolation?.reason).toMatch(/no container provider/);
-    // The REQUEST survives: a Continue reads `isolated` as its override, so
-    // overwriting it with the outcome would pin a task to the host forever
-    // after one bad turn.
-    expect(run?.isolated).toBe(true);
-  });
-
-  it('a run that already executed goes BACK where it went, not where it asked', async () => {
-    // The failure this prevents, seen for real: a task created before the
-    // per-task override worked ran turn 1 on the host, so its conversation was
-    // written to the operator's ~/.claude. The turn after the fix honoured
-    // `isolated: true`, started a container whose home is ~/.claude-agent, and
-    // `claude --resume` on a session it could not see failed with an opaque
-    // `error_during_execution`.
-    const { store, seam, runId } = harness();
-    const id = runId(true);
-    // Turn 1: no provider, so it ran here.
-    await seam.prepareSandbox(id, { ...podman(), provider: 'sbx' } as SandboxConfig, 'claude', 'step', true);
-    expect(store.getRun(id)?.isolation?.effective).toBe(false);
-
-    // Turn 2, with podman available and the task still marked isolated. It must
-    // NOT move: the conversation is on this machine.
-    await seam.prepareSandbox(id, podman(), 'claude', 'step', true);
-    expect(store.getRun(id)?.isolation?.effective).toBe(false);
-    // And the request is still intact — this is about where it RAN.
+    const turn = await seam.launcherForTurn(id, podman(), 'claude', 'step');
+    expect(turn.launcher.id).toBe('local');
+    expect(store.getRun(id)?.isolation).toMatchObject({ effective: false, reason: expect.stringMatching(/stopped/) });
+    // The REQUEST survives: a Continue reads `isolated` as its override.
     expect(store.getRun(id)?.isolated).toBe(true);
   });
 
-  it('an explicit request in an UNCONFIGURED repo gets the default sandbox', async () => {
-    // The override is documented as winning in both directions. Before this it
-    // could only ever turn isolation OFF: a repo with no `sandbox` block has no
-    // provider, so the request fell through to the host with the task marked
-    // isolated. Every project made through "New project" starts that way.
-    //
-    // Asserted through `defaultSandboxFor` rather than by running a container:
-    // reaching podman is what this suite must not do.
+  it('a later turn keeps the first fallback\'s reason instead of erasing it', async () => {
+    // Before this, turn 2 read `effective: false`, took the "not wanted" branch
+    // and wrote a bare `{ effective: false }` — making a run that asked for
+    // isolation and missed it look like one that never asked.
+    lifecycle.start.mockRejectedValueOnce(new PodmanUnavailable('podman machine is stopped'));
+    const { store, seam, runId } = harness();
+    const id = runId(true);
+    await seam.launcherForTurn(id, podman(), 'claude', 'step');
+    const first = store.getRun(id)?.isolation;
+    await seam.launcherForTurn(id, podman(), 'claude', 'step');
+    expect(store.getRun(id)?.isolation).toEqual(first);
+    expect(store.getRun(id)?.isolation?.reason).toMatch(/stopped/);
+  });
+
+  it('a run that already executed goes BACK where it went, not where it asked', async () => {
+    // Its conversation lives in the home that wrote it; `claude --resume` on a
+    // session it cannot see fails with an opaque error_during_execution.
+    const { store, seam, runId } = harness();
+    const id = runId(false);
+    await seam.launcherForTurn(id, podman(), 'claude', 'step');
+    // The task is later marked isolated, and podman is available. It must not move.
+    store.updateRun(id, { isolated: true });
+    const turn = await seam.launcherForTurn(id, podman(), 'claude', 'step');
+    expect(turn.launcher.id).toBe('local');
+    expect(lifecycle.start).not.toHaveBeenCalled();
+  });
+
+  it('an sbx sandbox is isolation, and is recorded as such', async () => {
+    // It used to be recorded as "not isolated" while the launcher factory
+    // quietly built an sbx launcher — a record describing a run that was not
+    // on the host as one that was.
+    const { store, seam, runId } = harness();
+    const id = runId(true);
+    const turn = await seam.launcherForTurn(id, podman({ provider: 'sbx', name: 'textbook' }), 'claude', 'step');
+    expect(turn.launcher.id).toBe('sbx');
+    expect(store.getRun(id)?.isolation).toEqual({ effective: true, container: 'textbook' });
+  });
+});
+
+describe('secrets are fetched only where they can be delivered', () => {
+  const vaultSecret = {
+    credentials: { custom: [{ id: 'k', env: ['K'], valueFrom: 'vault://kv/app#k', required: true }] },
+  } as Partial<SandboxConfig>;
+
+  it('a required secret cannot fail a turn that runs on the host', async () => {
+    // The local launcher ignores fetched values, so fetching for a host turn
+    // only created a way to fail a task over a secret it would have discarded.
+    const { seam, runId } = harness();
+    const id = runId(false);
+    const turn = await seam.launcherForTurn(id, podman(vaultSecret), 'claude', 'step');
+    expect(turn.fatal).toBeNull();
+    expect(turn.launcher.id).toBe('local');
+  });
+});
+
+describe('the default sandbox for an unconfigured repo', () => {
+  it('is the same configuration the Settings switch would write', () => {
     const sandbox = defaultSandboxFor('commetria');
-    expect(sandbox.enabled).toBe(true);
-    expect(sandbox.provider).toBe('podman');
-    expect(sandbox.name).toBe('commetria');
-    // The same configuration the Settings switch would have written — the
-    // shm default included, since podman's 64m kills a headless browser.
+    expect(sandbox).toMatchObject({ enabled: true, provider: 'podman', name: 'commetria' });
     expect(sandbox.resources?.shmSize).toBe('1g');
   });
 
-  it('a name that is not a legal container name is cleaned, never passed through', () => {
-    // It becomes an image tag (`cezar-agent/<name>:latest`); a directory called
-    // "My Repo (v2)" would produce one podman refuses.
+  it('cleans a directory name into one podman accepts', () => {
     expect(defaultSandboxFor('My Repo (v2)').name).toBe('my-repo-v2');
     expect(defaultSandboxFor('...').name).toBe('cezar');
-  });
-
-  it('a task that opts OUT records the host outcome even where the project isolates', async () => {
-    const { store, seam, runId } = harness();
-    const id = runId(false);
-    await seam.prepareSandbox(id, podman(), 'claude', 'step', false);
-    // No reason: nothing failed, the task simply did not want a container. That
-    // distinction is the point — this row must not wear a warning.
-    expect(store.getRun(id)?.isolation).toEqual({ effective: false });
   });
 });

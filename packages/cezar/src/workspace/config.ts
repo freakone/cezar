@@ -142,6 +142,30 @@ const composerDefaultsSchema = z
  * Personal and per-machine, like everything else in this file. The repo config is the team's; this
  * is yours.
  */
+/**
+ * A record whose bad ENTRIES are dropped one at a time, instead of the whole
+ * record failing — the same per-entry salvage the project registry has. Used
+ * where one malformed grant must not cost every other grant on the machine.
+ */
+function salvageRecord<T extends z.ZodTypeAny>(value: T) {
+  return z.preprocess((raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+    const kept: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(raw as Record<string, unknown>)) {
+      if (value.safeParse(entry).success) kept[key] = entry;
+    }
+    return kept;
+  }, z.record(z.string(), value));
+}
+
+/** An array whose bad ENTRIES are dropped one at a time. */
+function salvageArray<T extends z.ZodTypeAny>(item: T) {
+  return z.preprocess(
+    (raw) => (Array.isArray(raw) ? raw.filter((entry) => item.safeParse(entry).success) : raw),
+    z.array(item),
+  );
+}
+
 const agentDefaultsSchema = z
   .object({
     /**
@@ -174,31 +198,44 @@ const agentDefaultsSchema = z
       .object({
         provider: z.enum(['podman', 'sbx']).optional().catch(undefined),
         claudeCredentialPassthrough: z.boolean().optional().catch(undefined),
-        cacheVolumes: z.record(z.string(), z.string()).optional().catch(undefined),
+        cacheVolumes: salvageRecord(z.string()).optional().catch(undefined),
         resources: z
           .object({
             memory: z.string().trim().min(1).max(20).optional().catch(undefined),
             cpus: z.number().positive().max(256).optional().catch(undefined),
             shmSize: z.string().trim().min(1).max(20).optional().catch(undefined),
           })
+          .passthrough()
           .optional()
           .catch(undefined),
         credentials: z
           .object({
-            enabled: z
-              .record(z.string(), z.union([
-                z.boolean(),
-                z.object({
-                  mode: z.enum(['mount', 'copy']).optional(),
-                  keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
-                }),
-              ]))
-              .optional(),
-            custom: z.array(z.record(z.string(), z.unknown())).optional(),
+            // Per ENTRY: one grant with a mode this version does not know must
+            // cost that grant, not every grant on the machine. A whole-block
+            // `.catch(undefined)` dropped them all, and the next merge-write
+            // then persisted the loss.
+            enabled: salvageRecord(z.union([
+              z.boolean(),
+              z.object({
+                mode: z.enum(['mount', 'copy']).optional(),
+                keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+              }).passthrough(),
+            ])).optional().catch(undefined),
+            custom: salvageArray(z.object({
+              id: z.string().trim().min(1).max(64),
+              label: z.string().trim().max(120).optional(),
+              env: z.array(z.string().trim().min(1).max(128)).max(8).optional(),
+              valueFrom: z.string().trim().min(1).max(512).optional(),
+              required: z.boolean().optional(),
+            }).passthrough()).optional().catch(undefined),
           })
+          .passthrough()
           .optional()
           .catch(undefined),
       })
+      // Unknown keys survive a round trip through an older or newer cezar —
+      // the rule every other object in this file follows.
+      .passthrough()
       .optional()
       .catch(undefined),
     /**
@@ -215,6 +252,7 @@ const agentDefaultsSchema = z
         address: z.string().trim().min(1).max(512).optional().catch(undefined),
         namespace: z.string().trim().min(1).max(256).optional().catch(undefined),
       })
+      .passthrough()
       .optional()
       .catch(undefined),
     runner: z.enum(PROVIDER_IDS).optional().catch(undefined),

@@ -46,6 +46,7 @@ import {
   modelDiscoveryRunnerSchema,
   openProjectInSchema,
   updateProjectInputSchema,
+  vaultBrowseQuerySchema,
 } from '@open-mercato/cezar-contract';
 import { dispatchInputSchema, dispatchIntentSchema, dispatchReportSchema } from '@open-mercato/cezar-contract';
 import { detectEnvironment } from '../core/backend-detect.ts';
@@ -2996,6 +2997,27 @@ export function createApp(deps: ServerDeps) {
       ...(config.agentDefaults.models !== undefined ? { models: config.agentDefaults.models } : {}),
     },
   });
+  /**
+   * The repo's OWN credential choices, read from its config file without the
+   * machine template merged in — what the per-project page may edit.
+   */
+  const ownSandboxCredentials = async (
+    repoRoot: string,
+  ): Promise<{ enabled: Record<string, unknown>; custom: unknown[] }> => {
+    try {
+      const raw = JSON.parse(await readFile(join(repoRoot, '.ai/cezar', 'config.json'), 'utf8')) as {
+        sandbox?: { credentials?: { enabled?: Record<string, unknown>; custom?: unknown[] } };
+      };
+      const credentials = raw.sandbox?.credentials;
+      return {
+        enabled: credentials?.enabled && typeof credentials.enabled === 'object' ? credentials.enabled : {},
+        custom: Array.isArray(credentials?.custom) ? credentials.custom : [],
+      };
+    } catch {
+      return { enabled: {}, custom: [] };
+    }
+  };
+
   // ---- chained family: workspace settings + GUI prefs (workspace-level) ----
   const workspaceConfigRoutes = new Hono<ProjectApiEnv>()
     /**
@@ -3023,15 +3045,8 @@ export function createApp(deps: ServerDeps) {
       });
     })
 
-    .get('/vault/browse', async (c) => {
-      const mount = (c.req.query('mount') ?? '').trim();
-      const path = (c.req.query('path') ?? '').trim().replace(/^\/+|\/+$/g, '');
-      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(mount)) {
-        return c.json({ error: 'mount must be a single KV mount name' }, 400);
-      }
-      if (path !== '' && (!/^[A-Za-z0-9][A-Za-z0-9._\-/]*$/.test(path) || path.split('/').includes('..'))) {
-        return c.json({ error: 'path must be a KV path' }, 400);
-      }
+    .get('/vault/browse', queryZodValidator(vaultBrowseQuerySchema, { message: 'mount must be a KV mount name and path a KV path' }), async (c) => {
+      const { mount, path } = c.req.valid('query');
       const exec = vaultCli((await loadWorkspaceConfig()).agentDefaults.vault ?? {});
       const listed = await listPaths(mount, path, exec)
         .catch((err: unknown) => ({ entries: [] as string[], error: String(err) }));
@@ -5759,12 +5774,17 @@ export function createApp(deps: ServerDeps) {
       const runtime = await detectContainerRuntime();
       const enabled = sandbox?.enabled === true;
       const containerfile = join(repoRoot, sandbox?.containerfile ?? '.ai/cezar/Containerfile');
+      const hasContainerfile = existsSync(containerfile);
+      const own = await ownSandboxCredentials(repoRoot);
       return c.json({
         runtime,
         enabled,
         effective: enabled && runtime.ready,
-        image: sandbox ? imageTag(sandbox) : '',
-        hasContainerfile: existsSync(containerfile),
+        // What a task will actually run. `imageTag` defaults to "has a
+        // Containerfile", so without the real answer a repo with none was shown
+        // `cezar-agent/<name>` while its tasks ran the pin or the base image.
+        image: sandbox ? imageTag(sandbox, hasContainerfile) : '',
+        hasContainerfile,
         suggestions: loadProposal(c.get('project').dataDir).pending,
         resources: sandbox?.resources ?? { shmSize: '1g' },
         credentials: {
@@ -5785,6 +5805,10 @@ export function createApp(deps: ServerDeps) {
           })),
           enabled: sandbox?.credentials?.enabled ?? {},
           custom: sandbox?.credentials?.custom ?? [],
+          // The REPO's own choices, apart from what it inherits. The page edits
+          // these: writing the merged view back pinned every machine-wide grant
+          // into the repo, so revoking one machine-wide later did nothing there.
+          own,
         },
       });
     })
@@ -5845,6 +5869,19 @@ export function createApp(deps: ServerDeps) {
             ? existing as Record<string, unknown>
             : {};
           const merged: Record<string, unknown> = { ...base, ...(incoming as Record<string, unknown>) };
+          // `credentials.enabled` merges one level further, per credential: the
+          // page sends only the grants that CHANGED. Replacing the whole map
+          // meant sending the whole map, and the only whole map the page has is
+          // the merged one — machine grants included.
+          if (key === 'credentials') {
+            const baseEnabled = base.enabled && typeof base.enabled === 'object' ? base.enabled as Record<string, unknown> : {};
+            const incomingEnabled = (incoming as { enabled?: Record<string, unknown> }).enabled;
+            if (incomingEnabled) {
+              const enabled: Record<string, unknown> = { ...baseEnabled, ...incomingEnabled };
+              for (const [k, v] of Object.entries(enabled)) if (v === null) delete enabled[k];
+              merged.enabled = enabled;
+            }
+          }
           // `null` clears a key rather than storing a null the schema would reject.
           for (const [k, v] of Object.entries(merged)) if (v === null) delete merged[k];
           patch[key] = merged;

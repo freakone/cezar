@@ -53,6 +53,7 @@ import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
 import { defaultSandboxFor, loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
 import { bootstrapRepoSandbox } from '../core/sandbox-bootstrap.ts';
+import { localLauncher, type ProcessLauncher } from '../core/process-launcher.ts';
 import { loadWorkspaceConfig } from '../workspace/config.ts';
 import { resolvePassthrough, resolveSecretEnv } from '../core/credential-passthrough.ts';
 import {
@@ -900,6 +901,14 @@ interface PersistedAttachments {
  * subject, so the always-on flushes are not mistaken for the opt-in timer.
  * The user's working tree is never touched.
  */
+/** Where one agent turn runs, decided once by `prepareSandbox`. */
+interface TurnPlacement {
+  /** The sandbox the agent runs in, with `enabled` forced on. Absent = this machine. */
+  sandbox?: SandboxConfig;
+  /** The per-task container, for podman. */
+  container?: TaskContainer;
+}
+
 export class RunManager {
   private readonly active = new Map<string, ActiveRun>();
   // Queue + `starting` set (spec 006, janitor's pump() pattern): `starting`
@@ -2591,8 +2600,13 @@ export class RunManager {
    * global installs count: a project's own `npm install` belongs to its
    * lockfile, not to the image.
    */
-  private noteToolInstall(event: { tool: string; input: unknown }): void {
+  private noteToolInstall(runId: string, event: { tool: string; input: unknown }): void {
     if (event.tool !== 'Bash') return;
+    // Only installs that happened INSIDE a container describe what the image
+    // is missing. A host run's `brew install`, or an `apt-get` on a Mac that
+    // never ran, is not a fact about the container — and these suggestions are
+    // written into a Containerfile unreviewed when a project bootstraps.
+    if (!this.store.getRun(runId)?.isolation?.effective) return;
     const command = (event.input as { command?: unknown } | null)?.command;
     if (typeof command !== 'string' || command.length === 0) return;
     noteInstalls(this.dataDir, command);
@@ -2609,15 +2623,11 @@ export class RunManager {
    */
   private async prepareSandbox(
     runId: string,
-    // Reassigned when an explicit per-task request meets an unconfigured repo.
     sandbox: SandboxConfig | undefined,
     backend: AgentBackend | undefined,
     stepId: string,
     override?: boolean,
-  ): Promise<TaskContainer | undefined> {
-    // The per-task override wins over the project switch in BOTH directions:
-    // a task explicitly marked isolated runs in a container even if the project
-    // default is off, and one marked not-isolated stays on the host.
+  ): Promise<TurnPlacement> {
     // WHERE THIS RUN ALREADY WENT WINS. A run's conversation lives in the home
     // of whoever wrote it — the operator's `~/.claude` on the host, the agent's
     // own inside a container — and `claude --resume` on a session it cannot see
@@ -2625,50 +2635,54 @@ export class RunManager {
     // somewhere, every later turn goes back there, even if the request, the
     // project setting, or cezar's own code has changed meaning in between.
     //
-    // That last case is not hypothetical: a task created before the per-task
-    // override worked ran its first turn on the host, and the turn after the fix
-    // honoured the request, moved into a container and could not find its own
-    // conversation.
+    // Otherwise the per-task override wins over the project switch in BOTH
+    // directions: marked isolated runs in a container even with the project
+    // off, marked not-isolated stays on the host with the project on.
     const recorded = this.store.getRun(runId)?.isolation;
     const wanted = recorded ? recorded.effective : (override ?? sandbox?.enabled === true);
-    // A task that ASKS for isolation in a repo that has never configured a
-    // sandbox gets the default one. Without this the override could only ever
-    // turn isolation off: no `sandbox` block means no provider, the check below
-    // bails, and the task runs on the host having been marked isolated. Every
-    // project created through "New project" starts in exactly that state.
-    //
-    // Only for an EXPLICIT request. A repo that is silent about isolation still
-    // means "no" — this reads a deliberate per-task choice, not a default.
-    if (override === true && sandbox === undefined) {
-      sandbox = defaultSandboxFor(basename(this.repoRoot));
-    }
-    // Every exit from here records where the agent actually ends up, because a
-    // run that WANTED a container and did not get one is indistinguishable
-    // afterwards from one that never asked — and those need different words in
-    // front of a person deciding whether to trust the task's blast radius.
+
     if (!wanted) {
-      this.store.updateRun(runId, { isolation: { effective: false } });
-      return undefined;
+      // Record only a FIRST decision. A later turn following an earlier
+      // fallback must not overwrite it with a bare `{ effective: false }`:
+      // that erases the reason and makes a run that asked for isolation and
+      // missed it indistinguishable from one that never asked.
+      if (!recorded) this.store.updateRun(runId, { isolation: { effective: false } });
+      return {};
     }
-    if (sandbox?.provider !== 'podman') {
-      this.store.updateRun(runId, {
-        isolation: { effective: false, reason: 'isolation is on, but no container provider is configured' },
-      });
-      return undefined;
+    // Isolation is wanted and the repo has no sandbox of its own: use the
+    // default. Not only for a fresh request — a run that already isolated keeps
+    // isolating after its project config is removed, rather than moving to the
+    // host where its conversation does not exist.
+    const chosen = sandbox ?? defaultSandboxFor(basename(this.repoRoot));
+    // What the launcher will be built from. `enabled` is forced on because THIS
+    // is the decision, made once: the launcher factory's own `enabled` gate is a
+    // second, older reading of the config, and handing it the caller's sandbox —
+    // switch off, or no block at all — is what started a container for a task
+    // marked isolated and then ran the agent on the host anyway.
+    const placed: SandboxConfig = { ...chosen, enabled: true };
+
+    if (placed.provider === 'sbx') {
+      // A Docker Sandboxes sandbox is isolation too, and has no per-task
+      // container to create — the launcher execs into it by name. Recording it
+      // as "not isolated" described a run that was not on the host.
+      this.store.updateRun(runId, { isolation: { effective: true, container: placed.name } });
+      return { sandbox: placed };
     }
     if (!backendSupportsLauncher(backend)) {
-      this.store.updateRun(runId, {
-        isolation: {
-          effective: false,
-          reason: `the ${backend ?? 'selected'} runner cannot run in a container yet`,
-        },
-      });
-      return undefined;
+      if (!recorded?.effective) {
+        this.store.updateRun(runId, {
+          isolation: {
+            effective: false,
+            reason: `the ${backend ?? 'selected'} runner cannot run in a container yet`,
+          },
+        });
+      }
+      return {};
     }
     try {
-      const container = await startTaskContainer(sandbox, this.repoRoot, runId);
+      const container = await startTaskContainer(placed, this.repoRoot, runId);
       this.store.updateRun(runId, { isolation: { effective: true, container: container.name } });
-      return container;
+      return { sandbox: placed, container };
     } catch (err) {
       const why = err instanceof PodmanUnavailable ? err.message : String(err);
       this.store.appendEvent(runId, {
@@ -2690,10 +2704,79 @@ export class RunManager {
           isolation: { effective: false, reason: `the container could not be prepared — ${why}` },
         });
       }
-      return undefined;
+      return {};
     }
   }
 
+  /**
+   * Put the project's imported team skills on disk in `cwd`, once.
+   *
+   * The ONE place a session gets them from, whichever way it starts — a task
+   * start or a Continue — so the two cannot drift (the #811 shape: a fix landed
+   * in one construction site only). Live messages need nothing: they go to a
+   * session one of those two already set up.
+   *
+   * Skips skills already there, so a long task keeps the versions it started
+   * with and a Continue does not pay ~1s to rewrite identical files.
+   */
+  private async ensureTeamSkillsOnDisk(
+    cwd: string,
+    skills: readonly Skill[],
+    stepId: string,
+    emit: (event: { type: string; stepId?: string; [k: string]: unknown }) => void,
+    selected?: string,
+  ): Promise<void> {
+    if (!skills.some((s) => s.source === 'team' && s.team?.dir)) return;
+    const seededNames = await materializeSkillDirs(cwd, skills, { skipExisting: true }).catch(() => []);
+    if (seededNames.length === 0) return;
+    emit({
+      type: 'note',
+      stepId,
+      // One note: a line per skill would bury the step's real output.
+      message: seededNames.length === 1
+        ? `team skill "${seededNames[0]}" materialized to .claude/skills/${seededNames[0]}/`
+        : `${seededNames.length} team skills materialized to .claude/skills/`
+          + (selected ? ` (selected: ${selected})` : ''),
+    });
+  }
+
+  /**
+   * The launcher for one agent turn — the ONE place both the step path and the
+   * Continue path get it from.
+   *
+   * Two sites used to assemble it themselves, and both handed the launcher
+   * factory the config they had read rather than the placement
+   * `prepareSandbox` had just decided. That is how a task marked isolated in a
+   * project whose switch was off got a container started for it and an agent
+   * spawned on the host, while its record said "isolated".
+   *
+   * Secrets are fetched only where they can be DELIVERED: the local launcher
+   * ignores fetched values, so fetching for a host turn only created a way for a
+   * `required` secret to fail a task that would have discarded it anyway.
+   */
+  private async launcherForTurn(
+    runId: string,
+    sandbox: SandboxConfig | undefined,
+    backend: AgentBackend | undefined,
+    stepId: string,
+  ): Promise<{ launcher: ProcessLauncher; fatal: string | null }> {
+    const placement = await this.prepareSandbox(runId, sandbox, backend, stepId, this.store.getRun(runId)?.isolated);
+    let env: string[] = [];
+    if (placement.container) {
+      const secrets = await this.fetchSecrets(runId, placement.sandbox, stepId);
+      if (secrets.fatal) return { launcher: localLauncher, fatal: secrets.fatal };
+      env = secrets.env;
+    } else if (placement.sandbox && resolvePassthrough(placement.sandbox.credentials).some((c) => c.valueFrom)) {
+      // sbx cannot take per-exec values. Silence here would be a dropped secret
+      // on a run that is isolated and looks fully configured.
+      this.store.appendEvent(runId, {
+        type: 'note',
+        stepId,
+        message: `⚠ secrets from Vault are not passed to a ${placement.sandbox.provider} sandbox — only to podman containers`,
+      });
+    }
+    return { launcher: createLauncher(placement.sandbox, placement.container, env), fatal: null };
+  }
 
   /**
    * Fetch this turn's store-backed secrets on the HOST, and say what failed.
@@ -2812,13 +2895,17 @@ export class RunManager {
    * the cockpit for the next task to use it.
    */
   private vaultReader = cachingVaultReader();
-  private vaultReaderAddress: string | undefined;
+  private vaultReaderKey: string | undefined;
 
   private async readerForVault(): Promise<VaultReader> {
     const settings = (await loadWorkspaceConfig()).agentDefaults.vault ?? {};
-    const address = effectiveVaultAddress(settings);
-    if (address !== this.vaultReaderAddress) {
-      this.vaultReaderAddress = address;
+    // Keyed on EVERYTHING that changes which Vault answers, not just the
+    // address: a namespace edited in Settings — or set while the address comes
+    // from an inherited VAULT_ADDR — kept the old reader, and its cache, until
+    // the cockpit restarted.
+    const key = JSON.stringify([effectiveVaultAddress(settings), settings.namespace ?? '']);
+    if (key !== this.vaultReaderKey) {
+      this.vaultReaderKey = key;
       this.vaultReader = cachingVaultReader(readWith(settings));
     }
     return this.vaultReader;
@@ -3915,22 +4002,30 @@ export class RunManager {
     // existed — "No conversation found with session ID …", on a task that is
     // perfectly intact.
     const continueSandbox = (await loadConfig(this.repoRoot)).sandbox;
-    const continueContainer = await this.prepareSandbox(runId, continueSandbox, continueBackend, stepId, this.store.getRun(runId)?.isolated);
-    // Re-fetched for this turn, not reused from the first one: a secret rotated
-    // between turns has to reach the next one.
-    const continueSecrets = await this.fetchSecrets(runId, continueSandbox, stepId);
-    if (continueSecrets.fatal) {
+    // The same helper the step path uses, so the two cannot drift apart again.
+    // Secrets are re-fetched for this turn: one rotated between turns has to
+    // reach the next.
+    const continueTurn = await this.launcherForTurn(runId, continueSandbox, continueBackend, stepId);
+    if (continueTurn.fatal) {
       // Same treatment as a broken temp dir: refuse before spawning, with the
       // reason on the record, rather than resuming into a turn that will fail
       // at something naming neither the secret nor the store.
-      failBeforeSpawn(continueSecrets.fatal);
+      failBeforeSpawn(continueTurn.fatal);
       return;
     }
-    const runner = createRunner(continueBackend, {
-      launcher: createLauncher(continueSandbox, continueContainer, continueSecrets.env),
-    });
+    const runner = createRunner(continueBackend, { launcher: continueTurn.launcher });
     state.currentStepId = stepId;
     this.beginUsageInvocation(runId, state, stepId);
+    // The same skills-on-disk guarantee a task start gives, for the other way a
+    // session begins. A reclaimed worktree comes back from git without them
+    // (they are excluded from it), and this is the session a `/skill` in the
+    // opening message will delegate from.
+    await this.ensureTeamSkillsOnDisk(
+      state.cwd,
+      state.skills ?? [],
+      stepId,
+      (event) => this.store.appendEvent(runId, event as never),
+    );
     // A continuation's opening message becomes the session's `userPrompt` and never passes
     // through `deliverMessage`, so it needs the SAME delivery-only `/skill` rewrite the
     // live path applies (#811). Delivery-only: the `user-message` event above already
@@ -4432,35 +4527,6 @@ export class RunManager {
         // numeric task such as "432" still gives the model enough context to
         // describe the work — and therefore derive a useful title (#432).
         systemPrompt = skillSystemPrompt(skill);
-        // Directory team skills (SKILL.md + references/) get materialized
-        // into <cwd>/.claude/skills/<name>/ — the run's worktree when there
-        // is one — so claude sees the companion files on disk; the shared
-        // info/exclude keeps them out of git (and out of autosave commits).
-        if (skill.source === 'team' && skill.team?.dir) {
-          // The selected skill AND the rest of the collection it came with.
-          // These collections delegate constantly — om-code-review stops and
-          // names om-setup-agent-pipeline, om-auto-review-pr wraps
-          // om-code-review — and materializing only the SELECTED skill left the
-          // agent reporting the whole collection as "not installed" on a machine
-          // where every one of them was imported.
-          //
-          // The whole imported set rather than a computed delegation closure:
-          // measured against the open-mercato collection, every skill's closure
-          // reached the cap anyway, so "just the ones it needs" was false
-          // precision with a non-deterministic cut. `skills` is the project's
-          // resolved catalog, so nothing the project did not import is written.
-          const seededNames = await materializeSkillDirs(state.cwd, skills);
-          if (seededNames.length > 0) {
-            emit({
-              type: 'note',
-              stepId: step.id,
-              // One note: a line per skill would bury the step's real output.
-              message: seededNames.length === 1
-                ? `team skill "${seededNames[0]}" materialized to .claude/skills/${seededNames[0]}/`
-                : `${seededNames.length} team skills materialized to .claude/skills/ (selected: ${skill.name})`,
-            });
-          }
-        }
       } else {
         emit({
           type: 'note',
@@ -4469,6 +4535,15 @@ export class RunManager {
         });
       }
     }
+
+    // The project's imported team skills go on disk for EVERY session, not only
+    // one that started with a skill selected. A `/om-auto-review-pr` typed into
+    // a message or a Continue is expanded from the registry — its SKILL.md body
+    // is inlined — but the skill then delegates to its siblings and to its own
+    // `references/`, which exist only on disk. With materialization tied to the
+    // selected-skill path, that run read its instructions, was told to use
+    // om-code-review, looked, and found nothing.
+    await this.ensureTeamSkillsOnDisk(state.cwd, skills, step.id, emit, step.skill);
 
     let userPrompt = applyTemplate(step.prompt ?? '{{task}}', input.task);
     // A fresh run's OPENING prompt is delivered straight to `startSession`, never through
@@ -4537,7 +4612,7 @@ export class RunManager {
       // offered one built from the toolchain its own tasks needed. Observation
       // only — it never writes anything a person has not accepted, and never
       // throws into the run.
-      if (event.type === 'tool-call') this.noteToolInstall(event);
+      if (event.type === 'tool-call') this.noteToolInstall(runId, event);
       emit({ ...event, stepId: step.id });
       if (event.type === 'error') {
         sessionError ??= event.message;
@@ -4777,13 +4852,12 @@ export class RunManager {
         message: `⚠ sandbox is configured, but the ${stepBackend} runner does not support it yet — this step runs on this machine, unisolated`,
       });
     }
-    const container = await this.prepareSandbox(runId, sandbox, stepBackend, step.id, this.store.getRun(runId)?.isolated);
-    // Store-backed secrets for THIS turn, fetched on the host. A required one
-    // that cannot be fetched fails the step here, before an agent spawns and
-    // discovers it several tool calls later.
-    const secrets = await this.fetchSecrets(runId, sandbox, step.id);
-    if (secrets.fatal) return secrets.fatal;
-    const runner = createRunner(stepBackend, { launcher: createLauncher(sandbox, container, secrets.env) });
+    // Placement, secrets and launcher from ONE decision — see `launcherForTurn`.
+    // A required secret that cannot be fetched fails the step here, before an
+    // agent spawns and discovers it several tool calls later.
+    const turn = await this.launcherForTurn(runId, sandbox, stepBackend, step.id);
+    if (turn.fatal) return turn.fatal;
+    const runner = createRunner(stepBackend, { launcher: turn.launcher });
     let session: AgentSession;
     state.currentStepId = step.id;
     this.beginUsageInvocation(runId, state, step.id);

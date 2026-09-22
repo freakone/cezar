@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -91,4 +91,25 @@ describe('taking the latest base from the remote', () => {
     const { clone } = scenario();
     expect(await fetchBase(clone, '--upload-pack=touch /tmp/pwned')).toMatchObject({ ok: false });
   });
+
+  it('never waits on an ssh prompt, and keeps the operator\'s own ssh command', async () => {
+    // `GIT_TERMINAL_PROMPT=0` does not reach ssh: a passphrase or an unseen
+    // host key made it open the terminal and wait out the whole timeout at
+    // every task start. The command is recorded by a fake ssh that exits.
+    const { clone } = scenario();
+    const log = join(clone, 'ssh-args.log');
+    const fakeSsh = join(clone, 'fake-ssh.sh');
+    writeFileSync(fakeSsh, `#!/bin/sh\necho "$@" > ${log}\nexit 255\n`, { mode: 0o755 });
+    execFileSync('git', ['remote', 'set-url', 'origin', 'git@example.invalid:x/y.git'], { cwd: clone });
+    // A repo whose sshCommand names a key relies on it to authenticate at all.
+    execFileSync('git', ['config', 'core.sshCommand', `${fakeSsh} -i /keys/deploy`], { cwd: clone });
+
+    const result = await fetchBase(clone, 'main');
+
+    expect(result.ok).toBe(false);
+    const args = readFileSync(log, 'utf8');
+    expect(args).toContain('BatchMode=yes');
+    // Extended, not replaced — the key is still there.
+    expect(args).toContain('-i /keys/deploy');
+  }, 20_000);
 });
