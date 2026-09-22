@@ -3456,6 +3456,21 @@ export class RunManager {
     // here rather than letting one reach a backend that has no idea what it is.
     const blocks = contentBlocksOf(content);
     const expanded = userAuthored ? expandRegistrySlashSkill(blocks, state.skills ?? []) : blocks;
+    // A typed `/skill` that matched the registry delegates to its collection on
+    // DISK, and a session that started before those skills were there never got
+    // them: session start is where they are materialized. Seen for real — a
+    // long-lived task given `/om-auto-review-pr` read its instructions, was told
+    // to use om-code-review, and found nothing. Fire-and-forget because this
+    // path is synchronous; it races the agent's first read by about a second the
+    // first time, and costs nothing after (skills already there are skipped).
+    if (userAuthored && expanded !== blocks) {
+      void this.ensureTeamSkillsOnDisk(
+        state.cwd,
+        state.skills ?? [],
+        state.currentStepId ?? '',
+        (event) => this.store.appendEvent(runId, event as never),
+      );
+    }
     const deliverable = persisted.length
       ? [...expanded, pastedAttachmentsNote(persisted, this.attachmentLibraryHint(persisted) ??
           (imageLibraryWrites.length ? attachmentLibraryDir(this.dataDir) : undefined))]
