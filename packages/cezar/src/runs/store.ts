@@ -4,7 +4,12 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync
 import { join } from 'node:path';
 import { z } from 'zod';
 import { StreamRedaction } from './stream-redaction.ts';
-import { collectSecretValues, redactDeep, redactSecrets } from '../core/secret-redaction.ts';
+import {
+  collectSecretValues,
+  redactDeep,
+  redactSecrets,
+  registeredSecretValues,
+} from '../core/secret-redaction.ts';
 // Sibling module, files only — a draft belongs to a run and is deleted with it (#939).
 import { deleteRunDrafts } from './drafts.ts';
 // Pure, dependency-free reference helpers — the same sanity bound the marker parser applies.
@@ -1586,7 +1591,12 @@ export class RunStore extends EventEmitter {
 
   private hostSecrets(): readonly string[] {
     if (this.secretValues === null) this.secretValues = collectSecretValues();
-    return this.secretValues;
+    // The host env is read once — it does not change under a running cockpit.
+    // Fetched secrets DO arrive later (the first task that resolves one), so
+    // they are merged per call rather than folded into the cached list.
+    const fetched = registeredSecretValues();
+    if (fetched.length === 0) return this.secretValues;
+    return [...this.secretValues, ...fetched].sort((a, b) => b.length - a.length);
   }
 
   readEvents(runId: string): RunEvent[] {
