@@ -3,7 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { collectSecretValues, redactDeep, redactSecrets } from '../core/secret-redaction.ts';
+import {
+  collectSecretValues,
+  redactDeep,
+  redactSecrets,
+  registeredSecretValues,
+} from '../core/secret-redaction.ts';
 // Pure, dependency-free reference helpers — the same sanity bound the marker parser applies.
 import { MAX_REF } from './task-refs.ts';
 // Type-only module (zod + nothing else), so this cannot cycle back into the store.
@@ -1126,7 +1131,12 @@ export class RunStore extends EventEmitter {
 
   private hostSecrets(): readonly string[] {
     if (this.secretValues === null) this.secretValues = collectSecretValues();
-    return this.secretValues;
+    // The host env is read once — it does not change under a running cockpit.
+    // Fetched secrets DO arrive later (the first task that resolves one), so
+    // they are merged per call rather than folded into the cached list.
+    const fetched = registeredSecretValues();
+    if (fetched.length === 0) return this.secretValues;
+    return [...this.secretValues, ...fetched].sort((a, b) => b.length - a.length);
   }
 
   readEvents(runId: string): RunEvent[] {

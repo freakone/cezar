@@ -112,6 +112,14 @@ export const isolationStatusResponseSchema = z.object({
       guestPath: z.string().optional(),
       env: z.array(z.string()).optional(),
       mode: z.enum(['mount', 'copy']).optional(),
+      /**
+       * Where the value is fetched from — `vault://<mount>/<path>#<field>`.
+       * A REFERENCE, never a value: this is served over the API, so a secret
+       * here would be readable by anything that can read the settings page.
+       */
+      valueFrom: z.string().optional(),
+      /** Fail the step when it cannot be fetched, instead of running without it. */
+      required: z.boolean().optional(),
     })).default([]),
   }),
 });

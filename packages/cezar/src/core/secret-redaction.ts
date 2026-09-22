@@ -84,6 +84,32 @@ export function collectSecretValues(env: NodeJS.ProcessEnv = process.env): strin
   return [...values].sort((a, b) => b.length - a.length);
 }
 
+/**
+ * Values fetched at runtime from a secret store, registered so they are scrubbed
+ * from transcripts by VALUE rather than only when they happen to match a known
+ * token shape.
+ *
+ * This is the argument for cezar resolving secrets itself instead of handing the
+ * agent a Vault token: a value cezar never saw can only be caught by its shape,
+ * and most secrets do not have one.
+ *
+ * Process-wide and append-only. It holds credentials, so it is never persisted,
+ * never served over the API, and never logged.
+ */
+const fetchedSecrets = new Set<string>();
+
+/** Register values to scrub. Short values are ignored, as in `collectSecretValues`. */
+export function registerSecretValues(values: Iterable<string>): void {
+  for (const value of values) {
+    if (value && value.length >= MIN_SECRET_LEN) fetchedSecrets.add(value);
+  }
+}
+
+/** Everything registered so far, longest first so overlaps scrub completely. */
+export function registeredSecretValues(): string[] {
+  return [...fetchedSecrets].sort((a, b) => b.length - a.length);
+}
+
 /** Replace every known secret value / token shape in `text` with `[REDACTED]`. */
 export function redactSecrets(text: string, secretValues: readonly string[]): string {
   let out = text;

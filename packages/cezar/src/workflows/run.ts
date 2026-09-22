@@ -40,6 +40,9 @@ import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
 import { defaultSandboxFor, loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
 import { bootstrapRepoSandbox } from '../core/sandbox-bootstrap.ts';
+import { resolvePassthrough, resolveSecretEnv } from '../core/credential-passthrough.ts';
+import { cachingVaultReader, parseVaultRef, VaultUnavailable } from '../core/vault-secrets.ts';
+import { registerSecretValues } from '../core/secret-redaction.ts';
 import { autosaveCommit, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows } from './load.ts';
@@ -1628,6 +1631,51 @@ export class RunManager {
     }
   }
 
+
+  /**
+   * Fetch this turn's store-backed secrets on the HOST, and say what failed.
+   *
+   * Per turn rather than per container: a container outlives a turn, and a
+   * secret rotated between turns must reach the next one — the same property
+   * the file-backed credentials have. The reader caches briefly so a multi-step
+   * workflow does not pay a round trip per step for the same reference.
+   *
+   * Values are registered for redaction BEFORE they are handed to a launcher,
+   * so a secret cannot reach a transcript unscrubbed even if the very first
+   * tool call prints it.
+   */
+  private async fetchSecrets(
+    runId: string,
+    sandbox: SandboxConfig | undefined,
+    stepId: string,
+  ): Promise<{ env: string[]; fatal: string | null }> {
+    const resolved = resolvePassthrough(sandbox?.credentials);
+    if (!resolved.some((c) => c.valueFrom)) return { env: [], fatal: null };
+    const { pairs, problems } = await resolveSecretEnv(resolved, async (reference) => {
+      const ref = parseVaultRef(reference);
+      if (!ref) throw new VaultUnavailable(`not a secret reference cezar can fetch: ${reference}`);
+      return this.vaultReader(ref);
+    });
+    registerSecretValues(pairs.map((pair) => pair.slice(pair.indexOf('=') + 1)));
+
+    for (const problem of problems) {
+      this.store.appendEvent(runId, {
+        type: 'note',
+        stepId,
+        message: `⚠ secret "${problem.id}" could not be fetched — ${problem.reason}`
+          + (problem.required ? '' : '; the task runs without it'),
+      });
+    }
+    const required = problems.find((p) => p.required);
+    return {
+      env: pairs,
+      // A load-bearing secret is a step failure, not a note: without it the
+      // agent gets several tool calls in and fails at something that names
+      // neither the secret nor the store.
+      fatal: required ? `required secret "${required.id}" could not be fetched — ${required.reason}` : null,
+    };
+  }
+
   /**
    * Persist the sandbox a first isolated run used, and the packages it
    * installed, for a repo that has no config of its own.
@@ -1690,6 +1738,10 @@ export class RunManager {
       // retention is best-effort; swallow so terminal transitions never break.
     }
   }
+
+  /** One Vault reader per manager, so its short TTL cache is shared by every
+   *  step of every run in this project rather than re-fetching per step. */
+  private readonly vaultReader = cachingVaultReader();
 
   /** Last live-refresh namer inputs per run — unchanged inputs skip the call. */
   private lastNamerKey = new Map<string, string>();
@@ -2602,8 +2654,18 @@ export class RunManager {
     // perfectly intact.
     const continueSandbox = (await loadConfig(this.repoRoot)).sandbox;
     const continueContainer = await this.prepareSandbox(runId, continueSandbox, continueBackend, stepId, this.store.getRun(runId)?.isolated);
+    // Re-fetched for this turn, not reused from the first one: a secret rotated
+    // between turns has to reach the next one.
+    const continueSecrets = await this.fetchSecrets(runId, continueSandbox, stepId);
+    if (continueSecrets.fatal) {
+      // Same treatment as a broken temp dir: refuse before spawning, with the
+      // reason on the record, rather than resuming into a turn that will fail
+      // at something naming neither the secret nor the store.
+      failBeforeSpawn(continueSecrets.fatal);
+      return;
+    }
     const runner = createRunner(continueBackend, {
-      launcher: createLauncher(continueSandbox, continueContainer),
+      launcher: createLauncher(continueSandbox, continueContainer, continueSecrets.env),
     });
     state.currentStepId = stepId;
     this.beginUsageInvocation(runId, state, stepId);
@@ -3227,7 +3289,12 @@ export class RunManager {
       });
     }
     const container = await this.prepareSandbox(runId, sandbox, stepBackend, step.id, this.store.getRun(runId)?.isolated);
-    const runner = createRunner(stepBackend, { launcher: createLauncher(sandbox, container) });
+    // Store-backed secrets for THIS turn, fetched on the host. A required one
+    // that cannot be fetched fails the step here, before an agent spawns and
+    // discovers it several tool calls later.
+    const secrets = await this.fetchSecrets(runId, sandbox, step.id);
+    if (secrets.fatal) return secrets.fatal;
+    const runner = createRunner(stepBackend, { launcher: createLauncher(sandbox, container, secrets.env) });
     let session: AgentSession;
     state.currentStepId = step.id;
     this.beginUsageInvocation(runId, state, step.id);
