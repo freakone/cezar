@@ -5885,6 +5885,10 @@ export function createApp(deps: ServerDeps) {
                 guestPath: z.string().trim().optional(),
                 env: z.array(z.string().trim().min(1)).optional(),
                 mode: z.enum(['mount', 'copy']).optional(),
+                // A REFERENCE to a secret store, never a value — see the config
+                // schema. `vault://<mount>/<path>#<field>`.
+                valueFrom: z.string().trim().min(1).max(512).optional(),
+                required: z.boolean().optional(),
               }))
               .optional(),
           })

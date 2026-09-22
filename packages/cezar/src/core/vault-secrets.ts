@@ -1,0 +1,124 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const run = promisify(execFile);
+
+/**
+ * Resolve development secrets from HashiCorp Vault, on the HOST, so an isolated
+ * agent receives values and never access.
+ *
+ * The container is deliberately never given `VAULT_TOKEN`. Handing it one would
+ * grant the agent everything the operator's token reaches, and Vault's audit
+ * log would then record "the agent read the vault" rather than "this task read
+ * these three secrets" — the same narrowing argument as picking individual ssh
+ * keys instead of mounting `~/.ssh`.
+ *
+ * Auth is the CLI's, not ours: `vault login` writes `~/.vault-token` and the
+ * binary reads it, along with `VAULT_ADDR` and `VAULT_NAMESPACE` from the
+ * cockpit's own environment. cezar storing a Vault credential in order to fetch
+ * credentials would just move the problem, and shelling out is the same call
+ * this codebase already makes for `gh` and `glab`: let the vendor's tool own
+ * auth, namespaces, and the KV v1-vs-v2 path difference that is easy to get
+ * subtly wrong.
+ */
+
+/** `vault://<mount>/<path>#<field>` — e.g. `vault://secret/dev/api#STRIPE_KEY`. */
+export interface VaultRef {
+  mount: string;
+  path: string;
+  field: string;
+}
+
+/** Is this a Vault reference at all? Cheap enough to call on every value. */
+export function isVaultRef(value: string): boolean {
+  return value.startsWith('vault://');
+}
+
+/**
+ * Parse a reference, or `null` when it is not one this can fetch.
+ *
+ * Strict on purpose: every part becomes an argv entry, and a reference that
+ * parses loosely would send a malformed path to `vault` and surface as its
+ * error rather than as a bad reference the operator can see and fix.
+ */
+export function parseVaultRef(value: string): VaultRef | null {
+  if (!isVaultRef(value)) return null;
+  const rest = value.slice('vault://'.length);
+  const hash = rest.lastIndexOf('#');
+  if (hash <= 0 || hash === rest.length - 1) return null;
+  const location = rest.slice(0, hash);
+  const field = rest.slice(hash + 1);
+  const slash = location.indexOf('/');
+  if (slash <= 0 || slash === location.length - 1) return null;
+  const mount = location.slice(0, slash);
+  const path = location.slice(slash + 1);
+  // No traversal, no flag smuggling, no empty segments.
+  for (const part of [mount, field]) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part)) return null;
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._\-/]*$/.test(path) || path.includes('//') || path.split('/').includes('..')) {
+    return null;
+  }
+  return { mount, path, field };
+}
+
+/** Fetches one field. Injectable so tests never need a Vault. */
+export type VaultReader = (ref: VaultRef) => Promise<string>;
+
+export class VaultUnavailable extends Error {}
+
+/** How long a resolved value is reused before Vault is asked again. */
+const CACHE_TTL_MS = 60_000;
+
+/**
+ * The real reader: `vault kv get -field=…`, which prints the value alone.
+ *
+ * `-field` rather than `-format=json`: one value crosses the process boundary
+ * instead of the whole secret, so a sibling field never lands in a buffer, an
+ * error message, or a crash dump.
+ */
+export const vaultCliReader: VaultReader = async (ref) => {
+  try {
+    const { stdout } = await run(
+      'vault',
+      ['kv', 'get', `-mount=${ref.mount}`, `-field=${ref.field}`, ref.path],
+      { timeout: 15_000, maxBuffer: 1024 * 1024 },
+    );
+    // `-field` prints the raw value; Vault adds no trailing newline for it, but
+    // a shell wrapper on PATH might.
+    return stdout.replace(/\n$/, '');
+  } catch (err) {
+    const e = err as { stderr?: string; message?: string; code?: string };
+    if (e.code === 'ENOENT') {
+      throw new VaultUnavailable('the `vault` CLI is not installed or not on cezar\'s PATH');
+    }
+    const detail = (e.stderr || e.message || 'vault failed').trim().split('\n')[0] ?? 'vault failed';
+    throw new VaultUnavailable(detail);
+  }
+};
+
+interface CacheEntry {
+  value: string;
+  at: number;
+}
+
+/**
+ * A reader with a short TTL cache.
+ *
+ * Credentials are resolved per agent spawn so a rotated secret reaches the next
+ * turn of a long task — the same property the file-backed ones have. Without a
+ * cache a five-step workflow pays five round trips for the same value; with a
+ * minute of TTL a rotation still lands within a turn or two.
+ */
+export function cachingVaultReader(inner: VaultReader = vaultCliReader, ttlMs = CACHE_TTL_MS): VaultReader {
+  const cache = new Map<string, CacheEntry>();
+  return async (ref) => {
+    const key = `${ref.mount}/${ref.path}#${ref.field}`;
+    const hit = cache.get(key);
+    const now = Date.now();
+    if (hit && now - hit.at < ttlMs) return hit.value;
+    const value = await inner(ref);
+    cache.set(key, { value, at: now });
+    return value;
+  };
+}

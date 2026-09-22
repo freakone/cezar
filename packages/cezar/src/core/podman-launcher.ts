@@ -147,6 +147,13 @@ export function podmanExecArgs(
   args: string[],
   opts: LaunchOpts,
   pidFile: string,
+  /**
+   * `KEY=VALUE` pairs fetched from a secret store on the host, already resolved
+   * upstream. They arrive pre-resolved because fetching is async and this
+   * builder is deliberately synchronous and pure — the property its tests rest
+   * on. The container receives values, never the credential that fetched them.
+   */
+  fetchedEnv: readonly string[] = [],
 ): string[] {
   const env = { ...opts.env, CEZ_PID_FILE: pidFile };
   // Credentials passed as environment variables (AWS_PROFILE, a custom
@@ -155,7 +162,8 @@ export function podmanExecArgs(
   // the host env, not from `opts.env`, which `buildChildEnv` has already
   // filtered — that filtering is why they were absent before.
   const credentialEnv = credentialEnvPairs(resolvePassthrough(cfg.credentials));
-  const envArgs = [...containerEnvPairs(env, cfg.tmpdir), ...credentialEnv].flatMap((pair) => ['-e', pair]);
+  const envArgs = [...containerEnvPairs(env, cfg.tmpdir), ...credentialEnv, ...fetchedEnv]
+    .flatMap((pair) => ['-e', pair]);
   return [
     'exec',
     // `-i` keeps stdin open for the stream-json conversation. No `-t`: cezar
@@ -186,6 +194,15 @@ export class PodmanLauncher implements ProcessLauncher {
     private readonly bin = 'podman',
     /** The port published when the container was created, if any. */
     readonly publishedPort?: number,
+    /**
+     * Secrets fetched on the host for this turn (`KEY=VALUE`).
+     *
+     * Held on the launcher rather than fetched per spawn because `spawn` is
+     * synchronous by contract — every runner depends on it returning a child
+     * process, not a promise. The engine re-resolves them on each step and
+     * Continue, so a rotated secret still reaches the next turn.
+     */
+    private readonly fetchedEnv: readonly string[] = [],
   ) {}
 
   describe(): string {
@@ -196,7 +213,7 @@ export class PodmanLauncher implements ProcessLauncher {
     const pidFile = `${this.cfg.tmpdir}/cez-${randomUUID()}.pid`;
     const child = nodeSpawn(
       this.bin,
-      podmanExecArgs(this.cfg, this.containerName, bin, args, opts, pidFile),
+      podmanExecArgs(this.cfg, this.containerName, bin, args, opts, pidFile, this.fetchedEnv),
       // The host env is what `podman` itself needs; what the AGENT sees was
       // passed explicitly via `-e` above.
       { cwd: opts.cwd, env: process.env },
