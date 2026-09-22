@@ -241,24 +241,40 @@ export async function vaultStatus(
 }
 
 /** The KV mounts this token can see. */
-export async function listMounts(exec: VaultRunner = cli): Promise<string[]> {
-  const raw = await exec(['secrets', 'list', '-format=json']);
-  const parsed = JSON.parse(raw) as Record<string, { type?: string }>;
-  return Object.entries(parsed)
-    .filter(([, info]) => info.type === 'kv')
-    .map(([path]) => path.replace(/\/$/, ''))
-    .sort();
+export async function listMounts(exec: VaultRunner = cli): Promise<{ mounts: string[]; error?: string }> {
+  try {
+    const raw = await exec(['secrets', 'list', '-format=json']);
+    const parsed = JSON.parse(raw) as Record<string, { type?: string }>;
+    return {
+      mounts: Object.entries(parsed)
+        .filter(([, info]) => info.type === 'kv')
+        .map(([path]) => path.replace(/\/$/, ''))
+        .sort(),
+    };
+  } catch (err) {
+    // `sys/mounts` needs privileges a sensibly-scoped token does not have, so
+    // this 403s for most REAL tokens — measured against one whose policy
+    // covered its own KV paths and nothing else. It is not an error state: the
+    // operator knows their mount name, so the picker lets them type it.
+    return { mounts: [], error: vaultMessage(err) };
+  }
 }
 
 /** What a KV path holds: child paths (ending `/`) and leaf secrets. */
-export async function listPaths(mount: string, path: string, exec: VaultRunner = cli): Promise<string[]> {
+export async function listPaths(
+  mount: string,
+  path: string,
+  exec: VaultRunner = cli,
+): Promise<{ entries: string[]; error?: string }> {
   try {
     const raw = await exec(['kv', 'list', '-format=json', `-mount=${mount}`, path || '/']);
-    return (JSON.parse(raw) as string[]).sort();
-  } catch {
-    // An empty or non-existent path is not an error worth a 500 — the picker
-    // shows "nothing here", which is the same information.
-    return [];
+    return { entries: (JSON.parse(raw) as string[]).sort() };
+  } catch (err) {
+    // An empty path and a FORBIDDEN one are not the same answer. Collapsing
+    // both to "nothing here" is what makes a policy problem look like an empty
+    // Vault — measured against a real token whose policy granted list but not
+    // read, where the picker said "Nothing here" about a secret that was there.
+    return { entries: [], error: vaultMessage(err) };
   }
 }
 
@@ -269,13 +285,35 @@ export async function listPaths(mount: string, path: string, exec: VaultRunner =
  * process for as long as it takes to read the keys — they are not returned,
  * not logged, and not stored.
  */
-export async function listFields(mount: string, path: string, exec: VaultRunner = cli): Promise<string[]> {
-  const raw = await exec(['kv', 'get', '-format=json', `-mount=${mount}`, path]);
-  const parsed = JSON.parse(raw) as { data?: { data?: Record<string, unknown> } | Record<string, unknown> };
-  const outer = parsed.data ?? {};
-  // KV v2 nests the secret under `data.data`; v1 puts it directly on `data`.
-  const inner = (outer as { data?: Record<string, unknown> }).data ?? outer;
-  return Object.keys(inner as Record<string, unknown>).sort();
+export async function listFields(
+  mount: string,
+  path: string,
+  exec: VaultRunner = cli,
+): Promise<{ fields: string[]; error?: string }> {
+  try {
+    const raw = await exec(['kv', 'get', '-format=json', `-mount=${mount}`, path]);
+    const parsed = JSON.parse(raw) as { data?: { data?: Record<string, unknown> } | Record<string, unknown> };
+    const outer = parsed.data ?? {};
+    // KV v2 nests the secret under `data.data`; v1 puts it directly on `data`.
+    const inner = (outer as { data?: Record<string, unknown> }).data ?? outer;
+    return { fields: Object.keys(inner as Record<string, unknown>).sort() };
+  } catch (err) {
+    // The common one is a policy that grants `list` but not `read`: the path
+    // shows up, the fields do not, and without the reason it reads as an empty
+    // secret. It also means the value could not be fetched at task start
+    // either, which is worth knowing BEFORE picking it.
+    return { fields: [], error: vaultMessage(err) };
+  }
+}
+
+/** The useful line out of a vault CLI failure. */
+function vaultMessage(err: unknown): string {
+  const e = err as { stderr?: string; message?: string };
+  const text = (e.stderr || e.message || 'vault failed').trim();
+  const denied = /permission denied/i.test(text);
+  const line = text.split('\n').map((l) => l.trim()).filter(Boolean).find((l) => /error|denied|\*/i.test(l));
+  if (denied) return 'permission denied — this token\'s policy does not allow it';
+  return (line ?? text).replace(/^\*\s*/, '').slice(0, 200);
 }
 
 /** `vault://<mount>/<path>#<field>` for a picked field. */

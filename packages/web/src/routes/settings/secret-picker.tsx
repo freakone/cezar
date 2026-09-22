@@ -118,6 +118,7 @@ export function SecretPicker({
       {ready && picking ? (
         <VaultBrowser
           mounts={status.data?.mounts ?? []}
+          mountsError={status.data?.mountsError}
           busy={busy}
           onCancel={() => setPicking(false)}
           onPick={(entry) => {
@@ -134,11 +135,14 @@ export function SecretPicker({
 /** Browse one mount a level at a time, then pick a field. */
 function VaultBrowser({
   mounts,
+  mountsError,
   busy,
   onPick,
   onCancel,
 }: {
   mounts: string[]
+  /** Set when the mount list could not be read — usually a policy, not a fault. */
+  mountsError?: string
   busy: boolean
   onPick: (entry: SecretEntry) => void
   onCancel: () => void
@@ -163,14 +167,29 @@ function VaultBrowser({
   return (
     <div data-slot="vault-browser" className="rounded-md border border-border p-3">
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <select
-          className="rounded border bg-background px-1 py-0.5 text-xs"
-          value={mount}
-          aria-label="Vault mount"
-          onChange={(e) => { setMount(e.target.value); setPath(''); setField(null) }}
-        >
-          {mounts.map((m) => <option key={m} value={m}>{m}</option>)}
-        </select>
+        {/* Enumerating mounts needs `sys/mounts`, which a sensibly-scoped token
+            is not granted — so typing the name is the NORMAL path, not the
+            fallback. A dropdown alone left real tokens with an empty picker and
+            no way forward. */}
+        {mounts.length > 0 ? (
+          <select
+            className="rounded border bg-background px-1 py-0.5 text-xs"
+            value={mount}
+            aria-label="Vault mount"
+            onChange={(e) => { setMount(e.target.value); setPath(''); setField(null) }}
+          >
+            {mounts.map((m) => <option key={m} value={m}>{m}</option>)}
+          </select>
+        ) : (
+          <Input
+            data-slot="vault-mount"
+            className="h-7 w-32 font-mono text-xs"
+            placeholder="mount (e.g. kv)"
+            aria-label="Vault mount"
+            value={mount}
+            onChange={(e) => { setMount(e.target.value.trim()); setPath(''); setField(null) }}
+          />
+        )}
         <button
           type="button"
           className="text-muted-foreground hover:text-foreground"
@@ -191,6 +210,12 @@ function VaultBrowser({
           </span>
         ))}
       </div>
+
+      {mounts.length === 0 && mountsError ? (
+        <p className="mt-1.5 text-xs text-muted-foreground">
+          This token cannot list mounts ({mountsError}) — type the mount name.
+        </p>
+      ) : null}
 
       <ul className="mt-2 flex max-h-56 flex-col gap-0.5 overflow-y-auto">
         {browse.isPending ? <li className="text-xs text-muted-foreground">Reading…</li> : null}
@@ -223,8 +248,14 @@ function VaultBrowser({
             </button>
           </li>
         ))}
+        {/* "Nothing here" and "you are not allowed to look" are different
+            answers, and only one of them is worth acting on. */}
         {!browse.isPending && entries.length === 0 && fields.length === 0 ? (
-          <li className="text-xs text-muted-foreground">Nothing here.</li>
+          browse.data?.error ? (
+            <li data-slot="vault-browse-error" className="text-xs text-warning">{browse.data.error}</li>
+          ) : (
+            <li className="text-xs text-muted-foreground">Nothing here.</li>
+          )
         ) : null}
       </ul>
 

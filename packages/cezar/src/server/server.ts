@@ -2892,8 +2892,14 @@ export function createApp(deps: ServerDeps) {
       const status = await vaultStatus(exec, process.env, settings);
       // Mounts need a working token, so they ride on the same probe rather
       // than making the page fire a second request that will just fail.
-      const mounts = status.authenticated ? await listMounts(exec).catch(() => []) : [];
-      return c.json({ ...status, mounts });
+      const listed = status.authenticated
+        ? await listMounts(exec).catch((err: unknown) => ({ mounts: [], error: String(err) }))
+        : { mounts: [] as string[] };
+      return c.json({
+        ...status,
+        mounts: listed.mounts,
+        ...(listed.error ? { mountsError: listed.error } : {}),
+      });
     })
 
     .get('/vault/browse', async (c) => {
@@ -2906,11 +2912,26 @@ export function createApp(deps: ServerDeps) {
         return c.json({ error: 'path must be a KV path' }, 400);
       }
       const exec = vaultCli((await loadWorkspaceConfig()).agentDefaults.vault ?? {});
-      const entries = await listPaths(mount, path, exec).catch(() => []);
+      const listed = await listPaths(mount, path, exec)
+        .catch((err: unknown) => ({ entries: [] as string[], error: String(err) }));
       // A leaf has fields; a folder has none. Asking for both in one call is
       // what lets the picker show a level without a round trip per row.
-      const fields = path === '' ? [] : await listFields(mount, path, exec).catch(() => []);
-      return c.json({ mount, path, entries, fields });
+      const read = path === ''
+        ? { fields: [] as string[], error: undefined as string | undefined }
+        : await listFields(mount, path, exec)
+          .catch((err: unknown) => ({ fields: [] as string[], error: String(err) }));
+      // Only report a failure when the level really is empty: a folder that
+      // lists fine is not "denied" just because it is not itself a secret.
+      const error = listed.entries.length === 0 && read.fields.length === 0
+        ? read.error ?? listed.error
+        : undefined;
+      return c.json({
+        mount,
+        path,
+        entries: listed.entries,
+        fields: read.fields,
+        ...(error ? { error } : {}),
+      });
     })
 
     .get('/workspace/config', async (c) => c.json(workspaceConfigBody(await loadWorkspaceConfig())))
