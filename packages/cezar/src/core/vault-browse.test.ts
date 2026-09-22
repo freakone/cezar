@@ -9,7 +9,7 @@ describe('what the secret picker is allowed to see', () => {
     const exec = async (): Promise<string> => JSON.stringify({
       data: { data: { stripe: 'sk_live_REAL_SECRET_VALUE', other: 'also-secret' }, metadata: {} },
     });
-    const fields = await listFields('secret', 'dev/api', exec);
+    const { fields } = await listFields('secret', 'dev/api', exec);
     expect(fields).toEqual(['other', 'stripe']);
     expect(JSON.stringify(fields)).not.toContain('sk_live');
     expect(JSON.stringify(fields)).not.toContain('also-secret');
@@ -17,7 +17,7 @@ describe('what the secret picker is allowed to see', () => {
 
   it('reads KV v1 too, where the secret is not nested', async () => {
     const exec = async (): Promise<string> => JSON.stringify({ data: { token: 'v1-value' } });
-    expect(await listFields('kv', 'app', exec)).toEqual(['token']);
+    expect((await listFields('kv', 'app', exec)).fields).toEqual(['token']);
   });
 
   it('offers only KV mounts — cubbyhole and identity are not browsable like this', async () => {
@@ -27,12 +27,38 @@ describe('what the secret picker is allowed to see', () => {
       'cubbyhole/': { type: 'cubbyhole' },
       'identity/': { type: 'identity' },
     });
-    expect(await listMounts(exec)).toEqual(['kv2', 'secret']);
+    expect((await listMounts(exec)).mounts).toEqual(['kv2', 'secret']);
   });
 
-  it('an empty or missing path is "nothing here", not an error', async () => {
-    const exec = async (): Promise<string> => { throw new Error('No value found at secret/nope'); };
-    await expect(listPaths('secret', 'nope', exec)).resolves.toEqual([]);
+  it('says WHY a level is empty — "nothing here" and "denied" are different answers', async () => {
+    // Measured against a real token: its policy granted `list` but not `read`,
+    // so the path appeared and its fields did not. Collapsing that to "nothing
+    // here" made a policy problem look like an empty Vault — and hid that no
+    // task would have been able to fetch the value either.
+    const denied = async (): Promise<string> => {
+      throw Object.assign(new Error('exit 2'), { stderr: 'Code: 403. Errors:\n\n* permission denied' });
+    };
+    const fields = await listFields('kv', 'paynow_sandbox', denied);
+    expect(fields.fields).toEqual([]);
+    expect(fields.error).toMatch(/permission denied/);
+
+    const missing = async (): Promise<string> => { throw new Error('No value found at secret/nope'); };
+    const paths = await listPaths('secret', 'nope', missing);
+    expect(paths.entries).toEqual([]);
+    expect(paths.error).toBeTruthy();
+  });
+
+  it('a token that cannot enumerate mounts is the NORMAL case, not a failure', async () => {
+    // `sys/mounts` needs privileges a sensibly-scoped token does not have —
+    // verified against a real one, whose policy covered its own KV paths and
+    // nothing else. The picker lets the operator type the mount instead, so
+    // this has to come back as a reason rather than an exception.
+    const denied = async (): Promise<string> => {
+      throw Object.assign(new Error('exit 2'), { stderr: 'Code: 403. Errors:\n\n* permission denied' });
+    };
+    const listed = await listMounts(denied);
+    expect(listed.mounts).toEqual([]);
+    expect(listed.error).toMatch(/permission denied/);
   });
 
   it('names what is wrong and the command that fixes it', async () => {
