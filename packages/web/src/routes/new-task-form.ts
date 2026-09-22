@@ -71,7 +71,10 @@ export const MODELS_BY_RUNNER: Record<Runner, readonly ModelPreset[]> = {
     { id: 'opus', label: 'opus', desc: 'Deep reasoning for hard tasks' },
     { id: 'sonnet', label: 'sonnet', desc: 'Fast and cheap' },
     { id: 'haiku', label: 'haiku', desc: 'Fastest — simple, scoped tasks' },
-    { id: 'claude-fable-5', label: 'Fable 5', desc: 'Most capable — the Claude 5 family' },
+    { id: 'claude-fable-5-1', label: 'Fable 5.1', desc: 'Most capable — thinking always on' },
+    { id: 'claude-fable-5', label: 'Fable 5', desc: 'Previous Fable generation' },
+    { id: 'claude-opus-5-5', label: 'Opus 5.5', desc: 'Pinned version' },
+    { id: 'claude-opus-5', label: 'Opus 5', desc: 'Pinned version' },
     { id: 'claude-opus-4-8', label: 'Opus 4.8', desc: 'Pinned version' },
     { id: 'claude-sonnet-5', label: 'Sonnet 5', desc: 'Pinned version' },
     { id: 'claude-haiku-4-5', label: 'Haiku 4.5', desc: 'Pinned version' },
@@ -278,6 +281,13 @@ export function buildCreateRunBody(opts: {
   /** false → run in the repo working tree, no worktree (single runs only). Sent only when
    *  explicitly off; the default (isolated worktree) stays implicit. */
   worktree?: boolean
+  /**
+   * Per-task isolation override. Sent ONLY when the user touched the toggle:
+   * absent means "whatever the project's setting says at start time", which
+   * keeps a task started from a stale page honest rather than freezing a
+   * snapshot of the setting into the request.
+   */
+  isolated?: boolean
   /** true → autonomous run (never pauses for the user). Sent only when on. */
   autonomous?: boolean
   /** false → do not ask the agent for follow-up todos. Sent only when off. */
@@ -300,6 +310,7 @@ export function buildCreateRunBody(opts: {
     variants,
     images,
     worktree,
+    isolated,
     autonomous,
     generateFollowups,
     todoId,
@@ -318,6 +329,7 @@ export function buildCreateRunBody(opts: {
     images: images.length > 0 ? [...images] : undefined,
     // Off only matters for a single run — variants always isolate.
     worktree: worktree === false && variants <= 1 ? false : undefined,
+    isolated,
     autonomous: autonomous === true ? true : undefined,
     generateFollowups: generateFollowups === false ? false : undefined,
     todoId: todoId || undefined,

@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { collectSecretValues, redactDeep, redactSecrets, REDACTED } from './secret-redaction.ts';
+import {
+  collectSecretValues,
+  redactDeep,
+  redactSecrets,
+  registerSecretValues,
+  registeredSecretValues,
+  REDACTED,
+} from './secret-redaction.ts';
 
 /**
  * #427: credentials must never be persisted to a run's NDJSON transcript.
@@ -107,5 +114,24 @@ describe('redactDeep', () => {
     expect((out.item as { output: string }).output).not.toContain('sk-ant');
     expect(out.seq).toBe(3); // non-strings preserved
     expect((out.item as { nested: Array<{ text: string }> }).nested[0]?.text).toBe('safe');
+  });
+});
+
+describe('secrets fetched from a store', () => {
+  it('are scrubbed by VALUE once registered', () => {
+    // The argument for cezar resolving secrets rather than handing the agent a
+    // Vault token: a value cezar never saw can only be caught by its shape, and
+    // most secrets do not have one.
+    const value = 'zX9qPlain-Looking-Value-With-No-Token-Shape';
+    expect(redactSecrets(`token is ${value}`, registeredSecretValues())).toContain(value);
+    registerSecretValues([value]);
+    expect(redactSecrets(`token is ${value}`, registeredSecretValues())).toBe(`token is ${REDACTED}`);
+  });
+
+  it('ignores values too short to scrub safely', () => {
+    // Same floor as the env-derived list: a short "secret" is a dictionary word
+    // and redacting it mangles ordinary output.
+    registerSecretValues(['dev']);
+    expect(registeredSecretValues()).not.toContain('dev');
   });
 });

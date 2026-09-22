@@ -26,7 +26,11 @@ import type {
   CancelResponse,
   ChangesPayload,
   CheckoutProjectInput,
+  CreateProjectInput,
+  VaultBrowseResponse,
+  VaultStatusResponse,
   ConfigResponse,
+  IsolationStatusResponse,
   ReclaimWorktreesResponse,
   RemoveWorktreeResponse,
   WorktreesResponse,
@@ -653,6 +657,31 @@ export async function getConfig(opts?: ReadOptions): Promise<ConfigResponse> {
   )
 }
 
+/**
+ * Agent isolation status (`GET /api/isolation`): what the MACHINE can do and
+ * what the PROJECT asks for, kept apart on purpose — see the contract.
+ */
+export async function getIsolationStatus(opts?: ReadOptions): Promise<IsolationStatusResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].isolation.$get({ param: { projectId: queryScope() } }, init(opts)),
+    '/isolation',
+  )
+}
+
+/**
+ * Accept or dismiss Containerfile suggestions. Accepting writes the repo's
+ * Containerfile; the image is rebuilt lazily before the NEXT task, never now.
+ */
+export async function decideIsolationSuggestions(body: { accept?: string[]; dismiss?: string[] }) {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].isolation.suggestions.$post(
+      { param: { projectId: queryScope() }, json: body },
+      init(),
+    ),
+    '/isolation/suggestions',
+  )
+}
+
 /** The selected project's agent-owned config catalog and current file state. */
 export async function getAgentConfig(opts: ReadOptions = {}): Promise<AgentConfigListing> {
   return unwrap(
@@ -1036,6 +1065,35 @@ export async function registerProject(root: string): Promise<RegisterProjectResp
  */
 export async function checkoutProject(input: CheckoutProjectInput): Promise<RegisterProjectResponse> {
   return unwrap(await cez.api.v1.projects.checkout.$post({ json: input }), '/projects/checkout')
+}
+
+/**
+ * Create an empty, initialized project in the checkout root and register it
+ * (`POST /api/projects/create`).
+ *
+ * Same contract as `checkoutProject`: every non-2xx is a failure the dialog must show (409 =
+ * the folder exists), and the server's `{ error }` — git's own words, when git is what failed
+ * — is what gets rendered. No progress stream: creating a repo is one fast local operation,
+ * so there is nothing to watch.
+ */
+/**
+ * Whether cezar can read Vault right now, and which KV mounts the token sees
+ * (`GET /api/vault/status`).
+ *
+ * Names only, here and in `browseVault` — a secret's value is fetched on the
+ * host when a container starts and never travels to a browser.
+ */
+export async function getVaultStatus(opts?: ReadOptions): Promise<VaultStatusResponse> {
+  return unwrap(await cez.api.v1.vault.status.$get({}, init(opts)), '/vault/status')
+}
+
+/** One level of a KV mount: child paths, and the field NAMES of a leaf secret. */
+export async function browseVault(mount: string, path: string, opts?: ReadOptions): Promise<VaultBrowseResponse> {
+  return unwrap(await cez.api.v1.vault.browse.$get({ query: { mount, path } }, init(opts)), '/vault/browse')
+}
+
+export async function createProject(input: CreateProjectInput): Promise<RegisterProjectResponse> {
+  return unwrap(await cez.api.v1.projects.create.$post({ json: input }), '/projects/create')
 }
 
 /**

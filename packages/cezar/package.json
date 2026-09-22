@@ -18,6 +18,7 @@
     "dist",
     "web/dist",
     "scripts",
+    "containers",
     "README.md"
   ],
   "engines": {

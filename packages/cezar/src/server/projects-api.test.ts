@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -210,7 +211,88 @@ describe('workspace projects API', () => {
     });
   });
 
+  describe('POST /api/v1/projects/create — "Add project → New project"', () => {
+    // The checkout root MUST be pointed into the temp home first. `CEZ_HOME`
+    // redirects cezar's workspace paths, but the checkout root defaults to
+    // `~/cezar/projects` and `~` expands against the REAL home — so a test that
+    // skips this creates directories in the developer's actual home directory.
+    const useCheckoutRoot = () =>
+      mergeWriteWorkspaceConfig((config) => {
+        config.projectsDir = join(home, 'checkouts');
+      });
+
+    const create = async (body: unknown, over: Partial<ServerDeps> = {}) => {
+      const res = await apiRequest(makeApp(over), '/api/v1/projects/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, body: (await res.json()) as RegisterProjectResponse & { error?: string } };
+    };
+
+    it('creates a git repo in the checkout root and registers it', async () => {
+      await useCheckoutRoot();
+      const { status, body } = await create({ name: 'fresh-app' });
+      expect(status).toBe(200);
+      expect(body.project?.name).toBe('fresh-app');
+      // Registered as a real git project, not as `not-git` — which is what an
+      // uninitialized directory would have produced.
+      expect(body.project?.status).toBe('ok');
+      expect(existsSync(join(body.project!.root, '.git'))).toBe(true);
+      expect((await getProjects()).projects.map((p) => p.name)).toContain('fresh-app');
+    });
+
+    it('409s when the folder already exists, and registers nothing', async () => {
+      await useCheckoutRoot();
+      await create({ name: 'twice' });
+      const before = (await getProjects()).projects.length;
+      const { status, body } = await create({ name: 'twice' });
+      expect(status).toBe(409);
+      expect(body.error).toMatch(/already exists/);
+      expect((await getProjects()).projects).toHaveLength(before);
+    });
+
+    it('400s a name that is a path or empty, without touching the disk', async () => {
+      await useCheckoutRoot();
+      for (const name of ['../escape', 'a/b', '', '   ']) {
+        const { status } = await create({ name });
+        expect(status, JSON.stringify(name)).toBe(400);
+      }
+      expect((await getProjects()).projects).toEqual([]);
+    });
+
+    it('surfaces git\'s own failure and leaves nothing half-made', async () => {
+      await useCheckoutRoot();
+      const gitRunner = async (args: string[]): Promise<void> => {
+        if (args[0] === 'commit') throw Object.assign(new Error('x'), { stderr: 'Please tell me who you are.' });
+      };
+      const { status, body } = await create({ name: 'doomed' }, { gitRunner });
+      expect(status).toBe(500);
+      expect(body.error).toContain('Please tell me who you are');
+      expect((await getProjects()).projects).toEqual([]);
+    });
+  });
+
   describe('single-project management guards', () => {
+    it('refuses creating a project before any filesystem or registry side effect', async () => {
+      let gitCalls = 0;
+      const gitRunner = async (): Promise<void> => { gitCalls += 1; };
+      process.env.CEZ_SINGLE_PROJECT = '1';
+
+      const res = await apiRequest(makeApp({ gitRunner }), '/api/v1/projects/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'nope' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        error: 'single-project mode is enabled; adding projects is disabled',
+      });
+      expect(gitCalls).toBe(0);
+      expect((await loadWorkspaceConfig()).projects).toEqual([]);
+    });
+
     it('refuses checkout before clone or registry side effects', async () => {
       let cloneCalls = 0;
       const cloneRunner: CloneRunner = async () => {

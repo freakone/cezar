@@ -37,6 +37,37 @@ describe('Markdown', () => {
     )
   }, 15_000)
 
+  it('keeps every line of a fence on its own line — commands must not fuse', async () => {
+    // Streamdown renders each token line as a <span> and, before 2.6.0, gave that span its
+    // `block` class ONLY when line numbers were on. With `lineNumbers={false}` the spans were
+    // inline with NOTHING between them, so consecutive lines ran together with no separator at
+    // all: `…client.git` followed by `cd …` displayed as `…client.gitcd …` — a command someone
+    // can copy out of the thread and run. Blank lines still broke (an empty token line emits a
+    // literal newline), which is what made it read as a content problem rather than a
+    // rendering one.
+    //
+    // Asserted on the CLASS, not on text: `display:block` is layout, so `textContent` looks
+    // identical either way and cannot tell the broken rendering from the fixed one.
+    const code = [
+      'git clone git@gitlab.com:freakone/textbookweb-client.git',
+      'cd textbookweb-client/web',
+      '',
+      'corepack enable',
+      'pnpm install --frozen-lockfile',
+    ].join('\n')
+    render(<Markdown>{`\`\`\`bash\n${code}\n\`\`\``}</Markdown>)
+
+    await waitFor(
+      () => {
+        const lines = [...document.querySelectorAll('[data-streamdown="code-block-body"] code > span')]
+        // One span per source line, including the blank one.
+        expect(lines).toHaveLength(5)
+        for (const line of lines) expect(line.className).toContain('block')
+      },
+      { timeout: 10_000 },
+    )
+  }, 15_000)
+
   it('renders an unknown fence language as plaintext — no crash, chip kept honest', async () => {
     render(<Markdown>{'```wat-lang\nsome opaque output\n```'}</Markdown>)
     const block = document.querySelector('[data-streamdown="code-block"]')

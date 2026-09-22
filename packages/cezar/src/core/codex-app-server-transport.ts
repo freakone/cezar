@@ -1,3 +1,4 @@
+import { localLauncher, type ProcessLauncher } from './process-launcher.ts';
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { trackChildExit } from './agent-runner.ts';
 import { buildChildEnv } from './agent-env.ts';
@@ -29,9 +30,11 @@ export function spawnCodexAppServer(
   bin: string,
   cwd: string,
   extraEnv?: Record<string, string>,
+  /** WHERE it runs. Defaults to this machine; a container launcher isolates it. */
+  launcher: ProcessLauncher = localLauncher,
 ): ChildProcessWithoutNullStreams {
   try {
-    return nodeSpawn(bin, ['app-server'], {
+    return launcher.spawn(bin, ['app-server'], {
       cwd,
       env: buildCodexAppServerEnv(extraEnv),
     });

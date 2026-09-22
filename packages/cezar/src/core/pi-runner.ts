@@ -1,3 +1,4 @@
+import { localLauncher, type ProcessLauncher } from './process-launcher.ts';
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as resolvePath } from 'node:path';
@@ -24,6 +25,8 @@ export interface PiRunnerOptions {
   bin?: string;
   /** Wall-clock timeout for a run (ms); per-spec `timeoutMs` still wins. */
   timeoutMs?: number;
+  /** WHERE the CLI runs — this machine, or a container. Defaults to local. */
+  launcher?: ProcessLauncher;
 }
 
 /**
@@ -36,11 +39,13 @@ export class PiRunner implements AgentRunner {
   readonly backend = 'pi' as const;
   private readonly bin: string;
   private readonly timeoutMs: number;
+  private readonly launcher: ProcessLauncher;
   private lastSession: AgentSession | null = null;
 
   constructor(opts: PiRunnerOptions = {}) {
     this.bin = opts.bin ?? process.env.CEZ_PI_BIN ?? (process.env.CEZ_DRY_RUN === '1' ? mockPiPath() : 'pi');
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.launcher = opts.launcher ?? localLauncher;
   }
 
   run(spec: AgentRunSpec, onEvent?: (event: AgentEvent) => void): Promise<AgentRunResult> {
@@ -56,7 +61,7 @@ export class PiRunner implements AgentRunner {
     onEvent?: (event: AgentEvent) => void,
     opts: SessionOptions = {},
   ): AgentSession {
-    const child = nodeSpawn(this.bin, buildPiArgs(spec), {
+    const child = this.launcher.spawn(this.bin, buildPiArgs(spec), {
       cwd: spec.cwd,
       env: buildChildEnv({ backend: this.backend, extraEnv: spec.env }),
     });
@@ -119,14 +124,14 @@ export class PiRunner implements AgentRunner {
       if (!open) return;
       open = false;
       child.stdin.end();
-      killTimer = setTimeout(() => child.exitCode == null && child.kill('SIGTERM'), KILL_GRACE_MS);
+      killTimer = setTimeout(() => child.exitCode == null && void this.launcher.signal(child, 'SIGTERM'), KILL_GRACE_MS);
       killTimer.unref?.();
     };
     const interrupt = (): void => {
       if (!open) return;
       write({ type: 'abort' });
       open = false;
-      child.kill('SIGTERM');
+      void this.launcher.signal(child, 'SIGTERM');
     };
 
     write({ id: 'cezar-state', type: 'get_state' });

@@ -63,9 +63,13 @@ describe('model option resolution', () => {
     }
   })
 
-  it('claude: tier aliases + pinned versions, newest (Fable 5) first', () => {
+  it('claude: tier aliases first, then pinned versions newest-first', () => {
+    // The aliases lead because they are what most tasks want — "the current
+    // opus" survives a model release; a pin does not.
     expect(modelsForRunner('claude').map((m) => m.id)).toEqual([
-      '', 'opus', 'sonnet', 'haiku', 'claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5',
+      '', 'opus', 'sonnet', 'haiku',
+      'claude-fable-5-1', 'claude-fable-5', 'claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8',
+      'claude-sonnet-5', 'claude-haiku-4-5',
     ])
   })
 
