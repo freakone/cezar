@@ -65,12 +65,32 @@ async function fetchBase(repoRoot: string, base: string): Promise<void> {
   const hasOrigin = await git(repoRoot, ['remote', 'get-url', 'origin']);
   if (!hasOrigin.ok) return;
   const refspec = `+refs/heads/${base}:refs/remotes/origin/${base}`;
-  // GIT_TERMINAL_PROMPT only silences git's own (HTTPS) prompts; an SSH remote
-  // can still ask on the controlling TTY — the timeout is what bounds that.
+  // GIT_TERMINAL_PROMPT only silences git's own (HTTPS) prompts; ssh asks on its
+  // own — see `nonInteractiveSsh` — and the timeout bounds whatever is left.
   await git(repoRoot, ['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', 'origin', refspec], {
     timeout: FETCH_TIMEOUT_MS,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: await nonInteractiveSsh(repoRoot) },
   });
+}
+
+/**
+ * The ssh command for a fetch that must never wait on a person.
+ *
+ * `GIT_TERMINAL_PROMPT=0` stops git's own prompts, not ssh's: a key with a
+ * passphrase, or a host key it has not seen, makes ssh open the terminal and
+ * wait — up to the whole fetch timeout, at every task start, in a cockpit
+ * started from a shell. `BatchMode` makes ssh fail instead, and the task forks
+ * from what is on disk.
+ *
+ * EXTENDS the operator's command rather than replacing it. A repo whose
+ * `core.sshCommand` names a key, or an exported `GIT_SSH_COMMAND`, is using it
+ * to authenticate at all; overriding it with a bare `ssh` would turn a working
+ * fetch into a failing one.
+ */
+async function nonInteractiveSsh(repoRoot: string): Promise<string> {
+  const configured = await git(repoRoot, ['config', '--get', 'core.sshCommand']);
+  const own = (configured.ok && configured.stdout.trim()) || process.env.GIT_SSH_COMMAND || 'ssh';
+  return `${own} -o BatchMode=yes -o ConnectTimeout=10`;
 }
 
 export function branchFor(runId: string): string {

@@ -121,6 +121,18 @@ export const isolationStatusResponseSchema = z.object({
       /** Fail the step when it cannot be fetched, instead of running without it. */
       required: z.boolean().optional(),
     })).default([]),
+    /**
+     * The repo's OWN choices, without what it inherits from the machine.
+     *
+     * `enabled` and `custom` above are the EFFECTIVE view, for display. The
+     * per-project page edits `own`: writing the effective view back pinned every
+     * machine-wide grant into the repo, so revoking it machine-wide later had no
+     * effect there.
+     */
+    own: z.object({
+      enabled: z.record(z.string(), z.unknown()).default({}),
+      custom: z.array(z.unknown()).default([]),
+    }).default({ enabled: {}, custom: [] }),
   }),
 });
 export type IsolationStatusResponse = z.infer<typeof isolationStatusResponseSchema>;
@@ -170,3 +182,26 @@ export const vaultBrowseResponseSchema = z.object({
   error: z.string().optional(),
 });
 export type VaultBrowseResponse = z.infer<typeof vaultBrowseResponseSchema>;
+
+/**
+ * `GET /api/v1/vault/browse` query. Validated as route middleware like every
+ * other query in the API, so the shape reaches `AppType` and the typed client
+ * instead of being parsed by hand inside the handler.
+ *
+ * Strict for the same reason the reference parser is: both become argv entries
+ * to the `vault` CLI, and a loosely accepted one would surface as vault's own
+ * error about a malformed path rather than as a bad request.
+ */
+export const vaultBrowseQuerySchema = z.object({
+  mount: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'mount must be a single KV mount name'),
+  path: z
+    .string()
+    .trim()
+    .transform((p) => p.replace(/^\/+|\/+$/g, ''))
+    .refine(
+      (p) => p === '' || (/^[A-Za-z0-9][A-Za-z0-9._\-/]*$/.test(p) && !p.split('/').includes('..')),
+      'path must be a KV path',
+    )
+    .default(''),
+});
+export type VaultBrowseQuery = z.infer<typeof vaultBrowseQuerySchema>;

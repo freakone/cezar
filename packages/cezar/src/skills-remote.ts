@@ -418,8 +418,19 @@ export async function materializeSkillDir(repoRoot: string, skill: Skill): Promi
  * file-at-a-time it took 4.0s; with both levels pooled it is well under a
  * second, which is what makes "materialize the collection" affordable at all.
  */
-export async function materializeSkillDirs(repoRoot: string, skills: readonly Skill[]): Promise<string[]> {
-  const eligible = skills.filter((s) => s.source === 'team' && s.team?.dir);
+export async function materializeSkillDirs(
+  repoRoot: string,
+  skills: readonly Skill[],
+  opts: {
+    /**
+     * Leave a skill whose SKILL.md is already there. A task keeps the versions
+     * it started with, and a Continue does not rewrite ~300 identical files.
+     */
+    skipExisting?: boolean;
+  } = {},
+): Promise<string[]> {
+  const eligible = skills.filter((s) => s.source === 'team' && s.team?.dir)
+    .filter((s) => !opts.skipExisting || !existsSync(join(repoRoot, '.claude', 'skills', s.name, 'SKILL.md')));
   const done = await mapWithConcurrency(eligible, SKILL_CONCURRENCY, async (skill) =>
     (await materializeSkillDir(repoRoot, skill).catch(() => false)) ? skill.name : null);
   return done.filter((name): name is string => name !== null);
@@ -429,7 +440,31 @@ export async function materializeSkillDirs(repoRoot: string, skills: readonly Sk
 const SKILL_CONCURRENCY = 8;
 
 /** Append a pattern to git's `info/exclude` (idempotent, non-fatal). */
-async function excludeFromGit(repoRoot: string, pattern: string): Promise<void> {
+/**
+ * One chain of pending edits per exclude file.
+ *
+ * `excludeFromGit` is read-modify-write, and `materializeSkillDirs` runs eight
+ * skills at once — each ending in an exclude edit. Unserialized, every caller
+ * read the same file, appended its own line and wrote it back, so the last
+ * writer won and the others' patterns were lost. The unexcluded
+ * `.claude/skills/<name>/` directories then showed up as the TASK's changes: in
+ * the diff, and in autosave commits.
+ *
+ * In-process only, which is the scope of the race: one cockpit materializes a
+ * run's skills. Keyed by the resolved exclude path, because every linked task
+ * worktree shares one.
+ */
+const excludeChains = new Map<string, Promise<unknown>>();
+
+function serializeOn<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const run = (excludeChains.get(key) ?? Promise.resolve()).then(fn, fn);
+  // A failed edit must not wedge every later one behind it.
+  excludeChains.set(key, run.catch(() => undefined));
+  return run;
+}
+
+/** Exported for its race test; callers go through `materializeSkillDir`. */
+export async function excludeFromGit(repoRoot: string, pattern: string): Promise<void> {
   try {
     // Resolve the real exclude file: in a linked worktree (spec 006) `.git`
     // is a file and `info/exclude` lives in the shared common dir — which
@@ -441,15 +476,19 @@ async function excludeFromGit(repoRoot: string, pattern: string): Promise<void> 
     );
     const gitDir = probe.ok && probe.stdout.trim() ? probe.stdout.trim() : join(repoRoot, '.git');
     const excludePath = join(gitDir, 'info', 'exclude');
-    let prev = '';
-    try {
-      prev = await readFile(excludePath, 'utf8');
-    } catch {
-      // no exclude file yet
-    }
-    if (prev.split('\n').includes(pattern)) return;
-    await mkdir(dirname(excludePath), { recursive: true });
-    await writeFile(excludePath, prev + (prev && !prev.endsWith('\n') ? '\n' : '') + pattern + '\n', 'utf8');
+    // The read and the write happen under one lock, so no other edit can land
+    // between them and be overwritten.
+    await serializeOn(excludePath, async () => {
+      let prev = '';
+      try {
+        prev = await readFile(excludePath, 'utf8');
+      } catch {
+        // no exclude file yet
+      }
+      if (prev.split('\n').includes(pattern)) return;
+      await mkdir(dirname(excludePath), { recursive: true });
+      await writeFile(excludePath, prev + (prev && !prev.endsWith('\n') ? '\n' : '') + pattern + '\n', 'utf8');
+    });
   } catch {
     // non-fatal — `.git` might be a linked file (worktree) or absent entirely
   }

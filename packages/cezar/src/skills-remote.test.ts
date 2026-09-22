@@ -103,5 +103,36 @@ describe('materializing a whole imported collection', () => {
     expect(existsSync(join(repo, '.claude/skills/om-b/SKILL.md'))).toBe(true);
     // A non-team skill is not a directory in a bare clone; nothing is invented.
     expect(existsSync(join(repo, '.claude/skills/local-one'))).toBe(false);
+
+    // Every session start now calls this — a Continue included — so a second
+    // call must leave what is there: a task keeps the skill versions it began
+    // with, and does not pay to rewrite identical files each turn.
+    writeFileSync(join(repo, '.claude/skills/om-a/SKILL.md'), '# A, as this task started with it\n');
+    const again = await materializeSkillDirs(repo, [team('om-a'), team('om-b')], { skipExisting: true });
+    expect(again).toEqual([]);
+    expect(readFileSync(join(repo, '.claude/skills/om-a/SKILL.md'), 'utf8')).toContain('as this task started');
   }, 20_000)
 })
+
+describe('excluding materialized skills from git', () => {
+  it('keeps EVERY pattern when many skills are materialized at once', async () => {
+    // `materializeSkillDirs` runs eight skills concurrently and each ends in a
+    // read-modify-write of the shared `info/exclude`. Unserialized, the last
+    // writer won and the rest were lost — and an unexcluded
+    // `.claude/skills/<name>/` then showed up as the task's own change, in the
+    // diff and in autosave commits.
+    const { excludeFromGit } = await import('./skills-remote.ts');
+    const repo = mkdtempSync(join(tmpdir(), 'cez-exclude-race-'));
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: repo });
+      const patterns = Array.from({ length: 24 }, (_, i) => `.claude/skills/om-${i}/`);
+      await Promise.all(patterns.map((p) => excludeFromGit(repo, p)));
+      const lines = readFileSync(join(repo, '.git/info/exclude'), 'utf8').split('\n');
+      for (const pattern of patterns) expect(lines, pattern).toContain(pattern);
+      // And none twice: the lock serializes, the membership check dedupes.
+      expect(lines.filter((l) => l.startsWith('.claude/skills/')).length).toBe(patterns.length);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});

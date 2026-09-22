@@ -207,7 +207,19 @@ export async function applyCredentials(
   credentials: ResolvedCredential[],
   bin = 'podman',
 ): Promise<void> {
-  for (const planned of credentialCopyPlan(credentials, container)) {
+  const plan = credentialCopyPlan(credentials, container);
+  const placing = plan.map((args) => args[2]?.split(':')[1]).filter((p): p is string => Boolean(p));
+  // REVOKE before granting. Un-ticking a credential used to change the config
+  // and nothing in the container: this function only ever copied, so a revoked
+  // ssh key stayed usable in every running container — and in any reused one
+  // on later turns — while the settings page said the change applied to the
+  // task you are in. The manifest records what cezar itself placed, so only
+  // that is ever removed; files the agent made are not cezar's to delete.
+  for (const path of await readCredentialManifest(container, bin)) {
+    if (placing.includes(path)) continue;
+    await run(bin, ['exec', container, 'rm', '-f', path]).catch(() => undefined);
+  }
+  for (const planned of plan) {
     // A credential that has to be rewritten on the way in is copied from a
     // temp file instead of straight from the operator's own.
     const credential = credentials.find((c) => c.hostPath === planned[1]);
@@ -231,6 +243,44 @@ export async function applyCredentials(
       await run(bin, ['exec', container, 'chmod', perms.file, dest]).catch(() => undefined);
     }
     if (staged) rmSync(staged, { force: true });
+  }
+  await writeCredentialManifest(container, placing, bin);
+}
+
+/**
+ * Where cezar records, INSIDE a container, the credential files it copied in.
+ *
+ * In the container rather than on the host so it lives and dies with the thing
+ * it describes, and survives a cockpit restart between turns. Mounts are not in
+ * it: a bind mount is fixed at creation and cannot be withdrawn from a running
+ * container — a revoked MOUNTED credential stays until the container is
+ * recreated, which is why copies are the default for anything narrowed.
+ */
+const CREDENTIAL_MANIFEST = '/root/.cezar-credentials.json';
+
+async function readCredentialManifest(container: string, bin: string): Promise<string[]> {
+  try {
+    const { stdout } = await run(bin, ['exec', container, 'cat', CREDENTIAL_MANIFEST]);
+    const parsed: unknown = JSON.parse(stdout);
+    if (!Array.isArray(parsed)) return [];
+    // Only paths cezar could have placed: absolute, and no way out of /root.
+    return parsed.filter((p): p is string =>
+      typeof p === 'string' && p.startsWith('/root/') && !p.split('/').includes('..'));
+  } catch {
+    return []; // first apply, or a container from before the manifest existed
+  }
+}
+
+async function writeCredentialManifest(container: string, paths: string[], bin: string): Promise<void> {
+  try {
+    const dir = mkdtempSync(join(tmpdir(), 'cez-manifest-'));
+    const file = join(dir, 'manifest.json');
+    writeFileSync(file, JSON.stringify(paths), { mode: 0o600 });
+    await run(bin, ['cp', file, `${container}:${CREDENTIAL_MANIFEST}`]).catch(() => undefined);
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // Best-effort: without it the next apply cannot revoke, which is the old
+    // behaviour rather than a new failure.
   }
 }
 
@@ -264,8 +314,9 @@ export async function applyCredentialsToRunning(
     return []; // no podman, or no VM — nothing to update and nothing to report
   }
   if (names.length === 0) return [];
+  // No early return on an empty grant list: "revoke everything" is exactly
+  // the change that must reach running containers.
   const credentials = resolvePassthrough(cfg.credentials);
-  if (credentials.length === 0) return [];
   const updated: string[] = [];
   for (const name of names) {
     if (!(await mountsWorkspace(name, repoRoot, ask))) continue;

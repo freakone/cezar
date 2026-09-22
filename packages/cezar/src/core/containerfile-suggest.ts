@@ -61,11 +61,34 @@ const NOT_A_PACKAGE = /^(-|--)|^\.$|^\.\//;
  */
 const PROJECT_SCOPED = /(?:^|\s)(?:-r|--requirement|-e|--editable)(?:\s|$)/;
 
+/**
+ * What a package token may look like once it is written into a `RUN` line.
+ *
+ * A POSITIVE charset rather than a list of things to reject: anything here is
+ * pasted into a shell inside a Containerfile, and a stray `>`, `&`, `|`, quote
+ * or `$` there is a syntax error that fails the image build — before every
+ * later task, each of which then falls back to the host. Version constraints
+ * with comparison operators (`foo>=1.2`) are the cost: they lose the
+ * constraint, keeping the package, which is the right way round.
+ */
+const PACKAGE_TOKEN = /^[A-Za-z0-9@][A-Za-z0-9._+\-/:=@~^]*$/;
+
 function splitPackages(raw: string): string[] {
   return raw
     .split(/\s+/)
     .map((p) => p.trim())
-    .filter((p) => p.length > 0 && !NOT_A_PACKAGE.test(p));
+    .filter((p) => p.length > 0 && !NOT_A_PACKAGE.test(p) && PACKAGE_TOKEN.test(p));
+}
+
+/**
+ * Remove shell redirections, so what is left is words and operators.
+ *
+ * `apt-get install -y foo 2>&1 | tail` used to become
+ * `RUN … install -y foo 2> && rm -rf …` — the redirection split across a clause
+ * boundary. Stripped first, then split on operators, the install is just `foo`.
+ */
+function stripRedirections(command: string): string {
+  return command.replace(/\s*\d*(?:>>|>|<)(?:&\d+|\s*[^\s|;&]+)?/g, ' ');
 }
 
 /**
@@ -76,7 +99,11 @@ function splitPackages(raw: string): string[] {
 export function extractInstalls(command: string): InstallSuggestion[] {
   const out: InstallSuggestion[] = [];
   // `sudo` is noise inside a container, where the agent is already root.
-  const clauses = command.split(/&&|\|\||;/).map((c) => c.trim().replace(/^sudo\s+/, ''));
+  // Redirections out first, then split on EVERY control operator — pipes and
+  // `&` included, so `… | tail` is its own clause instead of package names.
+  const clauses = stripRedirections(command)
+    .split(/&&|\|\||;|\||&/)
+    .map((c) => c.trim().replace(/^sudo\s+/, ''));
   for (const clause of clauses) {
     if (PROJECT_SCOPED.test(clause)) continue;
     for (const { manager, re } of MATCHERS) {

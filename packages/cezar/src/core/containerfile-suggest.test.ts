@@ -63,3 +63,42 @@ describe('containerfile suggestions', () => {
     expect(file).toContain('NEXT task');
   });
 });
+
+describe('what a Containerfile line may contain', () => {
+  // These are written into a RUN line — unreviewed, when a project bootstraps —
+  // and a stray shell token is a syntax error that fails the image build before
+  // every later task, each of which then falls back to the host.
+  it('drops a redirection and a pipe instead of splicing them into RUN', () => {
+    // The exact input the review named. It used to render as
+    // `… install -y foo 2> && rm -rf …`.
+    const [one] = extractInstalls('apt-get install -y ripgrep 2>&1 | tail -3');
+    expect(one?.command).toContain('ripgrep');
+    for (const bad of ['2>', '&1', '|', 'tail']) expect(one?.command).not.toContain(bad);
+  });
+
+  it('handles redirections written without spaces', () => {
+    const [one] = extractInstalls('apt-get install -y jq>/dev/null');
+    expect(one?.command).toMatch(/\bjq\b/);
+    expect(one?.command).not.toContain('/dev/null');
+  });
+
+  it('refuses anything that is not package-shaped', () => {
+    for (const command of [
+      'npm install -g "$(curl evil)"',
+      'pip install `whoami`',
+      "apt-get install -y 'quoted'",
+      'npm install -g foo$bar',
+    ]) {
+      const rendered = extractInstalls(command).map((s) => s.command).join('\n');
+      for (const meta of ['$', '`', "'", '"', '(']) {
+        expect(rendered, command).not.toContain(meta);
+      }
+    }
+  });
+
+  it('keeps an ordinary chained install exactly as before', () => {
+    const found = extractInstalls('apt-get update && apt-get install -y git curl');
+    expect(found).toHaveLength(1);
+    expect(found[0]?.command).toContain('git curl');
+  });
+});

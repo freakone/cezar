@@ -28,8 +28,6 @@ import { SettingsField } from './settings-field'
  * actually do. When those disagree, the disagreement is the most important
  * thing on the page and is rendered as such rather than as a silent default.
  */
-/** Toggle or re-mode one credential, leaving the rest of the map untouched. */
-
 export function IsolationSection() {
   const { data, isPending, refetch, isFetching } = useIsolationStatus()
   const queryClient = useQueryClient()
@@ -247,16 +245,23 @@ export function IsolationSection() {
         hint={
           'An isolated agent starts with none. Each one you add is a deliberate widening — mount for anything the '
           + 'tool refreshes in place, copy for static keys the container should not be able to write back. '
-          + 'Credentials are attached when a task\u2019s container is created, so a change here reaches the NEXT '
-          + 'task; one already running keeps what it started with. Anything not set here follows the machine '
-          + 'defaults in Settings → Isolation defaults.'
+          // Accurate in both directions now: a COPIED credential is added to and
+          // removed from running containers as you change it here. A MOUNT
+          // cannot be withdrawn from a running container at all, so the one
+          // thing still deferred is saying so.
+          + 'Copied credentials change in running tasks immediately \u2014 granted or revoked. A mounted one is '
+          + 'fixed when a task\u2019s container is created, so revoking it reaches the NEXT task. Anything not set '
+          + 'here follows the machine defaults in Settings → Isolation defaults.'
         }
       >
         <CredentialMatrix
           catalog={credentials.catalog}
           value={credentials.enabled}
           busy={saveCredentials.isPending}
-          onChange={(next) => saveCredentials.mutate(next)}
+          // Only what CHANGED is written. The matrix shows the effective view —
+          // machine grants included — and writing that whole map back pinned
+          // them into this repo, so revoking one machine-wide did nothing here.
+          onChange={(next) => saveCredentials.mutate(changedGrants(credentials.enabled, next))}
         />
       </SettingsField>
 
@@ -269,7 +274,10 @@ export function IsolationSection() {
         }
       >
         <SecretPicker
-          value={(credentials.custom ?? []) as SecretEntry[]}
+          value={(credentials.own.custom ?? []) as SecretEntry[]}
+          // Shown, not editable here: they belong to the machine, and editing
+          // them from a project would copy them into its config.
+          inherited={inheritedSecrets(credentials.custom as SecretEntry[], credentials.own.custom as SecretEntry[])}
           busy={saveSecrets.isPending}
           onChange={(next) => saveSecrets.mutate(next)}
         />
@@ -288,4 +296,26 @@ export function IsolationSection() {
       </SettingsField>
     </div>
   )
+}
+
+/**
+ * The grants that differ between two views, as a patch.
+ *
+ * Turning one OFF is written as an explicit `false`, never as a deletion: the
+ * grant may be inherited from the machine, and deleting the repo's key would
+ * just inherit it back on. `false` is the repo saying "not here".
+ */
+export function changedGrants(before: Record<string, Choice>, after: Record<string, Choice>): Record<string, Choice> {
+  const patch: Record<string, Choice> = {}
+  for (const id of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    const next = after[id] ?? false
+    if (JSON.stringify(before[id] ?? false) !== JSON.stringify(next)) patch[id] = next
+  }
+  return patch
+}
+
+/** Machine-wide secrets this project inherits and has not overridden by id. */
+function inheritedSecrets(effective: SecretEntry[], own: SecretEntry[]): SecretEntry[] {
+  const mine = new Set(own.map((s) => s.id))
+  return effective.filter((s) => !mine.has(s.id))
 }
