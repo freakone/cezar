@@ -56,7 +56,7 @@ function harness(): { store: RunStore; seam: Seam; runId: (isolated?: boolean) =
         title: 't',
         workflow: 'w',
         task: 't',
-        steps: [{ id: 'step', command: 'noop' }],
+        steps: [{ id: 'step', name: 'step', kind: 'agent' }],
         ...(isolated === undefined ? {} : { isolated }),
       }).id,
   };
