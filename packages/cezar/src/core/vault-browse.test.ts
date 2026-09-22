@@ -81,6 +81,30 @@ describe('what the secret picker is allowed to see', () => {
     expect(ready).toMatchObject({ installed: true, authenticated: true, reason: '', address: 'https://vault.example.com' });
   });
 
+  it('names a SEALED Vault as sealed, not as a missing token', async () => {
+    // Seen for real after a redeploy: every token lookup answers 503 while
+    // sealed, and the status used to say "no usable Vault token — vault login",
+    // a fix that cannot work until the seal is gone. `vault status` exits 2 when
+    // sealed and still prints its JSON, so the answer comes from the failure.
+    const sealed = await vaultStatus(async (args) => {
+      if (args[0] === 'status') {
+        throw Object.assign(new Error('exit 2'), { stdout: JSON.stringify({ sealed: true, initialized: true }) });
+      }
+      if (args[0] === 'token') throw new Error('Code: 503. Vault is sealed');
+      return '';
+    }, {}, { address: 'https://vault.example.com' });
+    expect(sealed).toMatchObject({ authenticated: false, fix: 'vault operator unseal' });
+    expect(sealed.reason).toMatch(/is sealed/);
+
+    // Unsealed, a missing token is still reported as a missing token.
+    const unsealed = await vaultStatus(async (args) => {
+      if (args[0] === 'status') return JSON.stringify({ sealed: false });
+      if (args[0] === 'token') throw new Error('permission denied');
+      return '';
+    }, {}, { address: 'https://vault.example.com' });
+    expect(unsealed).toMatchObject({ fix: 'vault login' });
+  });
+
   it('the SETTING wins over the environment', async () => {
     // Otherwise the setting would be the one that silently does nothing on the
     // machine it was added for — a cockpit started with a stale VAULT_ADDR in
