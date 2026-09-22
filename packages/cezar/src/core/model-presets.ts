@@ -32,6 +32,7 @@ export const KNOWN_PRESETS_BY_RUNNER: Record<RunnerId, readonly string[]> = {
     'haiku',
     'claude-fable-5-1',
     'claude-fable-5',
+    'claude-opus-5-5',
     'claude-opus-5',
     'claude-opus-4-8',
     'claude-opus-4-7',

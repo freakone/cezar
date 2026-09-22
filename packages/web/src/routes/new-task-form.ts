@@ -73,6 +73,7 @@ export const MODELS_BY_RUNNER: Record<Runner, readonly ModelPreset[]> = {
     { id: 'haiku', label: 'haiku', desc: 'Fastest — simple, scoped tasks' },
     { id: 'claude-fable-5-1', label: 'Fable 5.1', desc: 'Most capable — thinking always on' },
     { id: 'claude-fable-5', label: 'Fable 5', desc: 'Previous Fable generation' },
+    { id: 'claude-opus-5-5', label: 'Opus 5.5', desc: 'Pinned version' },
     { id: 'claude-opus-5', label: 'Opus 5', desc: 'Pinned version' },
     { id: 'claude-opus-4-8', label: 'Opus 4.8', desc: 'Pinned version' },
     { id: 'claude-sonnet-5', label: 'Sonnet 5', desc: 'Pinned version' },
