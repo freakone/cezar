@@ -5,6 +5,7 @@ import { queryKeys, useIsolationStatus } from '@/api/queries'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { CredentialMatrix, type Choice } from './credential-matrix'
+import { SecretPicker, type SecretEntry } from './secret-picker'
 import { toast } from '@/components/ui/toaster'
 import { SettingsField } from './settings-field'
 
@@ -45,6 +46,12 @@ export function IsolationSection() {
   const saveCredentials = useMutation({
     mutationFn: (enabledMap: Record<string, boolean | { mode?: 'mount' | 'copy' }>) =>
       putConfig({ sandbox: { credentials: { enabled: enabledMap } } }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.isolation }),
+    onError: (error: Error) => toast(error.message, { tone: 'danger' }),
+  })
+  const saveSecrets = useMutation({
+    mutationFn: (custom: unknown[]) =>
+      putConfig({ sandbox: { credentials: { custom: custom as never } } }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.isolation }),
     onError: (error: Error) => toast(error.message, { tone: 'danger' }),
   })
@@ -250,6 +257,21 @@ export function IsolationSection() {
           value={credentials.enabled}
           busy={saveCredentials.isPending}
           onChange={(next) => saveCredentials.mutate(next)}
+        />
+      </SettingsField>
+
+      <SettingsField
+        title="Secrets from Vault"
+        hint={
+          'Fetched on this machine when a task\u2019s container starts and injected as environment variables. '
+          + 'These are this project\u2019s own \u2014 the machine-wide list in Settings \u2192 Isolation defaults '
+          + 'applies to every project that has none.'
+        }
+      >
+        <SecretPicker
+          value={(credentials.custom ?? []) as SecretEntry[]}
+          busy={saveSecrets.isPending}
+          onChange={(next) => saveSecrets.mutate(next)}
         />
       </SettingsField>
 

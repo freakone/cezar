@@ -193,6 +193,7 @@ import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig 
 import { detectContainerRuntime } from '../core/container-probe.ts';
 import { applyCredentialsToRunning, removeTaskContainer } from '../core/podman-lifecycle.ts';
 import { CREDENTIAL_CATALOG, hostPathOf, listSshEntries } from '../core/credential-passthrough.ts';
+import { listFields, listMounts, listPaths, vaultStatus } from '../core/vault-secrets.ts';
 import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
 import { renderContainerfile } from '../core/containerfile-suggest.ts';
 import { imageTag } from '../core/podman-launcher.ts';
@@ -3391,6 +3392,39 @@ export function createApp(deps: ServerDeps) {
   });
   // ---- chained family: workspace settings + GUI prefs (workspace-level) ----
   const workspaceConfigRoutes = new Hono<ProjectApiEnv>()
+    /**
+     * What the secret picker reads. NAMES ONLY — see the contract: a value is
+     * fetched on the host when a container starts and goes straight into it,
+     * and this endpoint is served to a browser.
+     *
+     * Workspace-level because a Vault is a property of the machine, not of a
+     * project: the same picker serves the machine-wide defaults and any one
+     * project's overrides.
+     */
+    .get('/vault/status', async (c) => {
+      const status = await vaultStatus();
+      // Mounts need a working token, so they ride on the same probe rather
+      // than making the page fire a second request that will just fail.
+      const mounts = status.authenticated ? await listMounts().catch(() => []) : [];
+      return c.json({ ...status, mounts });
+    })
+
+    .get('/vault/browse', async (c) => {
+      const mount = (c.req.query('mount') ?? '').trim();
+      const path = (c.req.query('path') ?? '').trim().replace(/^\/+|\/+$/g, '');
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(mount)) {
+        return c.json({ error: 'mount must be a single KV mount name' }, 400);
+      }
+      if (path !== '' && (!/^[A-Za-z0-9][A-Za-z0-9._\-/]*$/.test(path) || path.split('/').includes('..'))) {
+        return c.json({ error: 'path must be a KV path' }, 400);
+      }
+      const entries = await listPaths(mount, path).catch(() => []);
+      // A leaf has fields; a folder has none. Asking for both in one call is
+      // what lets the picker show a level without a round trip per row.
+      const fields = path === '' ? [] : await listFields(mount, path).catch(() => []);
+      return c.json({ mount, path, entries, fields });
+    })
+
     .get('/workspace/config', async (c) => c.json(workspaceConfigBody(await loadWorkspaceConfig())))
 
     // Live host totals for a REMOTE cockpit (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`):
