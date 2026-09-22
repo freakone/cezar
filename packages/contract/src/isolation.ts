@@ -143,6 +143,14 @@ export const vaultStatusResponseSchema = z.object({
   fix: z.string().optional(),
   /** The KV mounts this token can see. Empty unless authenticated. */
   mounts: z.array(z.string()).default([]),
+  /**
+   * Why `mounts` is empty, when it is for a reason other than "there are none".
+   *
+   * `sys/mounts` needs privileges a sensibly-scoped token does not have, so
+   * this is the NORMAL case for a real token rather than a failure — the
+   * picker lets the operator type the mount name instead.
+   */
+  mountsError: z.string().optional(),
 });
 export type VaultStatusResponse = z.infer<typeof vaultStatusResponseSchema>;
 
@@ -153,5 +161,12 @@ export const vaultBrowseResponseSchema = z.object({
   entries: z.array(z.string()).default([]),
   /** Field names of the secret AT this path, when it is one. Never values. */
   fields: z.array(z.string()).default([]),
+  /**
+   * Why a level came back empty. The common one is a policy granting `list`
+   * but not `read`: the path shows up, its fields do not, and without this the
+   * picker would say "nothing here" about a secret that is plainly there — and
+   * about a value no task would be able to fetch either.
+   */
+  error: z.string().optional(),
 });
 export type VaultBrowseResponse = z.infer<typeof vaultBrowseResponseSchema>;
