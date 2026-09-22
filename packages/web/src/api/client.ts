@@ -30,6 +30,8 @@ import type {
   ChangesPayload,
   CheckoutProjectInput,
   CreateProjectInput,
+  VaultBrowseResponse,
+  VaultStatusResponse,
   ConfigResponse,
   IsolationStatusResponse,
   ReclaimWorktreesResponse,
@@ -1109,6 +1111,22 @@ export async function checkoutProject(input: CheckoutProjectInput): Promise<Regi
  * — is what gets rendered. No progress stream: creating a repo is one fast local operation,
  * so there is nothing to watch.
  */
+/**
+ * Whether cezar can read Vault right now, and which KV mounts the token sees
+ * (`GET /api/vault/status`).
+ *
+ * Names only, here and in `browseVault` — a secret's value is fetched on the
+ * host when a container starts and never travels to a browser.
+ */
+export async function getVaultStatus(opts?: ReadOptions): Promise<VaultStatusResponse> {
+  return unwrap(await cez.api.v1.vault.status.$get({}, init(opts)), '/vault/status')
+}
+
+/** One level of a KV mount: child paths, and the field NAMES of a leaf secret. */
+export async function browseVault(mount: string, path: string, opts?: ReadOptions): Promise<VaultBrowseResponse> {
+  return unwrap(await cez.api.v1.vault.browse.$get({ query: { mount, path } }, init(opts)), '/vault/browse')
+}
+
 export async function createProject(input: CreateProjectInput): Promise<RegisterProjectResponse> {
   return unwrap(await cez.api.v1.projects.create.$post({ json: input }), '/projects/create')
 }

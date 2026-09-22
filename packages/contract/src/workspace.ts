@@ -84,6 +84,14 @@ export const workspaceConfigResponseSchema = z.object({
             keys: z.array(z.string()).optional(),
           }),
         ])).optional(),
+        /** Machine-wide secrets — a reference each, never a value. */
+        custom: z.array(z.object({
+          id: z.string(),
+          label: z.string().optional(),
+          env: z.array(z.string()).optional(),
+          valueFrom: z.string().optional(),
+          required: z.boolean().optional(),
+        })).optional(),
       }).optional(),
     }).optional(),
     runner: runnerSchema.optional(),
@@ -141,6 +149,14 @@ export const setWorkspaceConfigInputSchema = z.object({
                   keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
                 }),
               ])).optional(),
+              /** Secrets, as references. The whole array is sent on every edit. */
+              custom: z.array(z.object({
+                id: z.string().trim().min(1).max(64),
+                label: z.string().trim().max(120).optional(),
+                env: z.array(z.string().trim().min(1).max(128)).max(8).optional(),
+                valueFrom: z.string().trim().min(1).max(512).optional(),
+                required: z.boolean().optional(),
+              })).max(64).optional(),
             })
             .optional(),
         })

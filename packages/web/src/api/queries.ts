@@ -8,6 +8,8 @@ import {
   browseFs,
   checkoutProject,
   createProject,
+  browseVault,
+  getVaultStatus,
   connectProvider,
   continueRun,
   continueProjectRun,
@@ -670,6 +672,27 @@ export function useCheckoutProject() {
     mutationFn: (input: CheckoutProjectInput) => checkoutProject(input),
     retry: false,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: workspaceQueryKeys.projects }),
+  })
+}
+
+/** Vault reachability + mounts, for the secret picker. Names only. */
+export function useVaultStatus(enabled = true) {
+  return useQuery({
+    queryKey: [...workspaceQueryKeys.config, 'vault-status'],
+    queryFn: ({ signal }) => getVaultStatus({ signal }),
+    enabled,
+    // A `vault login` in a terminal should show up without a page reload, but
+    // not at the cost of shelling out on every render.
+    staleTime: 15_000,
+  })
+}
+
+/** One level of a KV mount. Disabled until a mount is picked. */
+export function useVaultBrowse(mount: string, path: string, enabled = true) {
+  return useQuery({
+    queryKey: [...workspaceQueryKeys.config, 'vault-browse', mount, path],
+    queryFn: ({ signal }) => browseVault(mount, path, { signal }),
+    enabled: enabled && mount !== '',
   })
 }
 
