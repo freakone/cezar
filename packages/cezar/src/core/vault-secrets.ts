@@ -122,3 +122,112 @@ export function cachingVaultReader(inner: VaultReader = vaultCliReader, ttlMs = 
     return value;
   };
 }
+
+// ---- browsing, for the picker ------------------------------------------------
+//
+// Everything below answers NAMES only. Values are fetched by `vaultCliReader`
+// at container start and go straight into a container; none of this is allowed
+// to put one on the wire, because it is served to a browser. `listFields` is
+// where that could go wrong — `vault kv get` returns the whole secret — so it
+// reads the keys and drops the rest before returning.
+
+export interface VaultStatus {
+  /** The CLI is installed and cezar can run it. */
+  installed: boolean;
+  /** `VAULT_ADDR`, when the cockpit has one. */
+  address?: string;
+  /** A usable token — `vault token lookup` succeeded. */
+  authenticated: boolean;
+  /** One actionable sentence. Empty when ready. */
+  reason: string;
+  /** The command that fixes `reason`, when one does. */
+  fix?: string;
+}
+
+/** Runs a vault subcommand and answers stdout; injectable for tests. */
+export type VaultRunner = (args: string[]) => Promise<string>;
+
+const cli: VaultRunner = async (args) => {
+  const { stdout } = await run('vault', args, { timeout: 15_000, maxBuffer: 4 * 1024 * 1024 });
+  return stdout;
+};
+
+/** Can cezar read secrets right now, and if not, what fixes it? */
+export async function vaultStatus(exec: VaultRunner = cli, env = process.env): Promise<VaultStatus> {
+  const address = env.VAULT_ADDR;
+  try {
+    await exec(['version']);
+  } catch {
+    return {
+      installed: false,
+      authenticated: false,
+      reason: 'the `vault` CLI is not installed, or not on the PATH cezar was started with',
+      fix: 'brew install vault',
+    };
+  }
+  if (!address) {
+    return {
+      installed: true,
+      authenticated: false,
+      // Named precisely: under launchd the cockpit's environment is the plist's,
+      // not the shell's, so "it works in my terminal" is expected here.
+      reason: 'VAULT_ADDR is not set in the environment cezar was started with',
+      fix: 'set VAULT_ADDR in the cockpit launch agent, then restart cezar',
+    };
+  }
+  try {
+    await exec(['token', 'lookup']);
+  } catch {
+    return {
+      installed: true,
+      address,
+      authenticated: false,
+      reason: `no usable Vault token for ${address}`,
+      fix: 'vault login',
+    };
+  }
+  return { installed: true, address, authenticated: true, reason: '' };
+}
+
+/** The KV mounts this token can see. */
+export async function listMounts(exec: VaultRunner = cli): Promise<string[]> {
+  const raw = await exec(['secrets', 'list', '-format=json']);
+  const parsed = JSON.parse(raw) as Record<string, { type?: string }>;
+  return Object.entries(parsed)
+    .filter(([, info]) => info.type === 'kv')
+    .map(([path]) => path.replace(/\/$/, ''))
+    .sort();
+}
+
+/** What a KV path holds: child paths (ending `/`) and leaf secrets. */
+export async function listPaths(mount: string, path: string, exec: VaultRunner = cli): Promise<string[]> {
+  try {
+    const raw = await exec(['kv', 'list', '-format=json', `-mount=${mount}`, path || '/']);
+    return (JSON.parse(raw) as string[]).sort();
+  } catch {
+    // An empty or non-existent path is not an error worth a 500 — the picker
+    // shows "nothing here", which is the same information.
+    return [];
+  }
+}
+
+/**
+ * The FIELD NAMES in one secret. Never their values.
+ *
+ * `vault kv get` returns the whole secret, so the values exist in this
+ * process for as long as it takes to read the keys — they are not returned,
+ * not logged, and not stored.
+ */
+export async function listFields(mount: string, path: string, exec: VaultRunner = cli): Promise<string[]> {
+  const raw = await exec(['kv', 'get', '-format=json', `-mount=${mount}`, path]);
+  const parsed = JSON.parse(raw) as { data?: { data?: Record<string, unknown> } | Record<string, unknown> };
+  const outer = parsed.data ?? {};
+  // KV v2 nests the secret under `data.data`; v1 puts it directly on `data`.
+  const inner = (outer as { data?: Record<string, unknown> }).data ?? outer;
+  return Object.keys(inner as Record<string, unknown>).sort();
+}
+
+/** `vault://<mount>/<path>#<field>` for a picked field. */
+export function formatVaultRef(mount: string, path: string, field: string): string {
+  return `vault://${mount}/${path}#${field}`;
+}

@@ -124,3 +124,34 @@ export const isolationStatusResponseSchema = z.object({
   }),
 });
 export type IsolationStatusResponse = z.infer<typeof isolationStatusResponseSchema>;
+
+/**
+ * `GET /api/v1/vault/status` and `/api/v1/vault/browse` — what the secret
+ * picker reads.
+ *
+ * NAMES ONLY, at every level. A secret's value is fetched on the host when a
+ * container starts and goes straight into it; nothing here may put one on the
+ * wire, because this is served to a browser. The picker's whole job is to turn
+ * "which key do I want" into a `vault://mount/path#field` reference.
+ */
+export const vaultStatusResponseSchema = z.object({
+  installed: z.boolean(),
+  address: z.string().optional(),
+  authenticated: z.boolean(),
+  /** One actionable sentence; empty when ready. */
+  reason: z.string(),
+  fix: z.string().optional(),
+  /** The KV mounts this token can see. Empty unless authenticated. */
+  mounts: z.array(z.string()).default([]),
+});
+export type VaultStatusResponse = z.infer<typeof vaultStatusResponseSchema>;
+
+export const vaultBrowseResponseSchema = z.object({
+  mount: z.string(),
+  path: z.string(),
+  /** Child paths at this level; a folder keeps its trailing slash. */
+  entries: z.array(z.string()).default([]),
+  /** Field names of the secret AT this path, when it is one. Never values. */
+  fields: z.array(z.string()).default([]),
+});
+export type VaultBrowseResponse = z.infer<typeof vaultBrowseResponseSchema>;

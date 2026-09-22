@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { toast } from '@/components/ui/toaster'
 import { CredentialMatrix, type Choice } from './credential-matrix'
+import { SecretPicker, type SecretEntry } from './secret-picker'
 import { SettingsField } from './settings-field'
 
 /**
@@ -98,6 +99,23 @@ export function IsolationDefaultsSection() {
           Chromium and other headless browsers need roughly 1g of <code>/dev/shm</code>; the container default of 64m
           crashes them with what looks like an out-of-memory error.
         </p>
+      </SettingsField>
+
+      <SettingsField
+        title="Secrets from Vault"
+        hint={
+          'Picked here, fetched on this machine when a task\u2019s container starts, and injected as environment '
+          + 'variables. The container never gets a Vault token \u2014 it receives the values it was granted, not '
+          + 'the ability to read more. Only the reference is stored.'
+        }
+      >
+        <SecretPicker
+          value={(template.credentials?.custom ?? []) as SecretEntry[]}
+          busy={save.isPending}
+          onChange={(next) => save.mutate({
+            agentDefaults: { sandbox: { credentials: { custom: next as never } } },
+          })}
+        />
       </SettingsField>
 
       <SettingsField
