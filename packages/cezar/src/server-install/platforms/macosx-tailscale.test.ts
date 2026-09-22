@@ -164,6 +164,8 @@ describe('macosx-tailscale', () => {
     const calls: string[][] = [];
     const ctx = ctxFor(tailscaleRunner({ calls }));
     const created = await stepOf('tailscale').run(ctx);
+    // Narrows the type AND fails with a reason: every case here expects a result.
+    if (!created) throw new Error('the tailscale step produced no result');
     expect(calls).toContainEqual(['/opt/homebrew/bin/tailscale', 'serve', '--bg', '--https=443', 'http://127.0.0.1:4321']);
     expect((ctx as unknown as { state: { publicUrl?: string } }).state.publicUrl).toBe('https://mac-mini.tail1234.ts.net');
     const mapping = created.artifacts.find((a) => a.type === 'tailscale-serve');
@@ -176,6 +178,8 @@ describe('macosx-tailscale', () => {
     const calls: string[][] = [];
     const ctx = ctxFor(tailscaleRunner({ calls }), {}, { [MODE_PROMPT]: 'service' });
     const created = await stepOf('tailscale').run(ctx);
+    // Narrows the type AND fails with a reason: every case here expects a result.
+    if (!created) throw new Error('the tailscale step produced no result');
     expect(calls).toContainEqual([
       '/opt/homebrew/bin/tailscale',
       'serve',
@@ -193,6 +197,8 @@ describe('macosx-tailscale', () => {
     const calls: string[][] = [];
     const ctx = ctxFor(tailscaleRunner({ calls }), {}, { [MODE_PROMPT]: 'funnel' });
     const created = await stepOf('tailscale').run(ctx);
+    // Narrows the type AND fails with a reason: every case here expects a result.
+    if (!created) throw new Error('the tailscale step produced no result');
     expect(calls).toContainEqual(['/opt/homebrew/bin/tailscale', 'funnel', '--bg', '--https=443', 'http://127.0.0.1:4321']);
     expect(created.artifacts.find((a) => a.type === 'tailscale-serve')?.scope).toBe('funnel');
   });
