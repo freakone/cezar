@@ -1,11 +1,13 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { BASE_IMAGE_TAG, agentClaudeHome, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
+import { agentKimiHome, kimiHome } from './kimi-home.ts';
 import type { SandboxConfig } from '../config.ts';
 import {
   credentialCopyPlan,
@@ -74,16 +76,39 @@ export function baseContainerfilePath(): string {
  * builds it.
  */
 export async function ensureBaseImage(bin = 'podman'): Promise<void> {
-  const exists = await run(bin, ['image', 'exists', BASE_IMAGE_TAG]).then(() => true).catch(() => false);
-  if (exists) return;
   const file = baseContainerfilePath();
+  const exists = await run(bin, ['image', 'exists', BASE_IMAGE_TAG]).then(() => true).catch(() => false);
   if (!existsSync(file)) {
+    if (exists) return;
     throw new PodmanUnavailable(
       `the cezar agent base image is missing and ${file} was not found — reinstall cezar, or set ` +
         '`sandbox.image` to an image that exists',
     );
   }
-  await podman(bin, ['build', '-t', BASE_IMAGE_TAG, '-f', file, dirname(file)]);
+  // Rebuilt when the shipped Containerfile changed — a cezar upgrade that adds
+  // an agent CLI (Kimi did) must reach machines that built the base before it.
+  // By CONTENT, stamped on the image as a label: an installed package's files
+  // all carry npm's fixed 1985 mtime, so a date comparison could never fire.
+  const hash = baseContainerfileHash(file);
+  if (exists && (await imageLabel(BASE_IMAGE_TAG, BASE_HASH_LABEL, bin)) === hash) return;
+  await podman(bin, ['build', '-t', BASE_IMAGE_TAG, '--label', `${BASE_HASH_LABEL}=${hash}`, '-f', file, dirname(file)]);
+}
+
+/** The label carrying the hash of the Containerfile a base image was built from. */
+const BASE_HASH_LABEL = 'dev.cezar.containerfile-sha256';
+
+export function baseContainerfileHash(file = baseContainerfilePath()): string {
+  return createHash('sha256').update(readFileSync(file)).digest('hex');
+}
+
+async function imageLabel(tag: string, label: string, bin: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await run(bin, ['image', 'inspect', tag, '--format', `{{index .Labels "${label}"}}`]);
+    const value = stdout.trim();
+    return value && value !== '<no value>' ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function ensureImage(
@@ -93,14 +118,6 @@ export async function ensureImage(
 ): Promise<void> {
   const containerfile = join(repoRoot, cfg.containerfile);
   const hasFile = existsSync(containerfile);
-  const tag = imageTag(cfg, hasFile);
-  const exists = await run(bin, ['image', 'exists', tag]).then(() => true).catch(() => false);
-  // An existing image is reused UNLESS its Containerfile has changed since it
-  // was built. That is what makes an accepted suggestion take effect on the
-  // NEXT task rather than never: without this check a stale tag would be
-  // reused forever, and rebuilding unconditionally would pay a full image
-  // build before every task, which is exactly the cost this design avoids.
-  if (exists && !(hasFile && (await containerfileIsNewer(containerfile, tag, bin)))) return;
   if (!hasFile) {
     // An explicit pin is expected to exist already — cezar has nothing to build
     // it from — so only the base is built here.
@@ -113,9 +130,39 @@ export async function ensureImage(
     await ensureBaseImage(bin);
     return;
   }
-  // A repo Containerfile builds FROM the base, so the base has to exist first.
+  // A repo Containerfile builds FROM the base, so the base has to be current
+  // first — and a base rebuilt just now makes the repo image stale with it.
   await ensureBaseImage(bin);
+  const tag = imageTag(cfg, hasFile);
+  const exists = await run(bin, ['image', 'exists', tag]).then(() => true).catch(() => false);
+  // An existing image is reused UNLESS its Containerfile has changed since it
+  // was built, or the base under it has. That is what makes an accepted
+  // suggestion take effect on the NEXT task rather than never: without this
+  // check a stale tag would be reused forever, and rebuilding unconditionally
+  // would pay a full image build before every task, which is exactly the cost
+  // this design avoids.
+  if (
+    exists &&
+    !(await containerfileIsNewer(containerfile, tag, bin)) &&
+    !(await imageIsOlderThan(tag, BASE_IMAGE_TAG, bin))
+  ) {
+    return;
+  }
   await podman(bin, podmanBuildArgs(cfg, containerfile, repoRoot));
+}
+
+/** Was `tag` built before `base`? Unreadable either way answers `false` — never a rebuild loop. */
+async function imageIsOlderThan(tag: string, base: string, bin: string): Promise<boolean> {
+  const created = async (image: string) => {
+    try {
+      const { stdout } = await run(bin, ['image', 'inspect', image, '--format', '{{.Created}}']);
+      return Date.parse(stdout.trim());
+    } catch {
+      return Number.NaN;
+    }
+  };
+  const [mine, theirs] = await Promise.all([created(tag), created(base)]);
+  return !Number.isNaN(mine) && !Number.isNaN(theirs) && mine < theirs;
 }
 
 /**
@@ -155,6 +202,7 @@ export async function startTaskContainer(
     // turn of a long task — the property a mount was supposed to give and
     // could not (see `podmanRunArgs`).
     if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
+    if (cfg.claudeCredentialPassthrough) syncKimiConfig();
     // And the same for everything else that is COPIED, so a credential ticked
     // after this container started reaches the next turn of the task instead of
     // waiting for a task that does not exist yet. Mounts cannot be refreshed
@@ -172,6 +220,8 @@ export async function startTaskContainer(
   // creates it root-owned inside the VM and the agent cannot write its
   // transcripts.
   mkdirSync(agentClaudeHome(), { recursive: true });
+  mkdirSync(agentKimiHome(), { recursive: true });
+  if (cfg.claudeCredentialPassthrough) syncKimiConfig();
   const credentials = resolvePassthrough(cfg.credentials);
   await podman(bin, podmanRunArgs(cfg, name, repoRoot, {
     credentialPassthrough: cfg.claudeCredentialPassthrough,
@@ -433,6 +483,25 @@ export async function syncClaudeCredential(
   // HAS a credential and the container still cannot read it.
   await ask(['restart', container]).catch(() => undefined);
   await ask(['cp', source, `${container}:${GUEST_CREDENTIAL}`]).catch(() => undefined);
+}
+
+/**
+ * Put the host's Kimi `config.toml` in the isolated agent's home: its providers and the
+ * `[models.*]` it may select, which is what makes `kimi-code/k3` resolvable in the container.
+ * The login itself is MOUNTED (`hostKimiLogin`); this file only describes it, so a copy — renewed
+ * before every turn, like Claude's credential — is enough. The agent home is a host directory
+ * mounted at `/root/.kimi-code`, so this is a plain local copy, no `podman cp`.
+ *
+ * Silent when the host has no Kimi config: then there is no Kimi login to describe either.
+ */
+export function syncKimiConfig(source = join(kimiHome(), 'config.toml'), home = agentKimiHome()): void {
+  try {
+    if (!existsSync(source)) return;
+    mkdirSync(home, { recursive: true });
+    copyFileSync(source, join(home, 'config.toml'));
+  } catch {
+    // An unwritable agent home costs the Kimi agent its login, reported by Kimi itself.
+  }
 }
 
 const GUEST_CREDENTIAL_DIR = '/root/.claude';

@@ -7,6 +7,7 @@ import { CopilotAcpRunner } from './copilot-acp-runner.ts';
 import { OpencodeServerRunner } from './opencode-server-runner.ts';
 import { CursorAgentRunner } from './cursor-agent-runner.ts';
 import { PiRunner } from './pi-runner.ts';
+import { KimiRunner } from './kimi-runner.ts';
 
 /**
  * The single place that maps a backend id onto a concrete runner. Everything
@@ -38,6 +39,8 @@ export function createRunner(
       return new JunieRunner();
     case 'copilot':
       return new CopilotAcpRunner();
+    case 'kimi':
+      return new KimiRunner({ launcher: opts.launcher });
     case 'claude':
     case 'claude-cli':
     default:
@@ -51,7 +54,7 @@ export function createRunner(
  * take one — a runner added without a launcher (Cursor, Junie and Copilot
  * arrived that way) runs on the host and is reported as such, not as isolated.
  */
-const LAUNCHER_BACKENDS: ReadonlySet<string> = new Set(['claude', 'claude-cli', 'codex', 'opencode', 'pi']);
+const LAUNCHER_BACKENDS: ReadonlySet<string> = new Set(['claude', 'claude-cli', 'codex', 'opencode', 'pi', 'kimi']);
 
 export function backendSupportsLauncher(backend: AgentBackend | RunnerId | undefined): boolean {
   return LAUNCHER_BACKENDS.has(backend ?? 'claude');

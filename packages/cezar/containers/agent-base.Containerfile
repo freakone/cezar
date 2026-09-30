@@ -22,8 +22,13 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 
-# The agent CLI itself.
-RUN npm install -g @anthropic-ai/claude-code
+# The agent CLIs themselves. Kimi Code needs Node >= 22.19, which this image's
+# node:22 satisfies; its npm build is the same program as the native installer's.
+RUN npm install -g @anthropic-ai/claude-code @moonshot-ai/kimi-code
+
+# The image is the version pin: an agent that updates itself inside a
+# per-task container would re-download on every task and drift from it.
+ENV KIMI_CODE_NO_AUTO_UPDATE=1
 
 # Agent scratch, deliberately NOT on any bind mount: the native claude binary
 # does a startup temp-file operation that a macOS bind mount cannot serve, and
@@ -37,5 +42,9 @@ RUN mkdir -p /tmp/cez-agent
 # so conversations survive the container and can never be stranded inside a
 # stopped one.
 VOLUME ["/root/.claude"]
+
+# Kimi's, likewise: the agent's own `~/.kimi-agent` on the host, with the host's
+# Kimi login directories mounted inside it.
+VOLUME ["/root/.kimi-code"]
 
 CMD ["sleep", "infinity"]

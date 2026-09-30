@@ -56,6 +56,7 @@ export const RUNNERS: readonly RunnerOption[] = [
   { id: 'cursor', label: 'cursor', desc: 'Cursor Agent CLI' },
   { id: 'pi', label: 'pi', desc: 'pi CLI (provider/model)' },
   { id: 'copilot', label: 'copilot', desc: 'GitHub Copilot CLI (ACP)' },
+  { id: 'kimi', label: 'kimi', desc: 'Kimi Code (ACP)' },
 ]
 
 export interface ModelPreset {
@@ -67,7 +68,7 @@ export interface ModelPreset {
 /**
  * Static model presets per runner. `id: ''` is always "auto" — no model flag, the runner decides.
  *
- * For a runner that discovers (`MODEL_DISCOVERY_RUNNERS` — claude, codex, opencode, cursor) this list is
+ * For a runner that discovers (`MODEL_DISCOVERY_RUNNERS` — claude, codex, opencode, cursor, kimi) this list is
  * only the FALLBACK, used when the host catalog has nothing to offer; a live catalog replaces it.
  * Nothing dated may be listed for those — pinned ids (`claude-opus-4-8`, `gpt-5.1-codex`) are
  * exactly the drift discovery exists to end (#794 for OpenCode, #784 for Claude). Claude
@@ -107,6 +108,10 @@ export const MODELS_BY_RUNNER: Record<Runner, readonly ModelPreset[]> = {
   // stays free text for anything the account is entitled to.
   copilot: [
     { id: '', label: 'auto', desc: 'Let Copilot pick the model' },
+  ],
+  // Kimi discovers its models from its own config.toml, so like Codex it lists `auto` alone.
+  kimi: [
+    { id: '', label: 'auto', desc: 'Use your Kimi default model' },
   ],
 }
 
@@ -201,6 +206,7 @@ const DISCOVERY_RUNNER_LABEL: Record<ModelDiscoveryRunner, string> = {
   opencode: 'OpenCode',
   junie: 'Junie',
   cursor: 'Cursor',
+  kimi: 'Kimi',
 }
 
 export function modelCatalogStatus(

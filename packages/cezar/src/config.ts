@@ -292,6 +292,7 @@ const configSchema = z.object({
       cursor: z.string().trim().min(1).max(200).optional(),
       pi: z.string().trim().min(1).max(200).optional(),
       copilot: z.string().trim().min(1).max(200).optional(),
+      kimi: z.string().trim().min(1).max(200).optional(),
     })
     .optional()
     .catch(undefined),
@@ -315,6 +316,7 @@ const configSchema = z.object({
       codex: z.boolean().optional(),
       opencode: z.boolean().optional(),
       pi: z.boolean().optional(),
+      kimi: z.boolean().optional(),
     })
     .optional()
     .catch(undefined),

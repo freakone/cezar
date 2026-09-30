@@ -14,6 +14,10 @@
 export const HOST_ONLY_ENV: ReadonlySet<string> = new Set([
   'PATH', 'HOME', 'SHELL', 'USER', 'LOGNAME', 'PWD', 'OLDPWD', 'SHLVL', '_',
   'TMPDIR', 'TEMP', 'TMP',
+  // A host path to a Kimi home (an agent account sets it): inside the container
+  // the agent's Kimi home is the mounted `/root/.kimi-code`, and a Mac path would
+  // send it looking for a login that is not there.
+  'KIMI_CODE_HOME',
 ]);
 
 /**

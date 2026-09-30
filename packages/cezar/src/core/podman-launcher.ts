@@ -7,6 +7,7 @@ import type { LaunchOpts, ProcessLauncher } from './process-launcher.ts';
 import { containerEnvPairs, guestKillScript, guestScript } from './container-runtime.ts';
 import type { SandboxConfig } from '../config.ts';
 import { credentialEnvPairs, credentialMountArgs, resolvePassthrough, type ResolvedCredential } from './credential-passthrough.ts';
+import { agentKimiHome, kimiHome } from './kimi-home.ts';
 
 /**
  * Run the agent in a Podman container while cezar stays on the host.
@@ -47,6 +48,30 @@ export function agentClaudeHome(): string {
 export function hostClaudeCredential(): string {
   return join(homedir(), '.claude', '.credentials.json');
 }
+
+/**
+ * The host's Kimi login directories passed through to an isolated Kimi agent, as
+ * `[host path, guest path]`. `credentials/` holds the OAuth tokens; `oauth/` the per-credential
+ * lock files Kimi takes while refreshing one.
+ *
+ * DIRECTORIES, mounted — the opposite of Claude's credential, and for the same reason. Kimi also
+ * rewrites a refreshed token by temp-file-plus-rename, which strands a FILE bind mount on the
+ * unlinked inode (see `podmanRunArgs`); a directory mount holds the directory's inode, which a
+ * rename inside it never replaces, so both sides always see the current file. It is also why a
+ * copy is not the answer here: were a refresh to rotate the refresh token, a copy refreshed inside
+ * the container would silently log the host out, and vice versa. One shared directory cannot
+ * diverge.
+ */
+export function hostKimiLogin(env: NodeJS.ProcessEnv = process.env): Array<[string, string]> {
+  const home = kimiHome(env);
+  return [
+    [join(home, 'credentials'), `${GUEST_KIMI_HOME}/credentials`],
+    [join(home, 'oauth'), `${GUEST_KIMI_HOME}/oauth`],
+  ];
+}
+
+/** Where an isolated Kimi agent's home is mounted — the image's `kimi` runs as root. */
+export const GUEST_KIMI_HOME = '/root/.kimi-code';
 
 /** The shared base every repo image builds FROM, shipped with cezar itself. */
 export const BASE_IMAGE_TAG = 'localhost/cezar-agent/base:latest';
@@ -101,7 +126,20 @@ export function podmanRunArgs(
     // The agent's OWN claude home: conversations land on the host, readable
     // from here and impossible to strand inside a container that is gone.
     '-v', `${agentClaudeHome()}:/root/.claude`,
+    // The same for Kimi — and it is also where cezar reads a Kimi turn's token
+    // usage from, since Kimi logs it to its session files rather than the wire.
+    '-v', `${agentKimiHome()}:${GUEST_KIMI_HOME}`,
   ];
+  // Kimi's login, mounted at directory granularity (see `hostKimiLogin`) and
+  // under the same switch as Claude's: the agent CLI's own identity. Only what
+  // exists — podman refuses a missing mount source, and a host that never ran
+  // `kimi login` has nothing to pass.
+  if (opts.credentialPassthrough) {
+    const exists = opts.credentialExists ?? existsSync;
+    for (const [host, guest] of hostKimiLogin()) {
+      if (exists(host)) args.push('-v', `${host}:${guest}`);
+    }
+  }
   // The Claude credential is deliberately NOT mounted — it is copied in, and
   // re-copied before every agent spawn (`syncClaudeCredential`).
   //
