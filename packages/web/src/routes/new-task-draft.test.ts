@@ -25,6 +25,7 @@ const EMPTY_DRAFT = {
   model: null,
   variants: 1,
   worktree: null,
+  isolated: null,
   autonomous: null,
   generateFollowups: null,
   dispatch: null,

@@ -51,6 +51,7 @@ const CONNECTED_OUTPUT: Record<ProviderId, string> = {
   // Copilot's probe drives its ACP server, so its "connected" evidence is the `session/new`
   // answer (`.ai/runs/2026-09-27-copilot-cli-runner/copilot-acp-notes.md`).
   copilot: '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"3f1b6f2e-0000-4000-8000-1f2e3d4c5b6a"}}',
+  kimi: 'managed:kimi-code  type=kimi  models=4  source=oauth\n\nDefault model: kimi-code/k3',
 };
 
 const providerForExecutable = (executable: string): ProviderId => {

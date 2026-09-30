@@ -120,6 +120,8 @@ describe('redactDeep', () => {
 it('redacts raw tracker key values from persisted task text', () => {
   const secrets = collectSecretValues({ JIRA_API_TOKEN: 'jira-token-value', LINEAR_API_KEY: 'linear-key-value' });
   expect(redactSecrets('jira-token-value linear-key-value', secrets)).toBe(REDACTED + ' ' + REDACTED);
+});
+
 describe('secrets fetched from a store', () => {
   it('are scrubbed by VALUE once registered', () => {
     // The argument for cezar resolving secrets rather than handing the agent a
