@@ -48,7 +48,7 @@ import {
   sanitizeAttachmentName,
 } from '@open-mercato/cezar-contract';
 import type { AgentEvent, ContentBlock } from '../core/agent-runner.ts';
-import { discoverSkills, type Skill } from '../skills.ts';
+import { discoverSkills, discoverSkillsForRun, type Skill } from '../skills.ts';
 import { automationsReachable } from '../automations/builtin-skill.ts';
 import { AUTOMATIONS_PROMPT } from '../automations/prompts.ts';
 import { materializeSkillDirs } from '../skills-remote.ts';
@@ -4847,7 +4847,15 @@ export class RunManager {
   ): Promise<string | null> {
     let systemPrompt: string | undefined;
     if (step.skill) {
-      const skill = skills.find((s) => s.name === step.skill);
+      let skill = skills.find((s) => s.name === step.skill);
+      if (!skill) {
+        // A cold team-skill cache, not a missing skill: the load that fills it starts on first
+        // access, so the first task after a cockpit restart that named a team skill found nothing
+        // and ran on the plain prompt. Wait for it (bounded) — only here, where a named skill is
+        // actually missing, so a task that needs no team skill never pays for the load.
+        skills = await discoverSkillsForRun(this.repoRoot).catch(() => skills);
+        skill = skills.find((s) => s.name === step.skill);
+      }
       if (skill) {
         // The body alone often does not identify the selected skill. Keep its
         // name and catalog description in the normalized runner payload so a

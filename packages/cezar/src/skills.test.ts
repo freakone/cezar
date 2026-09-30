@@ -274,3 +274,46 @@ describe('the built-in create-cezar-automation skill', () => {
     expect(matches[0]).toMatchObject({ source: 'ai', body: 'House version' });
   });
 });
+
+describe('discoverSkillsForRun — the team skills a run resolves its step against', () => {
+  it('finds a team skill on a cold cache, where the plain catalog read cannot yet', async () => {
+    // The first task after a cockpit restart: nothing has loaded this project's team skills,
+    // and the step names one. The catalog read starts the load and answers from empty memory;
+    // the run must wait for it, or the task runs skill-less and reports "not installed".
+    const { execFileSync } = await import('node:child_process');
+    const { discoverSkillsForRun } = await import('./skills.ts');
+    const home = await mkdtemp(join(tmpdir(), 'cez-run-skills-home-'));
+    const source = await mkdtemp(join(tmpdir(), 'cez-run-skills-src-'));
+    const repo = await mkdtemp(join(tmpdir(), 'cez-run-skills-repo-'));
+    const saved = process.env.CEZ_HOME;
+    process.env.CEZ_HOME = home;
+    try {
+      await mkdir(join(source, 'skills', 'om-code-review'), { recursive: true });
+      await writeFile(join(source, 'skills', 'om-code-review', 'SKILL.md'), '---\nname: om-code-review\n---\n# Review\n');
+      const git = (args: string[], cwd: string) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+      git(['init', '-q', '-b', 'main'], source);
+      git(['-c', 'user.name=t', '-c', 'user.email=t@l', 'add', '-A'], source);
+      git(['-c', 'user.name=t', '-c', 'user.email=t@l', 'commit', '-q', '-m', 'skills'], source);
+      await mkdir(join(repo, '.ai', 'cezar'), { recursive: true });
+      await writeFile(join(repo, '.ai', 'cezar', 'config.json'), JSON.stringify({ skillsRepos: [{ repo: source }] }));
+
+      const cold = await discoverSkills(repo);
+      expect(cold.some((s) => s.name === 'om-code-review')).toBe(false);
+      const settled = await discoverSkillsForRun(repo);
+      expect(settled.some((s) => s.name === 'om-code-review')).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.CEZ_HOME;
+      else process.env.CEZ_HOME = saved;
+      await Promise.all([home, source, repo].map((dir) => rm(dir, { recursive: true, force: true })));
+    }
+  }, 30_000);
+
+  it('does not hold a run past its bound when the load never settles', async () => {
+    const { discoverSkillsForRun } = await import('./skills.ts');
+    const repo = await mkdtemp(join(tmpdir(), 'cez-run-skills-bound-'));
+    const started = Date.now();
+    await discoverSkillsForRun(repo, 1);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await rm(repo, { recursive: true, force: true });
+  });
+});
