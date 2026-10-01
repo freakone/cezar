@@ -16,6 +16,7 @@ import type {
 // Re-exported for backends and the run manager that still import them from here.
 export type { AgentSession, SessionOptions } from './agent-runner.ts';
 import { isSignalTerminationExit, trackChildExit } from './agent-runner.ts';
+import { learnMcpGrants } from './claude-mcp.ts';
 import { buildChildEnv } from './agent-env.ts';
 import { resolveClaudeBin } from './claude-bin.ts';
 import { costWeightedTokens, type RawUsage } from './usage.ts';
@@ -483,6 +484,8 @@ interface ClaudeStreamMessage {
   usage?: RawUsage;
   is_error?: boolean;
   total_cost_usd?: number;
+  /** `system/init`: every tool the session loaded, MCP ones included. */
+  tools?: unknown[];
 }
 
 function normalizeIntentionalTeardownResult(
@@ -565,7 +568,12 @@ function handleClaudeMessage(
     return costWeightedTokens(msg.usage);
   }
 
-  // system/init and anything else: nothing actionable.
+  // The session's own tool list names its MCP servers exactly, so the next
+  // session can be granted them (a repo's `.mcp.json` server that discovery has
+  // not listed yet). Nothing else in system/init is actionable here.
+  if (msg.type === 'system' && msg.subtype === 'init' && Array.isArray(msg.tools)) {
+    learnMcpGrants(msg.tools.filter((tool): tool is string => typeof tool === 'string'));
+  }
   return 0;
 }
 
