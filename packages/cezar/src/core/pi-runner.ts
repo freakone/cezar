@@ -295,6 +295,8 @@ export function buildPiArgs(spec: AgentRunSpec): string[] {
   return args;
 }
 
+const CLAUDE_ONLY_TOOLS: ReadonlySet<string> = new Set(['WebFetch', 'WebSearch', 'Skill']);
+
 function piTools(tools: string[], bashAllowlist?: string[]): string[] {
   const map: Readonly<Record<string, string>> = {
     Read: 'read',
@@ -310,6 +312,9 @@ function piTools(tools: string[], bashAllowlist?: string[]): string[] {
         // Pi can allow/deny the whole bash tool but has no command-prefix
         // equivalent. Fail closed when a workflow requests that narrower mode.
         .filter((tool) => tool !== 'Bash' || !bashAllowlist || bashAllowlist.length === 0)
+        // Claude Code's own tools in cezar's default list: pi has none of them,
+        // and naming an unknown tool would be pi's error, not a narrower grant.
+        .filter((tool) => !CLAUDE_ONLY_TOOLS.has(tool))
         .map((tool) => map[tool] ?? tool.toLowerCase()),
     ),
   ];
