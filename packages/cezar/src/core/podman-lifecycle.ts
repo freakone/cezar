@@ -368,13 +368,65 @@ export async function applyCredentialsToRunning(
   // the change that must reach running containers.
   const credentials = resolvePassthrough(cfg.credentials);
   const updated: string[] = [];
-  for (const name of names) {
-    if (!(await mountsWorkspace(name, repoRoot, ask))) continue;
-    await applyCredentials(name, credentials, bin);
-    updated.push(name);
-  }
-  return updated;
+  // A few at a time rather than one after another: each container is a handful
+  // of podman round-trips into the VM, ~4–5s together, and a project with a
+  // dozen task containers took most of a minute sequentially. Bounded, because
+  // every exec is a process on the host and a hop into the same VM.
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < names.length) {
+      const name = names[next++]!;
+      if (!(await mountsWorkspace(name, repoRoot, ask))) continue;
+      await applyCredentials(name, credentials, bin);
+      updated.push(name);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(APPLY_CONCURRENCY, names.length) }, worker));
+  return updated.sort();
 }
+
+const APPLY_CONCURRENCY = 4;
+
+/**
+ * `applyCredentialsToRunning` for a settings save: queued per project and NOT awaited by the
+ * caller.
+ *
+ * The save itself is the config write; reaching the task containers that are already running is
+ * a follow-up that took ~50s with a dozen of them. Awaited, it held the request that long, and the
+ * page showed nothing until a reload — the secret was saved, the answer was not back.
+ *
+ * Queued so two quick saves cannot race: a push that started earlier must never finish later and
+ * put back a credential the newer save revoked. Each push reads the config when it RUNS, so the
+ * last one always applies the latest choice, and a push queued behind a running one is the only
+ * one kept — the ones in between would apply what it applies anyway.
+ */
+export function pushCredentialsToRunning(
+  repoRoot: string,
+  load: () => Promise<SandboxConfig | undefined>,
+  apply: (cfg: SandboxConfig, repoRoot: string) => Promise<unknown> = applyCredentialsToRunning,
+): Promise<void> {
+  const queued = queuedPushes.get(repoRoot);
+  if (queued) return queued;
+  const previous = runningPushes.get(repoRoot) ?? Promise.resolve();
+  const push: Promise<void> = previous.then(async () => {
+    queuedPushes.delete(repoRoot);
+    runningPushes.set(repoRoot, push);
+    try {
+      const cfg = await load();
+      if (cfg) await apply(cfg, repoRoot);
+    } catch {
+      // podman missing, VM down — the save itself is unaffected, and the next
+      // turn of each task copies its credentials in anyway.
+    } finally {
+      if (runningPushes.get(repoRoot) === push) runningPushes.delete(repoRoot);
+    }
+  });
+  queuedPushes.set(repoRoot, push);
+  return push;
+}
+
+const runningPushes = new Map<string, Promise<void>>();
+const queuedPushes = new Map<string, Promise<void>>();
 
 /** Reads something from podman. Answers its stdout; throws as `podman` does. */
 export type PodmanQuery = (args: string[]) => Promise<string>;

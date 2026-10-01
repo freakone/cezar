@@ -151,7 +151,7 @@ import {
 } from './git-changes.ts';
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { detectContainerRuntime } from '../core/container-probe.ts';
-import { applyCredentialsToRunning, removeTaskContainer } from '../core/podman-lifecycle.ts';
+import { pushCredentialsToRunning, removeTaskContainer } from '../core/podman-lifecycle.ts';
 import { CREDENTIAL_CATALOG, hostPathOf, listSshEntries } from '../core/credential-passthrough.ts';
 import { listFields, listMounts, listPaths, vaultCli, vaultStatus } from '../core/vault-secrets.ts';
 import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
@@ -6412,12 +6412,11 @@ export function createApp(deps: ServerDeps) {
       // exactly as long as the current task lasts — which is how long anyone
       // would be looking at it. Best-effort: a container that cannot be
       // updated still gets the credential when its next turn starts.
+      // In the background: it is a follow-up to the save, not part of it, and
+      // with a dozen task containers it took most of a minute — long enough for
+      // the page to look like the save did nothing (see `pushCredentialsToRunning`).
       if (parsed.data.sandbox?.credentials !== undefined && saved.sandbox) {
-        try {
-          await applyCredentialsToRunning(saved.sandbox, repoRoot);
-        } catch {
-          // podman missing, VM down — the save itself is unaffected.
-        }
+        void pushCredentialsToRunning(repoRoot, async () => (await loadConfig(repoRoot)).sandbox);
       }
       // Pre-R6 answer shape ({baseBranch, defaultRunner}) + additive R6 fields.
       return c.json(await configAnswer(repoRoot, saved));

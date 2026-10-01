@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 
+import type { IsolationStatusResponse } from '@open-mercato/cezar-api-client'
 import { decideIsolationSuggestions, putConfig } from '@/api/client'
 import { queryKeys, useIsolationStatus } from '@/api/queries'
 import { Button } from '@/components/ui/button'
@@ -50,8 +51,26 @@ export function IsolationSection() {
   const saveSecrets = useMutation({
     mutationFn: (custom: unknown[]) =>
       putConfig({ sandbox: { credentials: { custom: custom as never } } }),
+    // Shown the moment it is picked. The picker closes on Add, so until the
+    // save answered the page looked as if nothing had happened — and with the
+    // credential push to running containers in that answer, it took most of a
+    // minute. A failed save puts the list back.
+    onMutate: async (custom: unknown[]) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.isolation })
+      const previous = queryClient.getQueryData<IsolationStatusResponse>(queryKeys.isolation)
+      if (previous) {
+        queryClient.setQueryData<IsolationStatusResponse>(queryKeys.isolation, {
+          ...previous,
+          credentials: { ...previous.credentials, own: { ...previous.credentials.own, custom } },
+        })
+      }
+      return { previous }
+    },
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.isolation }),
-    onError: (error: Error) => toast(error.message, { tone: 'danger' }),
+    onError: (error: Error, _custom, context) => {
+      if (context?.previous) queryClient.setQueryData(queryKeys.isolation, context.previous)
+      toast(error.message, { tone: 'danger' })
+    },
   })
   const saveResources = useMutation({
     mutationFn: (patch: { memory?: string | null; cpus?: number | null; shmSize?: string }) =>

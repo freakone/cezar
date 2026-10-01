@@ -169,3 +169,55 @@ describe('the claude credential in a container from an older cezar', () => {
     expect(calls).toEqual([]);
   });
 });
+
+describe('pushing a credential change to running containers after a save', () => {
+  const cfgWith = (marker: string) => ({ name: marker }) as unknown as SandboxConfig;
+
+  it('runs pushes for one project one at a time, each with the config as it is when it starts', async () => {
+    const { pushCredentialsToRunning } = await import('./podman-lifecycle.ts');
+    let current = 'first';
+    const applied: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const apply = async (cfg: SandboxConfig) => {
+      applied.push(`start ${cfg.name}`);
+      if (cfg.name === 'first') await gate;
+      applied.push(`end ${cfg.name}`);
+    };
+    const load = async () => cfgWith(current);
+
+    const one = pushCredentialsToRunning('/repo/a', load, apply);
+    await Promise.resolve();
+    await Promise.resolve();
+    // Two more saves while the first push is still in the containers: they collapse into ONE
+    // follow-up push, and it reads the config only when it starts — so it applies the latest.
+    current = 'second';
+    const two = pushCredentialsToRunning('/repo/a', load, apply);
+    current = 'third';
+    const three = pushCredentialsToRunning('/repo/a', load, apply);
+    expect(three).toBe(two);
+    release();
+    await Promise.all([one, two, three]);
+    expect(applied).toEqual(['start first', 'end first', 'start third', 'end third']);
+  });
+
+  it('never rejects: a podman failure does not reach the save', async () => {
+    const { pushCredentialsToRunning } = await import('./podman-lifecycle.ts');
+    await expect(
+      pushCredentialsToRunning('/repo/b', async () => cfgWith('x'), async () => { throw new Error('no VM'); }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('keeps projects independent', async () => {
+    const { pushCredentialsToRunning } = await import('./podman-lifecycle.ts');
+    const seen: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const slow = pushCredentialsToRunning('/repo/c', async () => cfgWith('c'), async () => { await gate; seen.push('c'); });
+    await pushCredentialsToRunning('/repo/d', async () => cfgWith('d'), async () => { seen.push('d'); });
+    expect(seen).toEqual(['d']);
+    release();
+    await slow;
+    expect(seen).toEqual(['d', 'c']);
+  });
+});
