@@ -69,6 +69,9 @@ describe('checkout — repo reference parsing', () => {
         // A bare `owner/repo` stays GitHub: every saved value and every existing
         // caller keeps its meaning, and naming a forge means naming its host.
         forge: 'github',
+        // HTTPS for every GitHub spelling, ssh included: `gh` carries the token,
+        // and an org's SAML policy may authorize it while rejecting the key.
+        transport: 'https',
       });
     }
   });
@@ -79,19 +82,34 @@ describe('checkout — repo reference parsing', () => {
       'https://gitlab.com/open-mercato/cezar.git',
       'http://www.gitlab.com/open-mercato/cezar/',
       'gitlab.com/open-mercato/cezar',
-      'git@gitlab.com:open-mercato/cezar.git',
-      'ssh://git@gitlab.com/open-mercato/cezar',
     ]) {
       expect(parseRepoRef(input), input).toEqual({
         owner: 'open-mercato',
         repo: 'cezar',
         slug: 'open-mercato/cezar',
         forge: 'gitlab',
-        // HTTPS even for an ssh spelling: it clones a public project with no key
-        // set up, which an ssh URL cannot.
+        transport: 'https',
         cloneUrl: 'https://gitlab.com/open-mercato/cezar.git',
       });
     }
+  });
+
+  it('clones a GitLab ssh address over ssh — that spelling is how this machine logs in', () => {
+    // A private project cloned this way in a terminal failed in the dialog with
+    // "could not read Username for 'https://gitlab.com'": the address had been
+    // rewritten to HTTPS, where the machine has no credential.
+    for (const input of ['git@gitlab.com:open-mercato/cezar.git', 'ssh://git@gitlab.com/open-mercato/cezar']) {
+      expect(parseRepoRef(input), input).toEqual({
+        owner: 'open-mercato',
+        repo: 'cezar',
+        slug: 'open-mercato/cezar',
+        forge: 'gitlab',
+        transport: 'ssh',
+        // Rebuilt from the validated segments, never the typed string.
+        cloneUrl: 'git@gitlab.com:open-mercato/cezar.git',
+      });
+    }
+    expect(parseRepoRef('git@gitlab.com:acme/--upload-pack=x.git')).toBeNull();
   });
 
   it('GitLab nests groups — a subgroup path is a repo, not a malformed one', () => {
@@ -102,6 +120,7 @@ describe('checkout — repo reference parsing', () => {
       repo: 'api',
       slug: 'acme/backend/api',
       forge: 'gitlab',
+      transport: 'https',
       cloneUrl: 'https://gitlab.com/acme/backend/api.git',
     });
     // Every segment is still validated individually — nesting is not a hole.
@@ -165,6 +184,55 @@ describe('checkout — GitHub transport', () => {
       '--',
       '--progress',
     ]);
+  });
+});
+
+describe('checkout — a GitLab ssh address', () => {
+  /** A fake `git` that logs its argv and GIT_SSH_COMMAND, and fails an ssh URL with `sshError`. No `glab`:
+   *  the HTTPS fallback then goes to git, as on a machine without the GitLab CLI. */
+  function fakeClis(sshError: string | null): { root: string; log: string } {
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'cez-gitlab-ssh-'));
+    const bin = join(root, 'bin');
+    const log = join(root, 'calls.log');
+    mkdirSync(bin);
+    const fail = sshError === null ? '' : `case "$3" in git@*) echo "${sshError}" >&2; exit 128;; esac\n`;
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\necho "git $* | $GIT_SSH_COMMAND" >> "${log}"\n${fail}mkdir -p "$4" && exit 0\n`, { mode: 0o755 });
+    // System dirs only besides the fakes: a real glab (Homebrew) must not answer for the absent one.
+    vi.stubEnv('PATH', `${bin}:/usr/bin:/bin`);
+    vi.stubEnv('GIT_SSH_COMMAND', '');
+    return { root, log };
+  }
+
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('clones it with git over ssh, non-interactively — one call, nothing else tried', async () => {
+    const { root, log } = fakeClis(null);
+    const dir = join(root, 'out');
+    expect(await gitlabCloneRunner(parseRepoRef('git@gitlab.com:flossa.ai/voice.git')!, dir, () => {}, undefined)).toEqual({ ok: true });
+    expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual([
+      `git clone --progress git@gitlab.com:flossa.ai/voice.git ${dir} | ssh -o BatchMode=yes -o ConnectTimeout=15`,
+    ]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('falls back to HTTPS when ssh itself is unusable — a public project with no key set up', async () => {
+    const { root, log } = fakeClis('git@gitlab.com: Permission denied (publickey).');
+    const dir = join(root, 'out');
+    const lines: string[] = [];
+    expect(await gitlabCloneRunner(parseRepoRef('git@gitlab.com:acme/public.git')!, dir, (l) => lines.push(l), undefined)).toEqual({ ok: true });
+    const calls = readFileSync(log, 'utf8').trim().split('\n');
+    expect(calls[0]).toContain('git clone --progress git@gitlab.com:acme/public.git');
+    expect(calls.at(-1)).toContain('git clone --progress https://gitlab.com/acme/public.git');
+    expect(lines).toContain('ssh could not authenticate to gitlab.com — trying HTTPS instead');
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('keeps an ssh failure that is about the project, not about ssh — no pointless HTTPS retry', async () => {
+    const { root, log } = fakeClis("ERROR: The project you were looking for could not be found or you don't have permission to view it.");
+    const outcome = await gitlabCloneRunner(parseRepoRef('git@gitlab.com:acme/private.git')!, join(root, 'out'), () => {}, undefined);
+    expect(outcome.ok).toBe(false);
+    expect(readFileSync(log, 'utf8').trim().split('\n')).toHaveLength(1);
+    rmSync(root, { recursive: true, force: true });
   });
 });
 

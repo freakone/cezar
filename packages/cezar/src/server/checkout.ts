@@ -81,8 +81,19 @@ export interface RepoRef {
    *  `owner/repo` silently selects that rejected key. The resulting HTTPS
    *  `origin` needs a credential path of its own after the clone — see
    *  `persistGhCredentialHelper`. For GitLab it is what `git` needs, since
-   *  there is no `gh` to resolve a slug. */
+   *  there is no `gh` to resolve a slug — unless the user typed an SSH address
+   *  (see `transport`). */
   cloneUrl: string;
+  /**
+   * `ssh` when the user typed a GitLab SSH address (`git@gitlab.com:group/repo.git`),
+   * and the clone then goes over SSH. That spelling is a statement about how this
+   * machine authenticates: a private GitLab project cloned that way in a terminal
+   * failed here with "could not read Username for 'https://gitlab.com'", because
+   * the address had been rewritten to HTTPS, where this machine has no credential.
+   * GitHub never does this — its HTTPS is load-bearing (above) and `gh` carries
+   * the token.
+   */
+  transport: 'https' | 'ssh';
 }
 
 /** A path segment as GitHub and GitLab both allow them: alphanumerics, `-`,
@@ -127,9 +138,10 @@ export function parseRepoRef(input: string): RepoRef | null {
     { forge: 'github', host: 'github\\.com' },
     { forge: 'gitlab', host: 'gitlab\\.com' },
   ];
+  let typedSsh = false;
   for (const candidate of hosts) {
     const ssh = new RegExp(`^(?:ssh://)?git@${candidate.host}[:/](.+)$`).exec(path);
-    if (ssh?.[1]) { path = ssh[1]; forge = candidate.forge; break; }
+    if (ssh?.[1]) { path = ssh[1]; forge = candidate.forge; typedSsh = true; break; }
     const https = new RegExp(`^(?:https?://)?(?:www\\.)?${candidate.host}/(.+)$`).exec(path);
     if (https?.[1]) { path = https[1]; forge = candidate.forge; break; }
   }
@@ -144,12 +156,17 @@ export function parseRepoRef(input: string): RepoRef | null {
   const repo = parts[parts.length - 1] as string;
   const owner = parts.slice(0, -1).join('/');
   const slug = `${owner}/${repo}`;
+  if (forge === 'gitlab' && typedSsh) {
+    // The URL is rebuilt from the validated segments like every other spelling,
+    // so an SSH address can no more smuggle an option or a host than HTTPS can.
+    return { owner, repo, slug, forge, transport: 'ssh', cloneUrl: `git@gitlab.com:${slug}.git` };
+  }
   return forge === 'gitlab'
-    // HTTPS rather than SSH: it works for a public project with no key set up,
-    // and for a private one git can use a credential helper or a token in the
-    // URL's place. An SSH URL would fail for anyone without a key on file.
-    ? { owner, repo, slug, forge, cloneUrl: `https://gitlab.com/${slug}.git` }
-    : { owner, repo, slug, forge, cloneUrl: `https://github.com/${slug}.git` };
+    // HTTPS by default: it works for a public project with no key set up, and
+    // for a private one through glab, a credential helper, or a token. Someone
+    // whose GitLab login IS an ssh key says so by typing the ssh address.
+    ? { owner, repo, slug, forge, transport: 'https', cloneUrl: `https://gitlab.com/${slug}.git` }
+    : { owner, repo, slug, forge, transport: 'https', cloneUrl: `https://github.com/${slug}.git` };
 }
 
 /**
@@ -254,11 +271,26 @@ type CloneOutcome = { ok: true } | { ok: false; error: string; notFound?: boolea
  * Every forge shares this body and differs only in argv, so a fix to the
  * progress parsing or the abort path cannot land for one forge and miss another.
  */
+/**
+ * The ssh command for a clone nobody can answer a prompt for.
+ *
+ * `GIT_TERMINAL_PROMPT=0` silences git, not ssh: a passphrase-protected key with
+ * no agent, or a host key never seen, makes ssh wait on a terminal the dialog
+ * does not have — until the clone timeout. `BatchMode` makes it fail with its
+ * own words instead. EXTENDS an exported `GIT_SSH_COMMAND` (one that names a
+ * key is how that machine authenticates at all), the same rule
+ * `nonInteractiveSsh` in git-worktree.ts follows for fetches.
+ */
+export function nonInteractiveSsh(env: NodeJS.ProcessEnv = process.env): string {
+  return `${env.GIT_SSH_COMMAND?.trim() || 'ssh'} -o BatchMode=yes -o ConnectTimeout=15`;
+}
+
 function spawnClone(
   command: string,
   args: string[],
   onLine: (line: string) => void,
   signal: AbortSignal | undefined,
+  extraEnv: Record<string, string> = {},
 ): Promise<CloneOutcome> {
   return new Promise((resolvePromise) => {
     const child = spawn(command, args, {
@@ -268,7 +300,7 @@ function spawnClone(
       // unauthenticated `gh`/`glab`, or a private repo `git` wants a password
       // for, must fail with a message the dialog can show rather than block on a
       // prompt nobody can see.
-      env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' },
+      env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0', ...extraEnv },
     });
     const tail: string[] = [];
     let settled = false;
@@ -357,6 +389,29 @@ export const ghCloneRunner: CloneRunner = async (ref, dir, onLine, signal) => {
  * with its own message, which is more useful than git's.
  */
 export const gitlabCloneRunner: CloneRunner = async (ref, dir, onLine, signal) => {
+  const url = ref.cloneUrl ?? `https://gitlab.com/${ref.slug}.git`;
+  // An ssh address goes straight to git: glab picks its own protocol from its
+  // config, and the user just told us which one works here.
+  if (ref.transport === 'ssh') {
+    const viaSsh = await spawnClone('git', ['clone', '--progress', url, dir], onLine, signal, {
+      GIT_SSH_COMMAND: nonInteractiveSsh(),
+    });
+    if (viaSsh.ok || signal?.aborted || !SSH_UNUSABLE.test(viaSsh.error)) return viaSsh;
+    // ssh itself could not be used — no key, an unknown host key — which is
+    // the case HTTPS exists for: a public project clones with nothing set up.
+    // git cleans out a failed clone, so the directory is empty again for it.
+    onLine('ssh could not authenticate to gitlab.com — trying HTTPS instead');
+    const viaHttps = await cloneGitlabOverHttps({ ...ref, cloneUrl: `https://gitlab.com/${ref.slug}.git` }, dir, onLine, signal);
+    // Both failed: the ssh reason is the one that matches what the user typed.
+    return viaHttps.ok ? viaHttps : viaSsh;
+  }
+  return cloneGitlabOverHttps(ref, dir, onLine, signal);
+};
+
+/** ssh failed before GitLab could say anything about the project itself. */
+const SSH_UNUSABLE = /Permission denied \(publickey|Host key verification failed|no such identity|Connection timed out|Could not resolve hostname/i;
+
+const cloneGitlabOverHttps: CloneRunner = async (ref, dir, onLine, signal) => {
   const url = ref.cloneUrl ?? `https://gitlab.com/${ref.slug}.git`;
   const viaGlab = await spawnClone('glab', ['repo', 'clone', ref.slug, dir, '--', '--progress'], onLine, signal);
   if (viaGlab.ok || !viaGlab.notFound) return viaGlab;
@@ -502,11 +557,27 @@ const NEEDS_CREDENTIALS = /could not read Username|Authentication failed|termina
  * failing the same way earns the same explanation.
  */
 function explainGitlabAuth(error: string, ref: RepoRef): string {
+  if (ref.transport === 'ssh') return explainGitlabSsh(error, ref);
   if (!NEEDS_CREDENTIALS.test(error)) return error;
   return `${error}\n\ngitlab.com answers the same way for a private project and one that does not `
     + `exist, so this is either — check ${ref.slug}, and for a private project install the GitLab `
-    + 'CLI and run `glab auth login` (cezar uses it when it is there), or configure a git '
-    + 'credential helper for gitlab.com.';
+    + 'CLI and run `glab auth login` (cezar uses it when it is there), configure a git '
+    + `credential helper for gitlab.com, or — if your GitLab login is an ssh key — paste the ssh `
+    + `address instead (git@gitlab.com:${ref.slug}.git).`;
+}
+
+/** The ssh failures worth a sentence, each with the one thing that fixes it. */
+function explainGitlabSsh(error: string, ref: RepoRef): string {
+  if (/Host key verification failed/i.test(error)) {
+    return `${error}\n\nThis machine has not accepted gitlab.com's host key yet, and cezar cannot answer `
+      + 'that prompt for you — run `ssh -T git@gitlab.com` once in a terminal, accept the key, and retry.';
+  }
+  if (/Permission denied \(publickey|Could not read from remote repository|could not be found or you don't have permission/i.test(error)) {
+    return `${error}\n\ngitlab.com refused the ssh key cezar's process offered, or ${ref.slug} does not exist `
+      + '(gitlab.com answers the same way for both). A key that works in your terminal may need an '
+      + 'agent this process can reach (`ssh-add`), or a passphrase-free deploy key.';
+  }
+  return error;
 }
 
 function errText(err: unknown): string {
