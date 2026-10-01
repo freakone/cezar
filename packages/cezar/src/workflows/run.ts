@@ -63,6 +63,7 @@ import { automationsReachable } from '../automations/builtin-skill.ts';
 import { AUTOMATIONS_PROMPT } from '../automations/prompts.ts';
 import { getTeamSkillsCached, materializeSkillDir, waitForTeamSkills } from '../skills-remote.ts';
 import { provisionSkills } from '../skills-provision.ts';
+import { claudeMcpGrants } from '../core/claude-mcp.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
 import { defaultSandboxFor, loadConfig, resolveWorktreeRetention, type SandboxConfig } from '../config.ts';
@@ -4610,6 +4611,8 @@ export class RunManager {
       ? `${context}\n\n---\n\n## New user instruction\n${openingPrompt}`
       : openingPrompt;
     state.grantedAttachmentLibrary = this.prepareAttachmentLibrary();
+    // Computed before the launch closure, which is synchronous (it is also the retry path).
+    const continueAllowedTools = toolsStep?.allowedTools ?? (await this.defaultAllowedTools(continueBackend, continueProfile.env));
     const launch = (launchSessionId: string, resume: boolean, context: string | undefined): AgentSession => {
       const contextualOpeningPrompt = withContext(context);
       const started = runner.startSession(
@@ -4629,7 +4632,7 @@ export class RunManager {
             : contextualOpeningPrompt,
           ...(openingImages.length ? { images: openingImages } : {}),
           cwd: state.cwd,
-          allowedTools: toolsStep?.allowedTools ?? DEFAULT_ALLOWED_TOOLS,
+          allowedTools: continueAllowedTools,
           bashAllowlist: toolsStep?.bashAllowlist,
             additionalDirectories: agentDirectories(
               join(this.dataDir, 'runs'),
@@ -6124,6 +6127,14 @@ export class RunManager {
       return undefined;
     }
     return rec!.sessionId;
+   * The tool list for a step that names none: `DEFAULT_ALLOWED_TOOLS`, plus — for Claude — the
+   * user's MCP servers, without which `dontAsk` refused every MCP tool they had connected (see
+   * `claude-mcp.ts`). Keyed on the project, not the task worktree: same servers, one discovery.
+   * A step that lists its own tools never comes here, so it keeps exactly that list.
+   */
+  private async defaultAllowedTools(backend: AgentBackend | RunnerId, env?: Record<string, string>): Promise<string[]> {
+    if (backend !== 'claude' && backend !== 'claude-cli') return DEFAULT_ALLOWED_TOOLS;
+    return [...DEFAULT_ALLOWED_TOOLS, ...(await claudeMcpGrants(this.repoRoot, env))];
   }
 
   /**
@@ -6648,7 +6659,7 @@ export class RunManager {
           userPrompt: prompt,
           images,
           cwd: state.cwd,
-          allowedTools: step.allowedTools ?? DEFAULT_ALLOWED_TOOLS,
+          allowedTools: step.allowedTools ?? (await this.defaultAllowedTools(stepBackend, stepProfile.env)),
           bashAllowlist: step.bashAllowlist,
           // The handoff file lives outside the worktree — grant access.
           additionalDirectories: agentDirectories(
