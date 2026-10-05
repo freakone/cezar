@@ -59,7 +59,8 @@ import { defaultSandboxFor, loadConfig, resolveWorktreeRetention, type SandboxCo
 import { bootstrapRepoSandbox } from '../core/sandbox-bootstrap.ts';
 import { localLauncher, type ProcessLauncher } from '../core/process-launcher.ts';
 import { loadWorkspaceConfig } from '../workspace/config.ts';
-import { resolvePassthrough, resolveSecretEnv } from '../core/credential-passthrough.ts';
+import { githubTokenEnv, resolvePassthrough, resolveSecretEnv, type ResolvedCredential } from '../core/credential-passthrough.ts';
+import { readHostGithubToken } from '../core/backend-detect.ts';
 import {
   cachingVaultReader,
   effectiveVaultAddress,
@@ -2917,7 +2918,8 @@ export class RunManager {
     stepId: string,
   ): Promise<{ env: string[]; fatal: string | null }> {
     const resolved = resolvePassthrough(sandbox?.credentials);
-    if (!resolved.some((c) => c.valueFrom)) return { env: [], fatal: null };
+    const github = await this.githubTokenEnv(resolved);
+    if (!resolved.some((c) => c.valueFrom)) return { env: github, fatal: null };
     const read = await this.readerForVault();
     const { pairs, problems } = await resolveSecretEnv(resolved, async (reference) => {
       const ref = parseVaultRef(reference);
@@ -2936,12 +2938,27 @@ export class RunManager {
     }
     const required = problems.find((p) => p.required);
     return {
-      env: pairs,
+      env: [...github, ...pairs],
       // A load-bearing secret is a step failure, not a note: without it the
       // agent gets several tool calls in and fails at something that names
       // neither the secret nor the store.
       fatal: required ? `required secret "${required.id}" could not be fetched — ${required.reason}` : null,
     };
+  }
+
+  /**
+   * `GH_TOKEN` for a turn whose project passes the GitHub CLI through, fetched on the host.
+   *
+   * The copied `hosts.yml` carries a token only on machines where gh stores it in the file; gh's
+   * default on macOS is the Keychain, which leaves `hosts.yml` naming a user and no token — and
+   * the agent reporting gh "not logged in" with the credential ticked. `gh auth token` answers
+   * from wherever gh keeps it. Per turn, like every fetched secret, so a re-login on the host
+   * reaches the next turn; skipped when the host already exports one (that one is forwarded).
+   */
+  private async githubTokenEnv(resolved: readonly ResolvedCredential[]): Promise<string[]> {
+    const pairs = await githubTokenEnv(resolved, process.env, readHostGithubToken);
+    registerSecretValues(pairs.map((pair) => pair.slice(pair.indexOf('=') + 1)));
+    return pairs;
   }
 
   /**
