@@ -74,7 +74,7 @@ export function CredentialMatrix({
                   aria-label={source.label}
                 />
                 <span className={source.present ? '' : 'text-muted-foreground'}>{source.label}</span>
-                {on && picked.length === 0 ? (
+                {on && picked.length === 0 && source.kind !== 'file' ? (
                   <select
                     className="rounded border bg-background px-1 py-0.5 text-xs"
                     value={mode}
@@ -94,7 +94,7 @@ export function CredentialMatrix({
                 {/* Narrowed passthrough is always a copy, so the mount/copy
                     control would be a lie while files are ticked. Say which one
                     is in force instead of offering a choice that is not real. */}
-                {on && picked.length > 0 ? (
+                {on && (picked.length > 0 || source.kind === 'file') ? (
                   <span className="rounded border px-1 py-0.5 text-xs text-muted-foreground">copied</span>
                 ) : null}
                 {!source.present ? (

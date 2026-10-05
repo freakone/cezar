@@ -257,3 +257,32 @@ describe('the copied ssh config', () => {
     expect(resolved.find((c) => c.id === 'ssh:known_hosts')?.sanitize).toBeUndefined();
   });
 });
+
+describe('the GitHub CLI in a container', () => {
+  it('copies hosts.yml even when mount was picked — a mount strands on gh’s rewrite and misses a running task', async () => {
+    const { resolvePassthrough } = await import('./credential-passthrough.ts');
+    const [gh] = resolvePassthrough({ enabled: { 'github-cli': { mode: 'mount' } } }, '/home/u', () => true);
+    expect(gh).toMatchObject({ id: 'github-cli', mode: 'copy', guestPath: '/root/.config/gh/hosts.yml' });
+  });
+
+  it('keeps the picked mode for a directory', async () => {
+    const { resolvePassthrough } = await import('./credential-passthrough.ts');
+    const [aws] = resolvePassthrough({ enabled: { aws: { mode: 'copy' } } }, '/home/u', () => true);
+    expect(aws?.mode).toBe('copy');
+  });
+
+  it('hands the container the host’s gh token — hosts.yml has none when gh keeps it in the Keychain', async () => {
+    const { githubTokenEnv, resolvePassthrough } = await import('./credential-passthrough.ts');
+    const resolved = resolvePassthrough({ enabled: { 'github-cli': true } }, '/home/u', () => true);
+    expect(await githubTokenEnv(resolved, {}, async () => 'gho_host')).toEqual(['GH_TOKEN=gho_host']);
+    // Not passed through: nothing, and gh is not even asked.
+    let asked = false;
+    expect(await githubTokenEnv([], {}, async () => { asked = true; return 'x'; })).toEqual([]);
+    expect(asked).toBe(false);
+    // An exported token is forwarded as is by credentialEnvPairs; no second one.
+    expect(await githubTokenEnv(resolved, { GH_TOKEN: 'exported' }, async () => 'gho_host')).toEqual([]);
+    // gh logged out, or missing: the task runs without, never fails.
+    expect(await githubTokenEnv(resolved, {}, async () => null)).toEqual([]);
+    expect(await githubTokenEnv(resolved, {}, async () => { throw new Error('ENOENT'); })).toEqual([]);
+  });
+});

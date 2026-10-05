@@ -45,7 +45,7 @@ export interface CredentialSource {
    * `.ssh` and `.npmrc` are indistinguishable as strings, and this is what the
    * mount rule below is enforced against.
    */
-  kind?: 'file' | 'dir';
+  kind: 'file' | 'dir';
   /** Where it lands in the container. Defaults to the same path under /root. */
   guestPath?: string;
   /** Environment variables to forward instead of (or besides) a path. */
@@ -389,7 +389,16 @@ export function resolvePassthrough(
   for (const source of CREDENTIAL_CATALOG) {
     const choice = selection.enabled?.[source.id];
     if (!choice) continue;
-    const mode = (typeof choice === 'object' && choice.mode) || source.defaultMode;
+    // A single FILE is always copied, whatever mode was picked. A file bind mount
+    // binds an inode, and the tools that own these files rewrite them by
+    // temp-file-plus-rename (`gh auth login` and every token refresh do), which
+    // strands the container on the deleted one — Claude's credential failed that
+    // way after ~35 hours. And a mount is fixed when the container is created, so
+    // ticking `gh` during a task did nothing until the next one; a copy reaches
+    // the running container at once and is renewed every turn.
+    const mode = source.kind === 'file'
+      ? 'copy'
+      : (typeof choice === 'object' && choice.mode) || source.defaultMode;
     const keys = typeof choice === 'object' ? choice.keys ?? [] : [];
     // A narrowed `selectable` source passes the named files instead of the
     // directory. This is the whole point of picking keys: the container gets
@@ -553,6 +562,24 @@ export async function resolveSecretEnv(
     for (const name of credential.env) pairs.push(`${name}=${value}`);
   }
   return { pairs, problems };
+}
+
+/**
+ * `GH_TOKEN=<token>` for a container whose project passes the GitHub CLI through, read on the
+ * host by `readToken` (`gh auth token`, then `GITHUB_TOKEN`). The copied `hosts.yml` holds a
+ * token only where gh stores it in the file — macOS's default is the Keychain. Nothing when the
+ * GitHub CLI is not passed through, or when the host already exports a token (`credentialEnvPairs`
+ * forwards that one). Never throws.
+ */
+export async function githubTokenEnv(
+  resolved: readonly ResolvedCredential[],
+  env: NodeJS.ProcessEnv,
+  readToken: () => Promise<string | null>,
+): Promise<string[]> {
+  if (!resolved.some((c) => c.id === 'github-cli')) return [];
+  if (env.GH_TOKEN || env.GITHUB_TOKEN) return [];
+  const token = await readToken().catch(() => null);
+  return token ? [`GH_TOKEN=${token}`] : [];
 }
 
 /** `KEY=VALUE` pairs for every forwarded variable that is actually set. */

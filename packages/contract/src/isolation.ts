@@ -78,6 +78,9 @@ export const isolationStatusResponseSchema = z.object({
     catalog: z.array(z.object({
       id: z.string(),
       label: z.string(),
+      /** A single file is always COPIED (see `resolvePassthrough`), so the page offers mount/copy
+       *  only for a directory. */
+      kind: z.enum(['file', 'dir']),
       hostPath: z.string().optional(),
       env: z.array(z.string()).default([]),
       defaultMode: z.enum(['mount', 'copy']),

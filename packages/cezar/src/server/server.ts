@@ -6820,6 +6820,7 @@ export function createApp(deps: ServerDeps) {
           catalog: CREDENTIAL_CATALOG.map((source) => ({
             id: source.id,
             label: source.label,
+            kind: source.kind,
             hostPath: hostPathOf(source),
             env: source.env ?? [],
             defaultMode: source.defaultMode,
