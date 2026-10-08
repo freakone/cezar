@@ -64,6 +64,11 @@ const connectedResults: Record<string, ProviderCommandResult> = {
     stderr: '',
     exitCode: 0,
   },
+  kimi: {
+    stdout: 'managed:kimi-code  type=kimi  models=4  source=oauth\n\nDefault model: kimi-code/k3',
+    stderr: '',
+    exitCode: 0,
+  },
 };
 
 const originalEnv = {
@@ -75,6 +80,7 @@ const originalEnv = {
   CEZ_PI_BIN: process.env.CEZ_PI_BIN,
   CURSOR_API_KEY: process.env.CURSOR_API_KEY,
   CEZ_COPILOT_BIN: process.env.CEZ_COPILOT_BIN,
+  CEZ_KIMI_BIN: process.env.CEZ_KIMI_BIN,
 };
 
 beforeEach(() => {
@@ -86,6 +92,7 @@ beforeEach(() => {
   delete process.env.CEZ_PI_BIN;
   delete process.env.CURSOR_API_KEY;
   delete process.env.CEZ_COPILOT_BIN;
+  delete process.env.CEZ_KIMI_BIN;
 });
 
 afterEach(() => {
@@ -107,6 +114,8 @@ function resultFor(executable: string): ProviderCommandResult {
   if (executable === 'agent' || executable.includes('cursor')) return connectedResults.cursor!;
   if (executable.includes('opencode')) return connectedResults.opencode!;
   if (executable.includes('copilot')) return connectedResults.copilot!;
+  // Kimi's default executable is discovered (PATH, then ~/.kimi-code/bin/kimi), so match by name.
+  if (/(^|[\\/])kimi$/.test(executable)) return connectedResults.kimi!;
   return connectedResults.pi!;
 }
 
@@ -646,10 +655,43 @@ describe('provider auth parsers', () => {
 
     await expect(statuses(service)).resolves.toMatchObject({ pi: { status: 'unknown' } });
   });
+
+  it('recognizes a kimi provider row with models as connected', async () => {
+    process.env.CEZ_KIMI_BIN = 'kimi';
+    const service = new ProviderAuthService({
+      runCommand: runner((executable) => executable === 'kimi'
+        ? connectedResults.kimi!
+        : { stdout: 'unrecognized', stderr: '', exitCode: 0 }),
+    });
+
+    await expect(statuses(service)).resolves.toMatchObject({ kimi: { status: 'connected' } });
+  });
+
+  it('recognizes kimi "No providers configured." as disconnected', async () => {
+    process.env.CEZ_KIMI_BIN = 'kimi';
+    const service = new ProviderAuthService({
+      runCommand: runner((executable) => executable === 'kimi'
+        ? { stdout: 'No providers configured.', stderr: '', exitCode: 0 }
+        : { stdout: 'unrecognized', stderr: '', exitCode: 0 }),
+    });
+
+    await expect(statuses(service)).resolves.toMatchObject({ kimi: { status: 'disconnected' } });
+  });
+
+  it('does not guess from unrecognized kimi provider output', async () => {
+    process.env.CEZ_KIMI_BIN = 'kimi';
+    const service = new ProviderAuthService({
+      runCommand: runner((executable) => executable === 'kimi'
+        ? { stdout: 'managed:kimi-code  type=kimi  models=0', stderr: 'private detail', exitCode: 0 }
+        : { stdout: 'unrecognized', stderr: '', exitCode: 0 }),
+    });
+
+    await expect(statuses(service)).resolves.toMatchObject({ kimi: { status: 'unknown' } });
+  });
 });
 
 describe('ProviderAuthService', () => {
-  it('always returns every provider in descriptor order', async () => {
+  it('always returns every provider, kimi in descriptor order', async () => {
     const service = new ProviderAuthService({ runCommand: runner() });
 
     await expect(service.status()).resolves.toMatchObject({
@@ -661,6 +703,7 @@ describe('ProviderAuthService', () => {
         { provider: 'pi' },
         { provider: 'junie', status: 'connected' },
         { provider: 'copilot' },
+        { provider: 'kimi' },
       ],
     });
   });
@@ -685,6 +728,8 @@ describe('ProviderAuthService', () => {
       { executable: 'agent', args: ['status', '--format', 'json'], timeoutMs: 10_000 },
       { executable: 'pi', args: ['--list-models'], timeoutMs: 10_000 },
       { executable: 'copilot', args: ['--acp'], timeoutMs: 10_000 },
+      // Discovered (PATH, then ~/.kimi-code/bin/kimi), so only its basename is fixed.
+      { executable: expect.stringMatching(/(^|[\\/])kimi$/), args: ['provider', 'list'], timeoutMs: 10_000 },
     ]);
     release();
     await expect(pending).resolves.toBeDefined();
@@ -1141,6 +1186,7 @@ describe('ProviderAuthService', () => {
         { provider: 'pi', status: 'connected' },
         { provider: 'junie', status: 'connected' },
         { provider: 'copilot', status: 'connected' },
+        { provider: 'kimi', status: 'connected' },
       ],
     });
     expect(runCommand).not.toHaveBeenCalled();
@@ -1219,6 +1265,17 @@ describe('ProviderAuthService', () => {
     expect(service.loginCommand('pi')).toBe("'/tools/pi custom' /login");
   });
 
+  it('uses CEZ_KIMI_BIN for the provider-list probe and interactive login', async () => {
+    process.env.CEZ_KIMI_BIN = '/tools/kimi custom';
+    const runCommand = runner((executable) =>
+      executable === '/tools/kimi custom' ? connectedResults.kimi! : resultFor(executable));
+    const service = new ProviderAuthService({ runCommand, platform: 'linux' });
+
+    await service.status();
+    expect(runCommand).toHaveBeenCalledWith('/tools/kimi custom', ['provider', 'list'], 10_000);
+    expect(service.loginCommand('kimi')).toBe("'/tools/kimi custom' login");
+  });
+
   it('uses the documented CEZ_CLAUDE_BIN override for both probe and login commands', async () => {
     process.env.CEZ_CLAUDE_BIN = '/tools/claude custom';
     const runCommand = runner((executable) =>
@@ -1254,6 +1311,7 @@ describe('ProviderAuthService', () => {
         { provider: 'pi', status: 'connected' },
         { provider: 'junie', status: 'connected' },
         { provider: 'copilot', status: 'connected' },
+        { provider: 'kimi', status: 'connected' },
       ],
     });
     expect(runCommand).not.toHaveBeenCalled();

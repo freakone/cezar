@@ -1,4 +1,5 @@
-import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { localLauncher, type ProcessLauncher } from './process-launcher.ts';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as resolvePath } from 'node:path';
 import type {
@@ -15,8 +16,8 @@ import type {
 // Re-exported for backends and the run manager that still import them from here.
 export type { AgentSession, SessionOptions } from './agent-runner.ts';
 import { isSignalTerminationExit, trackChildExit } from './agent-runner.ts';
+import { learnMcpGrants } from './claude-mcp.ts';
 import { buildChildEnv } from './agent-env.ts';
-import { disclaimedCommand } from './disclaim-spawn.ts';
 import { resolveClaudeBin } from './claude-bin.ts';
 import { costWeightedTokens, type RawUsage } from './usage.ts';
 import { readNdjson } from './ndjson.ts';
@@ -60,6 +61,12 @@ export interface ClaudeCliRunnerOptions {
   bin?: string;
   /** Wall-clock timeout for a run (ms); per-spec `timeoutMs` still wins. */
   timeoutMs?: number;
+  /**
+   * WHERE the CLI runs. Defaults to this machine; an `SbxLauncher` puts the
+   * identical argv inside a sandbox instead. The runner is unaware of which —
+   * it only needs spawn + signal.
+   */
+  launcher?: ProcessLauncher;
 }
 
 /**
@@ -96,11 +103,13 @@ export class ClaudeCliRunner implements AgentRunner {
 
   private readonly bin: string;
   private readonly timeoutMs: number;
+  private readonly launcher: ProcessLauncher;
   private lastSession: AgentSession | null = null;
 
   constructor(opts: ClaudeCliRunnerOptions = {}) {
     this.bin = resolveClaudeExecutable(opts.bin);
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    this.launcher = opts.launcher ?? localLauncher;
   }
 
   /** One-shot run: start a session and auto-end it after the first turn. */
@@ -121,9 +130,10 @@ export class ClaudeCliRunner implements AgentRunner {
 
     let child: ChildProcessWithoutNullStreams;
     try {
-      const env = buildChildEnv({ backend: this.backend, extraEnv: spec.env });
-      const [file, argv] = disclaimedCommand(this.bin, args, env);
-      child = nodeSpawn(file, argv, { cwd: spec.cwd, env });
+      child = this.launcher.spawn(this.bin, args, {
+        cwd: spec.cwd,
+        env: buildChildEnv({ backend: this.backend, extraEnv: spec.env }),
+      });
     } catch (err) {
       throw wrapSpawnError(err, this.bin);
     }
@@ -182,7 +192,11 @@ export class ClaudeCliRunner implements AgentRunner {
     let terminatedByCezar = false;
     const signalChild = (signal: 'SIGTERM' | 'SIGKILL'): void => {
       terminatedByCezar = true;
-      child.kill(signal);
+      // Through the launcher, not `child.kill`: when the agent runs in a
+      // sandbox the child is an `sbx exec` client, and killing it leaves the
+      // agent alive inside the container. Fire-and-forget by design — the
+      // caller's SIGTERM→SIGKILL escalation already owns the timing.
+      void this.launcher.signal(child, signal);
     };
     // Every watchdog below asks "is the child still alive?" — and that question
     // is NOT `child.killed`, which only reports signal delivery. claude handles
@@ -470,6 +484,8 @@ interface ClaudeStreamMessage {
   usage?: RawUsage;
   is_error?: boolean;
   total_cost_usd?: number;
+  /** `system/init`: every tool the session loaded, MCP ones included. */
+  tools?: unknown[];
 }
 
 function normalizeIntentionalTeardownResult(
@@ -552,7 +568,12 @@ function handleClaudeMessage(
     return costWeightedTokens(msg.usage);
   }
 
-  // system/init and anything else: nothing actionable.
+  // The session's own tool list names its MCP servers exactly, so the next
+  // session can be granted them (a repo's `.mcp.json` server that discovery has
+  // not listed yet). Nothing else in system/init is actionable here.
+  if (msg.type === 'system' && msg.subtype === 'init' && Array.isArray(msg.tools)) {
+    learnMcpGrants(msg.tools.filter((tool): tool is string => typeof tool === 'string'));
+  }
   return 0;
 }
 

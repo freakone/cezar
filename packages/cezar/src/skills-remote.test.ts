@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { bareDirFor, isPinnedSha, shouldPassiveFetch } from './skills-remote.ts';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { bareDirFor, isPinnedSha, materializeSkillDirs, shouldPassiveFetch } from './skills-remote.ts';
+import type { Skill } from './skills.ts';
 
 const TTL = 6 * 60 * 60 * 1_000;
 
@@ -41,4 +47,128 @@ describe('isPinnedSha', () => {
     expect(isPinnedSha('b'.repeat(64))).toBe(true);
     expect(isPinnedSha('main')).toBe(false);
   });
+});
+
+describe('materializing a whole imported collection', () => {
+  const saved = process.env.CEZ_HOME;
+  const made: string[] = [];
+  afterEach(() => {
+    if (saved === undefined) delete process.env.CEZ_HOME;
+    else process.env.CEZ_HOME = saved;
+    for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const run = (args: string[], cwd: string): void => { execFileSync('git', args, { cwd, stdio: 'ignore' }); };
+
+  it('writes every team directory skill with its references, and skips the rest', async () => {
+    // A collection's skills delegate to each other, so the run needs the SET on
+    // disk — the selected skill alone is what made the agent report the whole
+    // collection as "not installed". Local skills are already where the agent
+    // looks, so they are untouched.
+    const home = mkdtempSync(join(tmpdir(), 'cez-skills-home-'));
+    const source = mkdtempSync(join(tmpdir(), 'cez-skills-src-'));
+    const repo = mkdtempSync(join(tmpdir(), 'cez-skills-repo-'));
+    made.push(home, source, repo);
+    process.env.CEZ_HOME = home;
+
+    // A skills repo shaped like the real one: SKILL.md plus references/.
+    mkdirSync(join(source, 'skills/om-a/references'), { recursive: true });
+    mkdirSync(join(source, 'skills/om-b'), { recursive: true });
+    writeFileSync(join(source, 'skills/om-a/SKILL.md'), '# A\nStop and run om-b.\n');
+    writeFileSync(join(source, 'skills/om-a/references/rules.md'), '# verdict rules\n');
+    writeFileSync(join(source, 'skills/om-b/SKILL.md'), '# B\n');
+    run(['init', '-q', '-b', 'main'], source);
+    run(['-c', 'user.name=t', '-c', 'user.email=t@l', 'add', '-A'], source);
+    run(['-c', 'user.name=t', '-c', 'user.email=t@l', 'commit', '-q', '-m', 'skills'], source);
+    // The bare clone where `bareDirFor` will look — now under CEZ_HOME.
+    const bare = bareDirFor('acme/skills');
+    mkdirSync(dirname(bare), { recursive: true });
+    execFileSync('git', ['clone', '--bare', '-q', source, bare], { stdio: 'ignore' });
+    run(['init', '-q'], repo);
+
+    const team = (name: string): Skill => ({
+      name,
+      body: '',
+      path: `${name}/SKILL.md`,
+      source: 'team',
+      team: { repo: 'acme/skills', ref: 'main', path: `skills/${name}/SKILL.md`, dir: true },
+    });
+    const local: Skill = { name: 'local-one', body: '', path: '.ai/skills/local-one.md', source: 'ai' };
+
+    const done = await materializeSkillDirs(repo, [team('om-a'), team('om-b'), local]);
+
+    expect(done.sort()).toEqual(['om-a', 'om-b']);
+    // The companion files come too: they are what the skill delegates its
+    // actual mechanics to, and their absence is what read as "not installed".
+    expect(readFileSync(join(repo, '.claude/skills/om-a/references/rules.md'), 'utf8')).toContain('verdict rules');
+    expect(existsSync(join(repo, '.claude/skills/om-b/SKILL.md'))).toBe(true);
+    // A non-team skill is not a directory in a bare clone; nothing is invented.
+    expect(existsSync(join(repo, '.claude/skills/local-one'))).toBe(false);
+
+    // Every session start now calls this — a Continue included — so a second
+    // call must leave what is there: a task keeps the skill versions it began
+    // with, and does not pay to rewrite identical files each turn.
+    writeFileSync(join(repo, '.claude/skills/om-a/SKILL.md'), '# A, as this task started with it\n');
+    const again = await materializeSkillDirs(repo, [team('om-a'), team('om-b')], { skipExisting: true });
+    expect(again).toEqual([]);
+    expect(readFileSync(join(repo, '.claude/skills/om-a/SKILL.md'), 'utf8')).toContain('as this task started');
+  }, 20_000)
+})
+
+describe('excluding materialized skills from git', () => {
+  it('keeps EVERY pattern when many skills are materialized at once', async () => {
+    // `materializeSkillDirs` runs eight skills concurrently and each ends in a
+    // read-modify-write of the shared `info/exclude`. Unserialized, the last
+    // writer won and the rest were lost — and an unexcluded
+    // `.claude/skills/<name>/` then showed up as the task's own change, in the
+    // diff and in autosave commits.
+    const { excludeFromGit } = await import('./skills-remote.ts');
+    const repo = mkdtempSync(join(tmpdir(), 'cez-exclude-race-'));
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: repo });
+      const patterns = Array.from({ length: 24 }, (_, i) => `.claude/skills/om-${i}/`);
+      await Promise.all(patterns.map((p) => excludeFromGit(repo, p)));
+      const lines = readFileSync(join(repo, '.git/info/exclude'), 'utf8').split('\n');
+      for (const pattern of patterns) expect(lines, pattern).toContain(pattern);
+      // And none twice: the lock serializes, the membership check dedupes.
+      expect(lines.filter((l) => l.startsWith('.claude/skills/')).length).toBe(patterns.length);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the passive background skills load', () => {
+  it('does not keep a finished process alive while its clone is still running', () => {
+    // A headless `cezar run` finished its task in 2s and then sat for 60 more:
+    // the background clone of the skills repo held the event loop until its
+    // timeout — and on a slow link that clone never completes inside it, so it
+    // happened on every run without a warm cache. A fake `git` that hangs
+    // stands in for that clone; the process must exit anyway.
+    const dir = mkdtempSync(join(tmpdir(), 'cez-bg-clone-'));
+    try {
+      const bin = join(dir, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'git'), '#!/bin/sh\nsleep 20\nexit 1\n', { mode: 0o755 });
+      const repo = join(dir, 'repo');
+      mkdirSync(repo);
+      const script = join(dir, 'probe.mts');
+      writeFileSync(script, [
+        `import { getTeamSkillsCached } from ${JSON.stringify(fileURLToPath(new URL('./skills-remote.ts', import.meta.url)))};`,
+        `getTeamSkillsCached(${JSON.stringify(repo)});`,
+      ].join('\n'));
+      const started = Date.now();
+      execFileSync(process.execPath, ['--import', 'tsx', script], {
+        // Run from this package so `--import tsx` resolves its own devDependency.
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CEZ_HOME: join(dir, 'home') },
+        stdio: 'ignore',
+        timeout: 30_000,
+      });
+      // Well under the fake clone's 20s: nothing waited on it.
+      expect(Date.now() - started).toBeLessThan(8_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
 });

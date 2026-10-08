@@ -12,6 +12,7 @@ import {
   NotebookPenIcon,
   PaletteIcon,
   TicketIcon,
+  ShieldIcon,
 } from 'lucide-react'
 import type { ComponentType, SVGProps } from 'react'
 
@@ -22,6 +23,8 @@ import { AgentConfigSection } from './agent-config-section'
 import { AgentsSection } from './agents-section'
 import { AppearanceSection } from './appearance'
 import { BookmarkletsSection } from './bookmarklets-section'
+import { IsolationDefaultsSection } from './isolation-defaults-section'
+import { IsolationSection } from './isolation-section'
 import { NotificationsSection } from './notifications-section'
 import { ProjectsSection } from './projects-section'
 import { PromptTemplatesSection } from './prompt-templates-section'
@@ -52,6 +55,8 @@ export type SettingsSectionId =
   | 'accounts'
   | 'agents'
   | 'agent-config'
+  | 'isolation'
+  | 'isolation-defaults'
   | 'resources'
   | 'worktrees'
   | 'projects'
@@ -119,6 +124,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     scope: 'project',
   },
   {
+    id: 'isolation',
+    title: 'Isolation',
+    description: 'Run this project’s agents in a container instead of on this machine.',
+    icon: ShieldIcon,
+    component: IsolationSection,
+    scope: 'project',
+  },
+  {
     id: 'worktrees',
     title: 'Worktrees',
     description: 'How many finished task worktrees this project keeps on disk.',
@@ -165,6 +178,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     description: 'Parallel tasks and per-task memory limit, across every project.',
     icon: GaugeIcon,
     component: ResourcesSection,
+    scope: 'global',
+  },
+  {
+    id: 'isolation-defaults',
+    title: 'Isolation defaults',
+    description: 'What a project inherits when it has not configured isolation itself.',
+    icon: ShieldIcon,
+    component: IsolationDefaultsSection,
     scope: 'global',
   },
   {

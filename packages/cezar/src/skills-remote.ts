@@ -53,14 +53,38 @@ const GIT_HARDENING_ENV = {
   GIT_TERMINAL_PROMPT: '0',
 };
 
-function git(args: string[], timeoutMs: number, cwd?: string): Promise<GitResult> {
+/** Stdio pipes are `net.Socket`s at runtime, typed as plain streams. */
+function unrefPipe(pipe: unknown): void {
+  (pipe as { unref?: () => void } | null)?.unref?.();
+}
+
+function git(
+  args: string[],
+  timeoutMs: number,
+  cwd?: string,
+  /**
+   * Best-effort work nobody is waiting on. Such a child must not keep the
+   * process alive: a headless `cezar run` finished its task in 2s and then sat
+   * for 60 more while a background clone of the skills repo ran into its
+   * timeout — every run, on any machine without a warm cache, because that
+   * clone takes longer than 60s on a slow link and so never completes. Unref'd,
+   * the CLI exits when its work is done; an orphaned clone runs to completion
+   * and warms the cache for next time. In the long-lived server nothing changes:
+   * the process stays up and the timeout still applies.
+   */
+  opts: { background?: boolean } = {},
+): Promise<GitResult> {
   return new Promise((resolve) => {
-    execFile(
+    const child = execFile(
       'git',
       [...GIT_HARDENING_ARGS, ...args],
       {
         cwd,
-        timeout: timeoutMs,
+        // In the background the timeout is ours (below): execFile's own is a
+        // REF'd kill timer, which kept the process alive exactly as long as the
+        // timeout even after the child itself was unref'd — measured as the
+        // CLI exiting at 60.6s, the instant the 60s clone timeout fired.
+        timeout: opts.background ? 0 : timeoutMs,
         killSignal: 'SIGKILL',
         maxBuffer: 16 * 1024 * 1024,
         encoding: 'utf8',
@@ -68,6 +92,16 @@ function git(args: string[], timeoutMs: number, cwd?: string): Promise<GitResult
       },
       (err, stdout, stderr) => resolve({ ok: !err, stdout: stdout ?? '', stderr: stderr ?? '' }),
     );
+    if (opts.background) {
+      // The child AND its pipes: an unref'd child with ref'd stdio pipes still
+      // holds the event loop open.
+      child.unref();
+      for (const pipe of [child.stdin, child.stdout, child.stderr]) unrefPipe(pipe);
+      // The same timeout while this process is alive, without holding it open.
+      const kill = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+      kill.unref();
+      child.once('exit', () => clearTimeout(kill));
+    }
   });
 }
 
@@ -143,8 +177,15 @@ export function isPinnedSha(ref: string): boolean {
   return /^[0-9a-f]{40}$/i.test(ref) || /^[0-9a-f]{64}$/i.test(ref);
 }
 
-/** Stable cache directory name: the last two path segments, `owner__name`. */
-export function bareDirFor(repo: string): string {
+/**
+ * Stable cache directory name: the last two path segments, `owner__name`.
+ *
+ * Under `CEZ_HOME` when it is set — the same rule every other piece of cezar
+ * state follows, and what lets a test exercise the real clone-and-extract path
+ * without seeding a bare repo into the developer's actual `~/.cache`. Unset
+ * (the normal case) keeps the existing location exactly, so nothing re-clones.
+ */
+export function bareDirFor(repo: string, env: NodeJS.ProcessEnv = process.env): string {
   const trimmed = repo
     .replace(/\/+$/, '')
     .replace(/\.git$/, '')
@@ -152,7 +193,8 @@ export function bareDirFor(repo: string): string {
     .replace(/^~\//, '');
   const segments = trimmed.split(/[/:]/).filter(Boolean).map(sanitizeSegment);
   const key = segments.slice(-2).join('__') || 'skills';
-  return join(homedir(), '.cache', 'cez', 'skills', key);
+  const base = env.CEZ_HOME || undefined;
+  return base ? join(base, 'cache', 'skills', key) : join(homedir(), '.cache', 'cez', 'skills', key);
 }
 
 function sanitizeSegment(s: string): string {
@@ -173,7 +215,10 @@ function warnUnsafeRemoteOnce(repo: string): void {
 }
 
 /** Clone the skills repo bare (no checkout) into the global cache, once. */
-export async function ensureBareClone(repo: string): Promise<{ bareDir: string; created: boolean }> {
+export async function ensureBareClone(
+  repo: string,
+  opts: { background?: boolean } = {},
+): Promise<{ bareDir: string; created: boolean }> {
   // Validate before anything else, cache hit or not: "this source is refusable"
   // should never depend on whether a clone happens to exist already.
   const remote = safeRemoteFor(repo);
@@ -189,17 +234,18 @@ export async function ensureBareClone(repo: string): Promise<{ bareDir: string; 
   await mkdir(dirname(bareDir), { recursive: true });
   // `--` separates options from the remote/dir operands: even a value that
   // slipped past validation can't pose as a git option.
-  const res = await git(['clone', '--bare', '--', remote, bareDir], CLONE_TIMEOUT_MS);
+  const res = await git(['clone', '--bare', '--', remote, bareDir], CLONE_TIMEOUT_MS, undefined, opts);
   if (!res.ok) throw new Error(`git clone --bare ${remote} failed: ${res.stderr.trim()}`);
   return { bareDir, created: true };
 }
 
 /** "Refresh" — update every branch head in the bare clone from origin. */
-export async function fetchAll(bareDir: string): Promise<void> {
+export async function fetchAll(bareDir: string, opts: { background?: boolean } = {}): Promise<void> {
   const res = await git(
     ['fetch', 'origin', '--prune', '+refs/heads/*:refs/heads/*'],
     CLONE_TIMEOUT_MS,
     bareDir,
+    opts,
   );
   if (!res.ok) throw new Error(`git fetch failed: ${res.stderr.trim() || res.stdout.trim()}`);
 }
@@ -333,6 +379,28 @@ export async function listRemoteSkills(src: SkillsRepoSource): Promise<Skill[]> 
 
 // ---- materialization (directory skills) ---------------------------------------
 
+/** How many `git show` calls run at once. Bounded so a big collection cannot
+ *  fork a few hundred processes at the same instant. */
+const EXTRACT_CONCURRENCY = 16;
+
+/** Map with a bounded number of in-flight operations, preserving input order. */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      out[index] = await fn(items[index] as T);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 /**
  * Copy a directory skill (SKILL.md + references/…) out of the bare clone into
  * `<repoRoot>/.claude/skills/<name>/` so claude sees the references on disk,
@@ -350,25 +418,91 @@ export async function materializeSkillDir(repoRoot: string, skill: Skill): Promi
   if (!ls.ok) return false;
 
   const destDir = join(repoRoot, '.claude', 'skills', skill.name);
-  let wrote = 0;
-  for (const file of ls.stdout.split('\n').filter(Boolean)) {
+  const files = ls.stdout.split('\n').filter(Boolean);
+  // One `git show` per file, in a bounded pool. Serially this is the whole cost
+  // of materializing: each file is a subprocess, and a collection of ~40 skills
+  // is ~300 of them — measured at 4s, which is not a price a run can pay at
+  // every start. The pool puts the same work under a second.
+  const written = await mapWithConcurrency(files, EXTRACT_CONCURRENCY, async (file) => {
     const rel = file.slice(srcDir.length + 1);
     // git paths are repo-relative and normalized, but never trust them blindly.
-    if (!rel || rel.split('/').includes('..')) continue;
+    if (!rel || rel.split('/').includes('..')) return false;
     const show = await git(['show', `${ref}:${file}`], LIST_TIMEOUT_MS, bareDir);
-    if (!show.ok) continue;
+    if (!show.ok) return false;
     const target = join(destDir, rel);
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, show.stdout, 'utf8');
-    wrote++;
-  }
+    return true;
+  });
+  const wrote = written.filter(Boolean).length;
   if (wrote === 0) return false;
   await excludeFromGit(repoRoot, `.claude/skills/${skill.name}/`);
   return true;
 }
 
+/**
+ * Materialize a whole set of directory skills, skills in parallel as well as
+ * files.
+ *
+ * Answers the names that landed. Used to put an entire imported collection on
+ * disk for a run that selects ONE of its skills: these collections delegate to
+ * each other constantly — `om-code-review` stops and names
+ * `om-setup-agent-pipeline`, `om-auto-review-pr` is a wrapper around
+ * `om-code-review` — and materializing only the selected skill left the agent
+ * reporting the whole collection as "not installed" on a machine where every
+ * one of them was imported.
+ *
+ * Measured on the open-mercato collection: 37 skills, 300 files. Serial and
+ * file-at-a-time it took 4.0s; with both levels pooled it is well under a
+ * second, which is what makes "materialize the collection" affordable at all.
+ */
+export async function materializeSkillDirs(
+  repoRoot: string,
+  skills: readonly Skill[],
+  opts: {
+    /**
+     * Leave a skill whose SKILL.md is already there. A task keeps the versions
+     * it started with, and a Continue does not rewrite ~300 identical files.
+     */
+    skipExisting?: boolean;
+  } = {},
+): Promise<string[]> {
+  const eligible = skills.filter((s) => s.source === 'team' && s.team?.dir)
+    .filter((s) => !opts.skipExisting || !existsSync(join(repoRoot, '.claude', 'skills', s.name, 'SKILL.md')));
+  const done = await mapWithConcurrency(eligible, SKILL_CONCURRENCY, async (skill) =>
+    (await materializeSkillDir(repoRoot, skill).catch(() => false)) ? skill.name : null);
+  return done.filter((name): name is string => name !== null);
+}
+
+/** How many skills are materialized at once; each also pools its own files. */
+const SKILL_CONCURRENCY = 8;
+
 /** Append a pattern to git's `info/exclude` (idempotent, non-fatal). */
-async function excludeFromGit(repoRoot: string, pattern: string): Promise<void> {
+/**
+ * One chain of pending edits per exclude file.
+ *
+ * `excludeFromGit` is read-modify-write, and `materializeSkillDirs` runs eight
+ * skills at once — each ending in an exclude edit. Unserialized, every caller
+ * read the same file, appended its own line and wrote it back, so the last
+ * writer won and the others' patterns were lost. The unexcluded
+ * `.claude/skills/<name>/` directories then showed up as the TASK's changes: in
+ * the diff, and in autosave commits.
+ *
+ * In-process only, which is the scope of the race: one cockpit materializes a
+ * run's skills. Keyed by the resolved exclude path, because every linked task
+ * worktree shares one.
+ */
+const excludeChains = new Map<string, Promise<unknown>>();
+
+function serializeOn<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const run = (excludeChains.get(key) ?? Promise.resolve()).then(fn, fn);
+  // A failed edit must not wedge every later one behind it.
+  excludeChains.set(key, run.catch(() => undefined));
+  return run;
+}
+
+/** Exported for its race test; callers go through `materializeSkillDir`. */
+export async function excludeFromGit(repoRoot: string, pattern: string): Promise<void> {
   try {
     // Resolve the real exclude file: in a linked worktree (spec 006) `.git`
     // is a file and `info/exclude` lives in the shared common dir — which
@@ -380,15 +514,19 @@ async function excludeFromGit(repoRoot: string, pattern: string): Promise<void> 
     );
     const gitDir = probe.ok && probe.stdout.trim() ? probe.stdout.trim() : join(repoRoot, '.git');
     const excludePath = join(gitDir, 'info', 'exclude');
-    let prev = '';
-    try {
-      prev = await readFile(excludePath, 'utf8');
-    } catch {
-      // no exclude file yet
-    }
-    if (prev.split('\n').includes(pattern)) return;
-    await mkdir(dirname(excludePath), { recursive: true });
-    await writeFile(excludePath, prev + (prev && !prev.endsWith('\n') ? '\n' : '') + pattern + '\n', 'utf8');
+    // The read and the write happen under one lock, so no other edit can land
+    // between them and be overwritten.
+    await serializeOn(excludePath, async () => {
+      let prev = '';
+      try {
+        prev = await readFile(excludePath, 'utf8');
+      } catch {
+        // no exclude file yet
+      }
+      if (prev.split('\n').includes(pattern)) return;
+      await mkdir(dirname(excludePath), { recursive: true });
+      await writeFile(excludePath, prev + (prev && !prev.endsWith('\n') ? '\n' : '') + pattern + '\n', 'utf8');
+    });
   } catch {
     // non-fatal — `.git` might be a linked file (worktree) or absent entirely
   }
@@ -485,10 +623,13 @@ async function loadTeamSkills(repoRoot: string, refresh: boolean): Promise<Skill
         })
       ) {
         cloneAttempted.add(src.repo);
-        const { bareDir, created } = await ensureBareClone(src.repo);
+        // Background: this is the passive load `getTeamSkillsCached` fires and
+        // forgets. Nothing waits on it, so it must not hold the process open.
+        // An explicit Refresh (above) stays in the foreground.
+        const { bareDir, created } = await ensureBareClone(src.repo, { background: true });
         // A clone left by an earlier run is very likely behind origin; fetch it
         // so worktree reviews never read a stale skills template.
-        if (!created) await fetchAll(bareDir);
+        if (!created) await fetchAll(bareDir, { background: true });
         lastFetchByRepo.set(src.repo, Date.now());
       }
     } catch {

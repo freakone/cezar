@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join, resolve, basename, dirname, extname } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { gatedSkillsRepos } from './config.ts';
-import { getTeamSkillsCached } from './skills-remote.ts';
+import { getTeamSkillsCached, waitForTeamSkills } from './skills-remote.ts';
 import { readWorkspaceUiState } from './workspace/ui-state.ts';
 import { builtinSkills } from './automations/builtin-skill.ts';
 
@@ -113,6 +113,29 @@ export async function discoverSkills(repoRoot: string): Promise<Skill[]> {
   }
   merged.sort((a, b) => a.name.localeCompare(b.name));
   return merged;
+}
+
+/**
+ * `discoverSkills` for a RUN: the team-skill load settled first, up to `waitMs`.
+ *
+ * `discoverSkills` reads the team skills from memory, and the load that fills that memory only
+ * starts on first access. The catalog can afford that — the cockpit re-reads with `wait=1` — but a
+ * run resolves its step's skill ONCE. So the first task after a cockpit restart that named a team
+ * skill (`om-code-review`) found nothing, ran on the plain prompt, and told the user the skill was
+ * not installed. The wait reads the local bare clone, normally milliseconds; the bound keeps a
+ * first-ever clone on a slow network from holding the run.
+ */
+export async function discoverSkillsForRun(repoRoot: string, waitMs = 15_000): Promise<Skill[]> {
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([
+    waitForTeamSkills(repoRoot).catch(() => []),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, waitMs);
+      timer.unref?.();
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return discoverSkills(repoRoot);
 }
 
 /**
