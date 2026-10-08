@@ -221,3 +221,48 @@ describe('pushing a credential change to running containers after a save', () =>
     expect(seen).toEqual(['d', 'c']);
   });
 });
+
+describe('a stopped podman VM', () => {
+  /** A fake podman whose `machine list` answers `running`, and whose `machine start` exits `startCode`. */
+  function machinePodman(running: boolean, startCode = 0): { bin: string; calls: () => string[] } {
+    const dir = mkdtempSync(join(tmpdir(), 'cez-fake-machine-'));
+    const bin = join(dir, 'podman');
+    const log = join(dir, 'calls.log');
+    writeFileSync(bin, `#!/bin/sh
+echo "$*" >> "${log}"
+if [ "$1" = machine ] && [ "$2" = list ]; then echo '[{"Name":"podman-machine-default","Running":${running}}]'; exit 0; fi
+if [ "$1" = machine ] && [ "$2" = start ]; then sleep 0.2; [ ${startCode} = 0 ] || echo "VM is broken" >&2; exit ${startCode}; fi
+exit 0
+`, { mode: 0o755 });
+    return { bin, calls: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []) };
+  }
+
+  it('is started, so a task that asked for isolation gets it instead of running on the host', async () => {
+    const { ensurePodmanMachine } = await import('./podman-lifecycle.ts');
+    const podman = machinePodman(false);
+    expect(await ensurePodmanMachine(podman.bin, 'darwin')).toBe('podman-machine-default');
+    expect(podman.calls()).toContain('machine start podman-machine-default');
+  });
+
+  it('is started once for tasks that launch together', async () => {
+    const { ensurePodmanMachine } = await import('./podman-lifecycle.ts');
+    const podman = machinePodman(false);
+    await Promise.all([ensurePodmanMachine(podman.bin, 'darwin'), ensurePodmanMachine(podman.bin, 'darwin')]);
+    expect(podman.calls().filter((c) => c.startsWith('machine start'))).toHaveLength(1);
+  });
+
+  it('leaves a running VM alone, and Linux has none to start', async () => {
+    const { ensurePodmanMachine } = await import('./podman-lifecycle.ts');
+    const podman = machinePodman(true);
+    expect(await ensurePodmanMachine(podman.bin, 'darwin')).toBeUndefined();
+    expect(podman.calls().some((c) => c.startsWith('machine start'))).toBe(false);
+    expect(await ensurePodmanMachine(podman.bin, 'linux')).toBeUndefined();
+  });
+
+  it('says so in podman’s own words when the VM cannot be started', async () => {
+    const { ensurePodmanMachine, PodmanUnavailable } = await import('./podman-lifecycle.ts');
+    const failing = ensurePodmanMachine(machinePodman(false, 1).bin, 'darwin');
+    await expect(failing).rejects.toBeInstanceOf(PodmanUnavailable);
+    await expect(failing).rejects.toThrow(/podman-machine-default.*could not be started.*VM is broken/);
+  });
+});

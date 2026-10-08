@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { BASE_IMAGE_TAG, agentClaudeHome, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import { agentKimiHome, kimiHome } from './kimi-home.ts';
 import type { SandboxConfig } from '../config.ts';
+import { parseMachines } from './container-probe.ts';
 import {
   credentialCopyPlan,
   resolvePassthrough,
@@ -194,6 +195,7 @@ export async function startTaskContainer(
   bin = 'podman',
 ): Promise<TaskContainer> {
   const name = taskContainerName(runId);
+  const startedMachine = await ensurePodmanMachine(bin);
   const running = await run(bin, ['container', 'exists', name]).then(() => true).catch(() => false);
   if (running) {
     // A stopped container from an earlier turn still has to be woken.
@@ -209,7 +211,7 @@ export async function startTaskContainer(
     // this way — they are fixed at creation — which is the practical argument
     // for copying anything that does not have to be live.
     await applyCredentials(name, resolvePassthrough(cfg.credentials), bin);
-    return { name, publishedPort: await publishedPortOf(name, bin) };
+    return { name, publishedPort: await publishedPortOf(name, bin), ...(startedMachine ? { startedMachine } : {}) };
   }
   // Allocated BEFORE the container exists, because publishing is a
   // creation-time property: an HTTP-speaking backend that discovers it needs a
@@ -235,7 +237,7 @@ export async function startTaskContainer(
   // that refused to start.
   if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
   await applyCredentials(name, credentials, bin);
-  return { name, publishedPort: publishPort };
+  return { name, publishedPort: publishPort, ...(startedMachine ? { startedMachine } : {}) };
 }
 
 /**
@@ -468,7 +470,51 @@ export interface TaskContainer {
   name: string;
   /** Host port forwarded to the same port inside, for HTTP-speaking backends. */
   publishedPort?: number;
+  /** Set when cezar had to start the stopped podman VM first — worth a line on the task. */
+  startedMachine?: string;
 }
+
+/**
+ * Start the podman VM when it exists and is stopped (macOS/Windows; Linux has none).
+ *
+ * The VM stops on its own sometimes — memory pressure, its helper exiting; one stopped mid-week on
+ * a machine that had not rebooted, with nothing in the system log — and every task asking for
+ * isolation then ran UNISOLATED on the host with "Cannot connect to Podman". The operator turned
+ * isolation on, so a stopped VM is a state to repair, not a reason to drop the guarantee: start
+ * it, bounded, and let the task isolate as asked. One start at a time per process, so tasks
+ * launched together share it. Answers the machine started, or undefined when nothing was needed;
+ * throws `PodmanUnavailable` when it could not be started.
+ */
+export async function ensurePodmanMachine(
+  bin = 'podman',
+  platform: NodeJS.Platform = process.platform,
+): Promise<string | undefined> {
+  if (platform === 'linux') return undefined;
+  if (machineStart) return machineStart;
+  machineStart = (async () => {
+    let machine: { running: boolean; name?: string };
+    try {
+      const { stdout } = await run(bin, ['machine', 'list', '--format', 'json'], { timeout: 10_000 });
+      machine = parseMachines(stdout);
+    } catch {
+      return undefined; // cannot tell — let the container commands report what is wrong
+    }
+    if (machine.running || !machine.name) return undefined;
+    try {
+      await run(bin, ['machine', 'start', machine.name], { timeout: MACHINE_START_TIMEOUT_MS });
+    } catch (err) {
+      const detail = (err as { stderr?: string }).stderr?.trim() || (err instanceof Error ? err.message : String(err));
+      throw new PodmanUnavailable(`podman's VM "${machine.name}" was stopped and could not be started: ${detail}`);
+    }
+    return machine.name;
+  })().finally(() => {
+    machineStart = undefined;
+  });
+  return machineStart;
+}
+
+let machineStart: Promise<string | undefined> | undefined;
+const MACHINE_START_TIMEOUT_MS = 180_000;
 
 /** An unused loopback port, asked of the OS rather than guessed. */
 async function freePort(): Promise<number> {
