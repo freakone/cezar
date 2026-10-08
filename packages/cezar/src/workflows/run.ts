@@ -2803,6 +2803,13 @@ export class RunManager {
     }
     try {
       const container = await startTaskContainer(placed, this.repoRoot, runId);
+      if (container.startedMachine) {
+        this.store.appendEvent(runId, {
+          type: 'note',
+          stepId,
+          message: `podman's VM "${container.startedMachine}" was stopped — cezar started it, and this task runs isolated as asked`,
+        });
+      }
       this.store.updateRun(runId, { isolation: { effective: true, container: container.name } });
       return { sandbox: placed, container };
     } catch (err) {
