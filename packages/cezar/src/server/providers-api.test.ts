@@ -80,10 +80,12 @@ const DISCONNECTED_OUTPUT: Record<ProviderId, string> = {
 };
 
 const providerForExecutable = (executable: string): ProviderId => {
-  if (executable === 'claude' || executable === 'codex' || executable === 'opencode' || executable === 'pi' || executable === 'junie' || executable === 'copilot' || executable === 'kimi') {
+  if (executable === 'claude' || executable === 'codex' || executable === 'opencode' || executable === 'pi' || executable === 'junie' || executable === 'copilot') {
     return executable;
-  if (executable === 'agent') return 'cursor';
   }
+  if (executable === 'agent') return 'cursor';
+  // Kimi resolves to ~/.kimi-code/bin/kimi when that is where it is installed and PATH lacks it.
+  if (executable === 'kimi' || executable.endsWith('/kimi')) return 'kimi';
   throw new Error(`unexpected executable: ${executable}`);
 };
 

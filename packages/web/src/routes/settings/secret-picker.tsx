@@ -187,7 +187,7 @@ function VaultBrowser({
             no way forward. */}
         {mounts.length > 0 ? (
           <select
-            className="rounded border bg-background px-1 py-0.5 text-xs"
+            className="rounded border bg-background px-1 py-0.5 text-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
             value={mount}
             aria-label="Vault mount"
             onChange={(e) => { setMount(e.target.value); setPath(''); setField(null) }}

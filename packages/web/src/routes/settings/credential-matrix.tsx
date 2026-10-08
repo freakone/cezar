@@ -76,7 +76,7 @@ export function CredentialMatrix({
                 <span className={source.present ? '' : 'text-muted-foreground'}>{source.label}</span>
                 {on && picked.length === 0 && source.kind !== 'file' ? (
                   <select
-                    className="rounded border bg-background px-1 py-0.5 text-xs"
+                    className="rounded border bg-background px-1 py-0.5 text-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
                     value={mode}
                     disabled={busy}
                     aria-label={`${source.label} passthrough mode`}
