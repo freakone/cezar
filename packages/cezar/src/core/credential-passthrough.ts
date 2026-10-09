@@ -112,6 +112,18 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
     note: 'gcloud refreshes its OAuth token in place, so a copy goes stale.',
   },
   {
+    id: 'railway',
+    kind: 'dir',
+    label: 'Railway CLI (railway)',
+    hostPath: '.railway',
+    guestPath: '/root/.railway',
+    // A project token (`RAILWAY_TOKEN`) or an account/team token (`RAILWAY_API_TOKEN`) works
+    // without any login on disk — the CI way, and enough on its own when the host exports one.
+    env: ['RAILWAY_TOKEN', 'RAILWAY_API_TOKEN'],
+    defaultMode: 'mount',
+    note: 'railway rewrites config.json on login and on `railway link`; mounted, a login or a link on either side reaches the other — the repo sits at the same path in both, so links resolve.',
+  },
+  {
     id: 'aws',
     kind: 'dir',
     label: 'AWS CLI',

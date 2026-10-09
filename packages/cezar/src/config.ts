@@ -87,7 +87,7 @@ const sandboxSchema = z.object({
   ephemeralPaths: z.array(z.string().trim().min(1)).optional().catch(undefined),
   /**
    * Which of the operator's OTHER credentials the agent may use — gh, gcloud,
-   * AWS, kube, ssh, and anything defined by hand.
+   * AWS, kube, Railway, ssh, and anything defined by hand.
    *
    * Nothing is passed unless named here: an isolated agent starts with no
    * credentials at all, and each one is a deliberate widening. `mode` picks the

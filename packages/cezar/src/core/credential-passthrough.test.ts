@@ -286,3 +286,24 @@ describe('the GitHub CLI in a container', () => {
     expect(await githubTokenEnv(resolved, {}, async () => { throw new Error('ENOENT'); })).toEqual([]);
   });
 });
+
+describe('the Railway CLI in a container', () => {
+  it('mounts ~/.railway by default, so a login or a `railway link` reaches both sides', async () => {
+    const { resolvePassthrough } = await import('./credential-passthrough.ts');
+    const [railway] = resolvePassthrough({ enabled: { railway: true } }, '/home/u', () => true);
+    expect(railway).toMatchObject({
+      id: 'railway',
+      mode: 'mount',
+      hostPath: '/home/u/.railway',
+      guestPath: '/root/.railway',
+      env: ['RAILWAY_TOKEN', 'RAILWAY_API_TOKEN'],
+    });
+  });
+
+  it('forwards an exported project or account token, which needs no login on disk', async () => {
+    const { credentialEnvPairs, resolvePassthrough } = await import('./credential-passthrough.ts');
+    const resolved = resolvePassthrough({ enabled: { railway: true } }, '/home/u', () => false);
+    expect(resolved[0]?.skipped).toMatch(/\.railway does not exist/);
+    expect(credentialEnvPairs(resolved, { RAILWAY_TOKEN: 'proj-token' })).toEqual(['RAILWAY_TOKEN=proj-token']);
+  });
+});

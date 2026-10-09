@@ -26,6 +26,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # node:22 satisfies; its npm build is the same program as the native installer's.
 RUN npm install -g @anthropic-ai/claude-code @moonshot-ai/kimi-code
 
+# CLIs an agent reaches for once their credential is passed through (Settings →
+# Isolation): without the binary in the image, a ticked credential has nothing to
+# authenticate. `gh` is installed above from its own apt repo.
+RUN npm install -g @railway/cli
+
 # The image is the version pin: an agent that updates itself inside a
 # per-task container would re-download on every task and drift from it.
 ENV KIMI_CODE_NO_AUTO_UPDATE=1

@@ -134,7 +134,7 @@ than the image.
 ### Credentials
 
 Isolation with no credentials is useless; with all of them it is pointless. So the dial is per
-credential: a catalog (gh, git, ssh, gcloud, AWS, kube, registries, npm, PyPI) plus custom entries,
+credential: a catalog (gh, git, ssh, gcloud, AWS, kube, Railway, registries, npm, PyPI) plus custom entries,
 each on/off and each **mount** or **copy**.
 
 - **mount** — the container reads the live file. Required for anything the tool refreshes in place;
