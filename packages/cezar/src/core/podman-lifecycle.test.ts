@@ -266,3 +266,62 @@ exit 0
     await expect(failing).rejects.toThrow(/podman-machine-default.*could not be started.*VM is broken/);
   });
 });
+
+describe('a credential mounted after the task container started', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'cez-remount-repo-'));
+  const home = mkdtempSync(join(tmpdir(), 'cez-remount-home-'));
+  const cfg = {
+    enabled: true, provider: 'podman', name: 'app', agent: 'shell', createIfMissing: true,
+    tmpdir: '/tmp/cez-agent', unsetPlaceholderCredentials: true, containerfile: '.ai/cezar/Containerfile',
+    claudeCredentialPassthrough: false, resources: { shmSize: '1g' },
+    credentials: { enabled: { railway: true } },
+  } as unknown as SandboxConfig;
+
+  /** A fake podman: the task container exists, `inspect` lists the guest paths in `mounts`. */
+  function existingContainer(mounts: string[]): { bin: string; calls: () => string[] } {
+    const dir = mkdtempSync(join(tmpdir(), 'cez-fake-remount-'));
+    const bin = join(dir, 'podman');
+    const log = join(dir, 'calls.log');
+    writeFileSync(join(dir, 'mounts'), mounts.join('\n') + '\n');
+    writeFileSync(bin, `#!/bin/sh
+echo "$*" >> "${log}"
+case "$1 $2" in
+  "machine list") echo '[{"Name":"m","Running":true}]'; exit 0;;
+  "container exists") exit 0;;
+  "image exists") exit 0;;
+esac
+if [ "$1" = inspect ]; then cat "${dir}/mounts"; exit 0; fi
+if [ "$1" = port ]; then exit 1; fi
+exit 0
+`, { mode: 0o755 });
+    return { bin, calls: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []) };
+  }
+
+  it('recreates the container to mount it, between turns', async () => {
+    const { startTaskContainer, wantedMounts } = await import('./podman-lifecycle.ts');
+    const savedHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const { mkdirSync } = await import('node:fs');
+      mkdirSync(join(home, '.railway'), { recursive: true });
+      const wanted = wantedMounts(cfg, repo, 'cez-run12345');
+      expect(wanted).toContain('/root/.railway');
+      const podman = existingContainer(wanted.filter((m) => m !== '/root/.railway'));
+      const container = await startTaskContainer(cfg, repo, 'run12345-0000', podman.bin);
+      expect(container.remounted).toEqual(['/root/.railway']);
+      const calls = podman.calls();
+      expect(calls).toContain('rm -f -v cez-run12345');
+      expect(calls.some((c) => c.startsWith('run --detach --name cez-run12345'))).toBe(true);
+    } finally {
+      process.env.HOME = savedHome;
+    }
+  });
+
+  it('reuses a container that already has every mount it should', async () => {
+    const { startTaskContainer, wantedMounts } = await import('./podman-lifecycle.ts');
+    const podman = existingContainer(wantedMounts(cfg, repo, 'cez-run67890'));
+    const container = await startTaskContainer(cfg, repo, 'run67890-0000', podman.bin);
+    expect(container.remounted).toBeUndefined();
+    expect(podman.calls().some((c) => c.startsWith('rm '))).toBe(false);
+  });
+});

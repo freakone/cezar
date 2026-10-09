@@ -196,7 +196,22 @@ export async function startTaskContainer(
 ): Promise<TaskContainer> {
   const name = taskContainerName(runId);
   const startedMachine = await ensurePodmanMachine(bin);
-  const running = await run(bin, ['container', 'exists', name]).then(() => true).catch(() => false);
+  let running = await run(bin, ['container', 'exists', name]).then(() => true).catch(() => false);
+  // A mount is fixed when a container is created, so a credential ticked in mount mode during a
+  // task (Railway, gcloud…) never reached it: the agent reported the CLI logged out while
+  // Settings said it was passed through. This runs between turns, with no agent process inside,
+  // and everything a task needs to continue lives on the host — the worktree and the agent's
+  // conversation are both bind mounts — so the container is recreated with the mounts it lacks.
+  // What goes is container-only state: a background server, a package installed outside the repo.
+  let remounted: string[] | undefined;
+  if (running) {
+    const missing = await missingMounts(name, wantedMounts(cfg, repoRoot, name), bin);
+    if (missing.length > 0) {
+      await run(bin, ['rm', '-f', '-v', name]).catch(() => undefined);
+      running = false;
+      remounted = missing;
+    }
+  }
   if (running) {
     // A stopped container from an earlier turn still has to be woken.
     await run(bin, ['start', name]).catch(() => undefined);
@@ -237,7 +252,45 @@ export async function startTaskContainer(
   // that refused to start.
   if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
   await applyCredentials(name, credentials, bin);
-  return { name, publishedPort: publishPort, ...(startedMachine ? { startedMachine } : {}) };
+  return {
+    name,
+    publishedPort: publishPort,
+    ...(startedMachine ? { startedMachine } : {}),
+    ...(remounted ? { remounted } : {}),
+  };
+}
+
+/**
+ * The guest paths this task's container should have mounted, read off the very argv that would
+ * create it — so this cannot drift from `podmanRunArgs`. Bind mounts and named volumes only:
+ * anonymous volumes (`ephemeralPaths`) are per-container scratch, not something a task can lack.
+ */
+export function wantedMounts(cfg: SandboxConfig, repoRoot: string, name: string): string[] {
+  const args = podmanRunArgs(cfg, name, repoRoot, {
+    credentialPassthrough: cfg.claudeCredentialPassthrough,
+    credentials: resolvePassthrough(cfg.credentials),
+    hasContainerfile: existsSync(join(repoRoot, cfg.containerfile)),
+  });
+  const targets: string[] = [];
+  args.forEach((arg, i) => {
+    if (args[i - 1] !== '-v') return;
+    const parts = arg.split(':');
+    if (parts.length >= 2 && parts[1]) targets.push(parts[1]);
+  });
+  return targets;
+}
+
+/** Wanted guest paths the container does not have mounted. Unreadable answers none — never a
+ *  reason to recreate a container on a probe that could not tell. */
+async function missingMounts(name: string, wanted: readonly string[], bin: string): Promise<string[]> {
+  try {
+    const { stdout } = await run(bin, ['inspect', name, '--format', '{{range .Mounts}}{{.Destination}}\n{{end}}']);
+    const have = new Set(stdout.split('\n').map((line) => line.trim()).filter(Boolean));
+    if (have.size === 0) return [];
+    return wanted.filter((target) => !have.has(target));
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -472,6 +525,8 @@ export interface TaskContainer {
   publishedPort?: number;
   /** Set when cezar had to start the stopped podman VM first — worth a line on the task. */
   startedMachine?: string;
+  /** Guest paths a running task's container lacked, so it was recreated to mount them. */
+  remounted?: string[];
 }
 
 /**

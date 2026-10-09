@@ -3114,6 +3114,15 @@ export class RunManager {
     }
     try {
       const container = await startTaskContainer(placed, this.repoRoot, runId);
+      if (container.remounted) {
+        this.store.appendEvent(runId, {
+          type: 'note',
+          stepId,
+          message: `this task's container was recreated to mount what was passed through after it started `
+            + `(${container.remounted.join(', ')}). The worktree and the conversation are intact; anything that `
+            + `lived only inside the old container — a background server, a package installed outside the repo — is gone.`,
+        });
+      }
       if (container.startedMachine) {
         this.store.appendEvent(runId, {
           type: 'note',
