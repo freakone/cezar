@@ -1,5 +1,5 @@
 import { KeyRoundIcon, ChevronRightIcon, FolderIcon, Trash2Icon } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { useVaultBrowse, useVaultStatus } from '@/api/queries'
 import { Button } from '@/components/ui/button'
@@ -24,6 +24,40 @@ export interface SecretEntry {
   env?: string[]
   valueFrom?: string
   required?: boolean
+}
+
+/** The longest id the settings routes have always accepted for a custom credential. */
+const SECRET_ID_MAX = 64
+
+/**
+ * The id a picked field is saved under.
+ *
+ * Readable — `<mount>/<path>#<field>` — when it fits, so an existing entry
+ * keeps the id it was saved with and re-picking it still edits rather than
+ * duplicates. A deep Vault path does not fit the 64 characters the settings
+ * routes cap an id at, and the machine-wide PUT answered such a pick with a
+ * 400; past the cap the id is a short stable hash of the full reference
+ * instead. Only the id shortens: `valueFrom` always carries the whole
+ * reference, and the id is never parsed — it only names the row.
+ */
+export function secretIdFor(mount: string, path: string, field: string): string {
+  const readable = `${mount}/${path}#${field}`
+  if (readable.length <= SECRET_ID_MAX) return readable
+  return `vault-${fnv1a64(`vault://${readable}`).slice(0, 12)}`
+}
+
+/**
+ * FNV-1a, 64-bit, as hex. Synchronous on purpose: `crypto.subtle` is async and
+ * exists only in a secure context, and this is an id, not a security boundary —
+ * stable and well-spread is all it has to be.
+ */
+function fnv1a64(text: string): string {
+  let hash = 0xcbf29ce484222325n
+  for (const byte of new TextEncoder().encode(text)) {
+    hash ^= BigInt(byte)
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn
+  }
+  return hash.toString(16).padStart(16, '0')
 }
 
 export function SecretPicker({
@@ -146,6 +180,9 @@ export function SecretPicker({
   )
 }
 
+/** How long the typed mount must sit still before it is browsed. */
+const MOUNT_DEBOUNCE_MS = 400
+
 /** Browse one mount a level at a time, then pick a field. */
 function VaultBrowser({
   mounts,
@@ -162,10 +199,28 @@ function VaultBrowser({
   onCancel: () => void
 }) {
   const [mount, setMount] = useState(mounts[0] ?? '')
+  // What the operator is TYPING into the mount box, committed to `mount` (and
+  // so to a browse) only once they pause, press Enter or leave the field.
+  // Every browse is a `vault` process on the host; keyed straight off the
+  // input, typing `secret` spawned six of them, five for mounts nobody meant.
+  const [mountDraft, setMountDraft] = useState(mount)
   const [path, setPath] = useState('')
   const [field, setField] = useState<string | null>(null)
   const [envName, setEnvName] = useState('')
   const browse = useVaultBrowse(mount, path)
+
+  const commitMount = (next: string): void => {
+    if (next === mount) return
+    setMount(next)
+    setPath('')
+    setField(null)
+  }
+  useEffect(() => {
+    if (mountDraft === mount) return
+    const timer = setTimeout(() => commitMount(mountDraft), MOUNT_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+    // commitMount reads only `mount`, which is already a dependency.
+  }, [mountDraft, mount])
 
   const segments = path === '' ? [] : path.split('/')
   const entries = browse.data?.entries ?? []
@@ -200,8 +255,10 @@ function VaultBrowser({
             className="h-7 w-32 font-mono text-xs"
             placeholder="mount (e.g. kv)"
             aria-label="Vault mount"
-            value={mount}
-            onChange={(e) => { setMount(e.target.value.trim()); setPath(''); setField(null) }}
+            value={mountDraft}
+            onChange={(e) => setMountDraft(e.target.value.trim())}
+            onBlur={() => commitMount(mountDraft)}
+            onKeyDown={(e) => { if (e.key === 'Enter') commitMount(mountDraft) }}
           />
         )}
         <button
@@ -263,8 +320,13 @@ function VaultBrowser({
           </li>
         ))}
         {/* "Nothing here" and "you are not allowed to look" are different
-            answers, and only one of them is worth acting on. */}
-        {!browse.isPending && entries.length === 0 && fields.length === 0 ? (
+            answers, and only one of them is worth acting on. A REFUSED
+            request (the route's 400 for a name it will not pass to `vault`)
+            is a third: it says nothing about the folder, so it must not read
+            as an empty one. */}
+        {browse.isError ? (
+          <li data-slot="vault-browse-error" className="text-xs text-warning">{browse.error.message}</li>
+        ) : !browse.isPending && entries.length === 0 && fields.length === 0 ? (
           browse.data?.error ? (
             <li data-slot="vault-browse-error" className="text-xs text-warning">{browse.data.error}</li>
           ) : (
@@ -292,7 +354,7 @@ function VaultBrowser({
             data-slot="secret-add"
             disabled={busy || envName.trim() === ''}
             onClick={() => onPick({
-              id: `${mount}/${path}#${field}`,
+              id: secretIdFor(mount, path, field),
               env: [envName.trim()],
               valueFrom: `vault://${mount}/${path}#${field}`,
             })}

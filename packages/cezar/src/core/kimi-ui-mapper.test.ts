@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { UiEvent } from './ui-events.js';
 import {
+  abortKimiTurn,
   createKimiUiState,
   kimiSessionStarted,
   kimiTurnStarted,
@@ -128,5 +129,35 @@ describe('kimi ACP → v2 golden fixture', () => {
         { type: 'turn.completed', turnId: 'turn_1', stopReason: expected },
       ]);
     }
+  });
+
+  it('settles a tool a cancelled turn left running, instead of leaving it spinning', () => {
+    let state = kimiTurnStarted(createKimiUiState()).state;
+    state = mapKimiMessage(
+      { method: 'session/update', params: { update: { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Bash', kind: 'execute' } } },
+      state,
+    ).state;
+    expect(mapKimiMessage({ id: 3, result: { stopReason: 'cancelled' } }, state).events).toEqual([
+      {
+        type: 'item.completed',
+        item: expect.objectContaining({ id: 't1', status: 'failed', error: 'turn ended (cancelled) before the tool finished' }),
+      },
+      { type: 'turn.completed', turnId: 'turn_1', stopReason: 'cancelled' },
+    ]);
+  });
+
+  it('aborts a turn no answer will end: as an error with a message, else with the given reason', () => {
+    let state = kimiTurnStarted(createKimiUiState()).state;
+    state = mapKimiMessage(
+      { method: 'session/update', params: { update: { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Read', kind: 'read' } } },
+      state,
+    ).state;
+    expect(abortKimiTurn(state, 'error', 'kimi acp exited').events).toEqual([
+      { type: 'item.completed', item: expect.objectContaining({ id: 't1', status: 'failed' }) },
+      { type: 'session.error', message: 'kimi acp exited', fatal: false },
+      { type: 'turn.completed', turnId: 'turn_1', stopReason: 'error' },
+    ]);
+    expect(abortKimiTurn(state, 'timeout').events.at(-1)).toEqual({ type: 'turn.completed', turnId: 'turn_1', stopReason: 'timeout' });
+    expect(abortKimiTurn(createKimiUiState(), 'cancelled').events).toEqual([]);
   });
 });

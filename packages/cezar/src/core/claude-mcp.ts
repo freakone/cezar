@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { resolveClaudeBin } from './claude-bin.ts';
 
 /**
  * The user's MCP servers, as `--allowedTools` grants for a headless Claude.
@@ -79,8 +80,10 @@ const listWithClaude: McpLister = (cwd, env) =>
     execFile(
       // Not `resolveClaudeExecutable`: the runner imports THIS module (it reports
       // what sessions saw), so importing it back would be a cycle. Its only other
-      // answer is the dry-run mock, which the guard below never asks.
-      process.env.CEZ_CLAUDE_BIN ?? 'claude',
+      // answer is the dry-run mock, which the guard below never asks. The binary
+      // lookup itself is shared, so a launchd cockpit — whose PATH has no
+      // `~/.local/bin` — finds the same claude the runner does.
+      resolveClaudeBin(),
       ['mcp', 'list'],
       { cwd, env: { ...process.env, ...env }, timeout: LIST_TIMEOUT_MS, maxBuffer: 512 * 1024 },
       (error, stdout) => (error && !stdout ? reject(error) : resolve(String(stdout))),
@@ -112,15 +115,16 @@ export async function claudeMcpGrants(
       discoveries.set(key, { grants, at: now() });
     });
   }
-  let grants = entry.grants;
-  if (entry.pending && entry.at === 0) {
+  const current = entry;
+  let grants = current.grants;
+  if (current.pending && current.at === 0) {
     // Nothing known for this directory yet: worth a short wait, since without it the first task
     // after a restart has no MCP at all. Bounded — a hung `claude mcp list` must not hold a run.
     let timer: NodeJS.Timeout | undefined;
     grants = await Promise.race([
-      entry.pending,
+      current.pending,
       new Promise<string[]>((resolve) => {
-        timer = setTimeout(() => resolve(entry!.grants), opts.waitMs ?? FIRST_WAIT_MS);
+        timer = setTimeout(() => resolve(current.grants), opts.waitMs ?? FIRST_WAIT_MS);
         timer.unref?.();
       }),
     ]);

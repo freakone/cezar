@@ -228,7 +228,7 @@ const agentDefaultsSchema = z
               }).passthrough(),
             ])).optional().catch(undefined),
             custom: salvageArray(z.object({
-              id: z.string().trim().min(1).max(64),
+              id: z.string().trim().min(1).max(512),
               label: z.string().trim().max(120).optional(),
               env: z.array(z.string().trim().min(1).max(128)).max(8).optional(),
               valueFrom: z.string().trim().min(1).max(512).optional(),

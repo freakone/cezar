@@ -1355,12 +1355,6 @@ export async function checkoutProject(input: CheckoutProjectInput): Promise<Regi
 }
 
 /**
- * Create a new project — a fresh git repo, optionally backed by a new private GitHub repo
- * (`POST /api/projects/create`, spec 2026-09-29-create-new-project). Same contract as
- * `checkoutProject`: every non-2xx is a failure whose `{ error }` the dialog shows verbatim, and
- * progress arrives as `checkout-progress` keyed by `input.checkoutId`.
- */
-/**
  * Whether cezar can read Vault right now, and which KV mounts the token sees
  * (`GET /api/vault/status`).
  *
@@ -1376,6 +1370,12 @@ export async function browseVault(mount: string, path: string, opts?: ReadOption
   return unwrap(await cez.api.v1.vault.browse.$get({ query: { mount, path } }, init(opts)), '/vault/browse')
 }
 
+/**
+ * Create a new project — a fresh git repo, optionally backed by a new private GitHub repo
+ * (`POST /api/projects/create`, spec 2026-09-29-create-new-project). Same contract as
+ * `checkoutProject`: every non-2xx is a failure whose `{ error }` the dialog shows verbatim, and
+ * progress arrives as `checkout-progress` keyed by `input.checkoutId`.
+ */
 export async function createProject(input: CreateProjectInput): Promise<RegisterProjectResponse> {
   return unwrap(await cez.api.v1.projects.create.$post({ json: input }), '/projects/create')
 }

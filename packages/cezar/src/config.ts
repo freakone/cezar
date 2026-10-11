@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { z } from 'zod';
@@ -453,19 +454,89 @@ function withMachineDefaults(
 export async function loadConfig(repoRoot: string): Promise<CezConfig> {
   const machine = (await loadWorkspaceConfig()).agentDefaults;
   const repoName = basename(repoRoot);
+  const local = await readLocalGrants(repoRoot);
   let raw: string;
   try {
     raw = await readFile(join(repoRoot, '.ai/cezar', 'config.json'), 'utf8');
   } catch {
-    return configSchema.parse(withMachineDefaults({}, machine, repoName));
+    return configSchema.parse(withMachineDefaults(withLocalGrants({}, local), machine, repoName));
   }
   try {
-    const parsed = configSchema.safeParse(withMachineDefaults(JSON.parse(raw), machine, repoName));
+    const own = JSON.parse(raw) as unknown;
+    const trusted = (await configIsTracked(repoRoot)) ? withoutGrants(own) : own;
+    const parsed = configSchema.safeParse(withMachineDefaults(withLocalGrants(trusted, local), machine, repoName));
     if (parsed.success) return parsed.data;
   } catch {
     // fall through — malformed JSON degrades to the default
   }
-  return configSchema.parse(withMachineDefaults({}, machine, repoName));
+  return configSchema.parse(withMachineDefaults(withLocalGrants({}, local), machine, repoName));
+}
+
+/**
+ * The machine-local file a project's credential GRANTS live in when its `config.json` is
+ * committed. Git-ignored (`DATA_GITIGNORE_ENTRIES`), so nothing in it ever arrives with a clone.
+ */
+export const LOCAL_CONFIG_FILE = 'config.local.json';
+
+/**
+ * Keys of a repo's `sandbox` block that hand the container something of the OPERATOR's: which
+ * credentials it gets, which host paths and secrets (`credentials`), and which volumes it mounts
+ * (`cacheVolumes`, whose key used to be able to name a host path). A committed config.json is
+ * written by whoever committed it — a cloned repo would otherwise grant itself `~/.ssh`, `~/.aws`
+ * or a Vault secret by shipping a file. So a TRACKED config.json may describe its image but not
+ * grant; grants come from an untracked config.json (cezar wrote it here) or `config.local.json`.
+ */
+const GRANT_KEYS = ['credentials', 'cacheVolumes'] as const;
+
+function withoutGrants(raw: unknown): unknown {
+  const own = asRecord(raw);
+  const sandbox = asRecord(own?.sandbox);
+  if (!own || !sandbox) return raw;
+  const kept = { ...sandbox };
+  for (const key of GRANT_KEYS) delete kept[key];
+  return { ...own, sandbox: kept };
+}
+
+async function readLocalGrants(repoRoot: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    return asRecord(asRecord(JSON.parse(await readFile(join(repoRoot, '.ai/cezar', LOCAL_CONFIG_FILE), 'utf8')))?.sandbox);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Lay `config.local.json`'s grants over the repo's — same per-key merge as the machine template. */
+function withLocalGrants(raw: unknown, local: Record<string, unknown> | undefined): unknown {
+  if (!local) return raw;
+  const own = asRecord(raw) ?? {};
+  const grants: Record<string, unknown> = {};
+  for (const key of GRANT_KEYS) if (local[key] !== undefined) grants[key] = local[key];
+  if (Object.keys(grants).length === 0) return raw;
+  return { ...own, sandbox: mergeSandboxTemplate(asRecord(own.sandbox) ?? {}, grants) };
+}
+
+const trackedCache = new Map<string, { tracked: boolean; at: number }>();
+
+/**
+ * Is `.ai/cezar/config.json` tracked by git in `repoRoot`? Cached briefly — `loadConfig` runs
+ * per turn and per request. An unanswerable question (no git, not a repo) answers false: the file
+ * then is this machine's, which is what an untracked file means.
+ */
+export function configIsTracked(repoRoot: string): Promise<boolean> {
+  const cached = trackedCache.get(repoRoot);
+  if (cached && Date.now() - cached.at < 30_000) return Promise.resolve(cached.tracked);
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      ['ls-files', '--error-unmatch', '--', '.ai/cezar/config.json'],
+      { cwd: repoRoot, timeout: 5_000 },
+      (error) => {
+        const tracked = !error;
+        trackedCache.set(repoRoot, { tracked, at: Date.now() });
+        resolve(tracked);
+      },
+    );
+  });
 }
 
 /**

@@ -5,7 +5,6 @@ import { putWorkspaceConfig } from '@/api/client'
 import { queryKeys, useIsolationStatus, useWorkspaceConfig, workspaceQueryKeys } from '@/api/queries'
 import type { SetWorkspaceConfigInput } from '@open-mercato/cezar-api-client'
 import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
 import { toast } from '@/components/ui/toaster'
 import { CredentialMatrix, type Choice } from './credential-matrix'
 import { SecretPicker, type SecretEntry } from './secret-picker'
@@ -61,26 +60,35 @@ export function IsolationDefaultsSection() {
       data-slot="isolation-defaults-section"
       className="mx-auto flex w-full max-w-2xl flex-col gap-7 p-4 md:p-6 md:pb-6"
     >
+      {/* The ONE control for the machine-wide isolation default. It used to
+          exist twice — a three-state select under Resources and a switch here
+          whose "off" wrote null — so flipping this switch off silently erased
+          a deliberate "do not isolate" set over there. Three states, because
+          "no opinion" and a deliberate off are different answers: only the
+          first lets a project's own choice (or the shipped default) decide. */}
       <SettingsField
-        title="Isolate by default"
+        title="Isolate agents by default"
         hint={
           'Applies to a project that has said nothing. A project that chose — either way — is never '
-          + 'overruled, so turning this on does not reach into one that opted out.'
+          + 'overruled, and a single task can still override it in the composer.'
         }
       >
-        <label className="flex items-center gap-2 text-sm">
-          <Switch
-            checked={isolation === true}
-            disabled={save.isPending}
-            aria-label="Isolate by default"
-            onCheckedChange={(next) => save.mutate({ agentDefaults: { isolation: next ? true : null } })}
-          />
-          <span className="text-muted-foreground">
-            {isolation === true
-              ? 'New projects isolate their agents.'
-              : 'New projects run agents on this machine until they say otherwise.'}
-          </span>
-        </label>
+        <select
+          aria-label="Isolate agents by default"
+          data-slot="isolation-default"
+          value={isolation === undefined ? 'unset' : String(isolation)}
+          disabled={save.isPending}
+          onChange={(event) => save.mutate({
+            agentDefaults: {
+              isolation: event.target.value === 'unset' ? null : event.target.value === 'true',
+            },
+          })}
+          className="block w-44 rounded-md border border-input bg-card px-3 py-1.5 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50"
+        >
+          <option value="unset">No opinion (off)</option>
+          <option value="true">Isolate</option>
+          <option value="false">Do not isolate</option>
+        </select>
       </SettingsField>
 
       <SettingsField
@@ -154,7 +162,12 @@ export function IsolationDefaultsSection() {
   )
 }
 
-/** The three container limits, committed on blur so a keystroke is not a write. */
+/**
+ * The three container limits, committed on blur so a keystroke is not a write
+ * — and only when the value actually changed. Tabbing through the fields used
+ * to write all three, and every write invalidates the workspace config and the
+ * isolation status, which re-probes podman and Vault on the host.
+ */
 function ResourceInputs({
   value,
   busy,
@@ -180,7 +193,10 @@ function ResourceInputs({
           onChange={(e) => setMemory(e.target.value)}
           // Empty CLEARS back to "no ceiling" — a blank field cannot mean
           // "leave the old value", or a limit could never be removed.
-          onBlur={() => onChange({ memory: memory.trim() === '' ? null : memory.trim() })}
+          onBlur={() => {
+            const next = memory.trim()
+            if (next !== (value.memory ?? '')) onChange({ memory: next === '' ? null : next })
+          }}
         />
       </label>
       <label className="grid gap-1.5 text-xs text-muted-foreground">
@@ -193,7 +209,8 @@ function ResourceInputs({
           onChange={(e) => setCpus(e.target.value)}
           onBlur={() => {
             const parsed = Number(cpus.trim())
-            onChange({ cpus: cpus.trim() === '' || !Number.isFinite(parsed) || parsed <= 0 ? null : parsed })
+            const next = cpus.trim() === '' || !Number.isFinite(parsed) || parsed <= 0 ? null : parsed
+            if (next !== (value.cpus ?? null)) onChange({ cpus: next })
           }}
         />
       </label>
@@ -205,14 +222,21 @@ function ResourceInputs({
           value={shm}
           disabled={busy}
           onChange={(e) => setShm(e.target.value)}
-          onBlur={() => onChange({ shmSize: shm.trim() === '' ? null : shm.trim() })}
+          onBlur={() => {
+            const next = shm.trim()
+            if (next !== (value.shmSize ?? '')) onChange({ shmSize: next === '' ? null : next })
+          }}
         />
       </label>
     </div>
   )
 }
 
-/** Where this machine's Vault is. Committed on blur, so a keystroke is not a write. */
+/**
+ * Where this machine's Vault is. Committed on blur, so a keystroke is not a
+ * write — and only when it changed: a write re-probes Vault (`vault status`,
+ * `token lookup`, `secrets list`) through the invalidated status query.
+ */
 function VaultAddress({
   address,
   namespace,
@@ -239,7 +263,10 @@ function VaultAddress({
           onChange={(e) => setAddr(e.target.value)}
           // Empty CLEARS, so an address can be removed; a blank field cannot
           // mean "keep the old one" or it could never be unset.
-          onBlur={() => onChange({ address: addr.trim() === '' ? null : addr.trim() })}
+          onBlur={() => {
+            const next = addr.trim()
+            if (next !== address) onChange({ address: next === '' ? null : next })
+          }}
         />
       </label>
       <label className="grid gap-1.5 text-xs text-muted-foreground">
@@ -251,7 +278,10 @@ function VaultAddress({
           value={ns}
           disabled={busy}
           onChange={(e) => setNs(e.target.value)}
-          onBlur={() => onChange({ namespace: ns.trim() === '' ? null : ns.trim() })}
+          onBlur={() => {
+            const next = ns.trim()
+            if (next !== namespace) onChange({ namespace: next === '' ? null : next })
+          }}
         />
       </label>
     </div>

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { homedir } from 'node:os';
-import { agentClaudeHome, imageTag, podmanBuildArgs, podmanExecArgs, podmanRunArgs } from './podman-launcher.ts';
+import { agentClaudeHome, imageTag, podmanBuildArgs, podmanExec, podmanExecArgs, podmanRunArgs } from './podman-launcher.ts';
 import { createLauncher } from './launcher-factory.ts';
 import { localLauncher } from './process-launcher.ts';
 import type { SandboxConfig } from '../config.ts';
@@ -121,17 +121,36 @@ describe('podman launcher', () => {
   });
 
   it('exec keeps stdin open, sets the worktree cwd, and never allocates a pty', () => {
-    const args = podmanExecArgs(cfg(), 'cez-run1', 'claude', ['--verbose'], {
+    const { args, env } = podmanExec(cfg(), 'cez-run1', 'claude', ['--verbose'], {
       cwd: `${REPO}/.ai/cezar/worktrees/abc`,
-      env: { CEZ_TASK_ID: 'abc' },
+      env: { CEZ_TASK_ID: 'abc', STRIPE_KEY: 'sk_live_secret_value' },
     }, '/tmp/cez-agent/p.pid');
     expect(args.slice(0, 4)).toEqual(['exec', '-i', '-w', `${REPO}/.ai/cezar/worktrees/abc`]);
     expect(args).not.toContain('-t');
-    expect(args).toContain('-e');
-    expect(args).toContain('CEZ_TASK_ID=abc');
     expect(args.slice(-3)).toEqual(['cez-podman', 'claude', '--verbose']);
+    // Names on the argv, values in podman's own environment: argv is readable by every local
+    // user through `ps`, and these carry Vault secrets and tokens.
+    expect(args[args.indexOf('CEZ_TASK_ID') - 1]).toBe('-e');
+    expect(env.CEZ_TASK_ID).toBe('abc');
+    expect(args.join(' ')).not.toContain('sk_live_secret_value');
+    expect(env.STRIPE_KEY).toBe('sk_live_secret_value');
     // The TMPDIR fix applies to podman exactly as it did to sbx.
-    expect(args).toContain('TMPDIR=/tmp/cez-agent');
+    expect(env.TMPDIR).toBe('/tmp/cez-agent');
+  });
+
+  it('withholds the host\'s GitHub token unless the GitHub CLI is passed through', () => {
+    const saved = process.env.GH_TOKEN;
+    process.env.GH_TOKEN = 'ghp_host_token_value';
+    try {
+      const off = podmanExec(cfg(), 'c', 'claude', [], { cwd: REPO, env: {} }, '/tmp/p');
+      expect(off.args).not.toContain('GH_TOKEN');
+      expect(off.env.GH_TOKEN).toBeUndefined();
+      const on = podmanExec(cfg({ credentials: { enabled: { 'github-cli': true } } }), 'c', 'claude', [], { cwd: REPO, env: {} }, '/tmp/p');
+      expect(on.env.GH_TOKEN).toBe('ghp_host_token_value');
+    } finally {
+      if (saved === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = saved;
+    }
   });
 
   it('podman without a container falls back to local rather than faking isolation', () => {

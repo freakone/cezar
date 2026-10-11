@@ -106,6 +106,30 @@ export function registerSecretValues(values: Iterable<string>): void {
   }
 }
 
+/**
+ * The strings to scrub for ONE value an operator explicitly marked secret: the value itself and,
+ * for a multi-line one (a PEM key, a service-account JSON), each of its lines — a tool that
+ * prints the file line by line, or wraps it, never reproduces the whole value in one chunk.
+ *
+ * No 12-character floor: that floor exists for the host-env sweep, which guesses at what is a
+ * secret; these were chosen as secrets, and a short password is still a password. Only values
+ * too short to be anything but noise (< 4 characters) are skipped, since scrubbing "ab" would
+ * shred every transcript.
+ */
+export function secretFragments(value: string): string[] {
+  const out = new Set<string>();
+  if (value.length >= MIN_CHOSEN_SECRET_LEN) out.add(value);
+  if (value.includes('\n')) {
+    for (const line of value.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.length >= MIN_CHOSEN_SECRET_LEN && !/^-----(BEGIN|END) /.test(trimmed)) out.add(trimmed);
+    }
+  }
+  return [...out];
+}
+
+const MIN_CHOSEN_SECRET_LEN = 4;
+
 /** Everything registered so far, longest first so overlaps scrub completely. */
 export function registeredSecretValues(): string[] {
   return [...fetchedSecrets].sort((a, b) => b.length - a.length);

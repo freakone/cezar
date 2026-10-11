@@ -88,13 +88,44 @@ export function parseVaultRef(value: string): VaultRef | null {
   const mount = location.slice(0, slash);
   const path = location.slice(slash + 1);
   // No traversal, no flag smuggling, no empty segments.
-  for (const part of [mount, field]) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part)) return null;
-  }
-  if (!/^[A-Za-z0-9][A-Za-z0-9._\-/]*$/.test(path) || path.includes('//') || path.split('/').includes('..')) {
-    return null;
-  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(mount)) return null;
+  if (!isVaultKvPath(path) || !isVaultFieldName(field)) return null;
   return { mount, path, field };
+}
+
+/**
+ * The characters a KV path segment or field name may carry: letters and digits
+ * in any script, plus the punctuation real Vault paths use (spaces, `_`, `@`,
+ * `.`, `-`, `+`, `=`, `,`, `:`, `~`). Vault itself allows more, but this is
+ * what the picker can round-trip through a `vault://mount/path#field`
+ * reference — so `#` (the field separator), `/` within a segment, `%`, `?`,
+ * `\`, and every control character (NUL, newline) stay out.
+ *
+ * Mirrored by `vaultBrowseQuerySchema` in packages/contract/src/isolation.ts:
+ * a path the picker may browse must be one this module can fetch, or picking
+ * it would save a reference the task then refuses. vault-browse.test.ts pins
+ * the two against one table.
+ */
+const VAULT_NAME = /^[\p{L}\p{N}\p{M} ._@+=,:~-]+$/u;
+
+/** Longest path (or field) accepted — bounded so it is never unbounded input to a spawn. */
+export const VAULT_PATH_MAX = 512;
+
+/**
+ * A KV path cezar will hand to `vault`: non-empty `/`-separated segments of
+ * `VAULT_NAME` characters, no `.`/`..` segment, and no leading `-` — the path
+ * is ONE argv entry (`execFile`, no shell), so the only way it could be read
+ * as anything but a path is as a flag.
+ */
+export function isVaultKvPath(path: string): boolean {
+  if (path === '' || path.length > VAULT_PATH_MAX || path.startsWith('-')) return false;
+  return path.split('/').every((segment) => segment !== '.' && segment !== '..' && VAULT_NAME.test(segment));
+}
+
+/** A field name: one `VAULT_NAME` token, never a leading `-` (it rides in `-field=…`, but a flag-shaped
+ *  field is never what anyone meant). */
+function isVaultFieldName(field: string): boolean {
+  return field.length <= VAULT_PATH_MAX && !field.startsWith('-') && VAULT_NAME.test(field);
 }
 
 /** Fetches one field. Injectable so tests never need a Vault. */

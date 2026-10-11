@@ -3,7 +3,7 @@ import {
   trackerCandidatesQuerySchema, trackerListQuerySchema, trackerSearchQuerySchema, trackerItemQuerySchema, trackerReadScope,
   trackerCredentialsSchema, trackerItemParamsSchema, trackerAssociationInputSchema, type TrackerChangedEvent,
   secretParamsSchema, secretValueInputSchema, type SecretsList, type SecretValueInput,
-  e2eSetupInputSchema, type E2eStatus, taskActionSurfaceSchema,
+  e2eSetupInputSchema, type E2eStatus, taskActionSurfaceSchema, setConfigInputSchema,
 } from '@open-mercato/cezar-contract';
 import { SecretStore, SecretsError, type SecretScopeRef } from '../workspace/secrets.ts';
 import { E2E_SETUP_TASK, e2eCredentialsAmong, e2eSetupWorkflow, latestE2eSetupRun, readE2eStatus, setupInFlight } from '../e2e-setup.ts';
@@ -191,9 +191,9 @@ import {
   readWorktreePath,
   repoIndexContains,
 } from './git-changes.ts';
-import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
+import { configIsTracked, gatedSkillsRepos, loadConfig, LOCAL_CONFIG_FILE, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { detectContainerRuntime } from '../core/container-probe.ts';
-import { pushCredentialsToRunning, removeTaskContainer } from '../core/podman-lifecycle.ts';
+import { pushCredentialsToRunning, removeContainersOf, removeTaskContainer } from '../core/podman-lifecycle.ts';
 import { CREDENTIAL_CATALOG, hostPathOf, listSshEntries } from '../core/credential-passthrough.ts';
 import { listFields, listMounts, listPaths, vaultCli, vaultStatus } from '../core/vault-secrets.ts';
 import { acceptSuggestions, dismissSuggestions, loadProposal } from '../core/containerfile-store.ts';
@@ -462,6 +462,15 @@ const selectAgentProfileSchema = z.object({
   provider: z.enum(PROVIDER_IDS),
   profileId: z.string().max(64).nullable(),
 }).strict();
+
+/**
+ * Credential grants and Vault wiring decide what reaches an agent container from THIS machine's
+ * home, so — like agent-config writes and agent accounts — they are edited only from the machine
+ * that owns the checkout, never by a remote visitor to a hosted cockpit.
+ */
+const hostedGrantRefusal = {
+  error: 'credential grants are managed from the machine that owns the checkout (this cockpit runs in hosted mode)',
+};
 
 /** The hosted-mode refusal, worded like the agent-config one it mirrors. */
 const hostedProfileRefusal = {
@@ -3401,18 +3410,34 @@ export function createApp(deps: ServerDeps) {
   const ownSandboxCredentials = async (
     repoRoot: string,
   ): Promise<{ enabled: Record<string, unknown>; custom: unknown[] }> => {
-    try {
-      const raw = JSON.parse(await readFile(join(repoRoot, '.ai/cezar', 'config.json'), 'utf8')) as {
-        sandbox?: { credentials?: { enabled?: Record<string, unknown>; custom?: unknown[] } };
-      };
-      const credentials = raw.sandbox?.credentials;
-      return {
-        enabled: credentials?.enabled && typeof credentials.enabled === 'object' ? credentials.enabled : {},
-        custom: Array.isArray(credentials?.custom) ? credentials.custom : [],
-      };
-    } catch {
-      return { enabled: {}, custom: [] };
+    // The project's own grants, from where `loadConfig` honors them: an UNTRACKED config.json,
+    // then `config.local.json` over it. A committed config.json grants nothing (see GRANT_KEYS).
+    const read = async (file: string) => {
+      try {
+        const raw = JSON.parse(await readFile(join(repoRoot, '.ai/cezar', file), 'utf8')) as {
+          sandbox?: { credentials?: { enabled?: Record<string, unknown>; custom?: unknown[] } };
+        };
+        return raw.sandbox?.credentials;
+      } catch {
+        return undefined;
+      }
+    };
+    const repo = (await configIsTracked(repoRoot)) ? undefined : await read('config.json');
+    const local = await read(LOCAL_CONFIG_FILE);
+    const byId = new Map<string, unknown>();
+    for (const list of [repo?.custom, local?.custom]) {
+      for (const entry of Array.isArray(list) ? list : []) {
+        const id = entry && typeof entry === 'object' ? (entry as { id?: unknown }).id : undefined;
+        if (typeof id === 'string') byId.set(id, entry);
+      }
     }
+    return {
+      enabled: {
+        ...(repo?.enabled && typeof repo.enabled === 'object' ? repo.enabled : {}),
+        ...(local?.enabled && typeof local.enabled === 'object' ? local.enabled : {}),
+      },
+      custom: [...byId.values()],
+    };
   };
 
   // ---- chained family: workspace settings + GUI prefs (workspace-level) ----
@@ -3484,6 +3509,14 @@ export function createApp(deps: ServerDeps) {
     .put('/workspace/config', jsonZodValidator(() => setWorkspaceConfigInputSchema), async (c) => {
       const parsed = { data: c.req.valid('json') };
       const { browseRoot, projectsDir, skillsAutoUpdate, composerDefaults, resources, agentDefaults, branding } = parsed.data;
+      if (
+        !capabilities().localHandoff &&
+        (agentDefaults?.vault !== undefined ||
+          agentDefaults?.sandbox?.credentials !== undefined ||
+          agentDefaults?.sandbox?.cacheVolumes !== undefined)
+      ) {
+        return c.json(hostedGrantRefusal, 409);
+      }
       for (const [configuredRoot, create] of [
         [browseRoot, false],
         [projectsDir, true],
@@ -5739,6 +5772,7 @@ export function createApp(deps: ServerDeps) {
       // The body is validated (an empty or `{}` one is accepted) but carries nothing this
       // handler reads; retention is best-effort, so 200 always.
       const reclaimed = await reclaimWorktrees(repoRoot, store, await resolveWorktreeRetention(repoRoot));
+      void removeContainersOf(reclaimed, (id) => store.getRun(id)?.isolation?.container !== undefined);
       return c.json({ reclaimed });
     });
 
@@ -6805,6 +6839,12 @@ export function createApp(deps: ServerDeps) {
       const containerfile = join(repoRoot, sandbox?.containerfile ?? '.ai/cezar/Containerfile');
       const hasContainerfile = existsSync(containerfile);
       const own = await ownSandboxCredentials(repoRoot);
+      // A hosted visitor sees WHAT can be passed through, not where it lives on this machine nor
+      // which identities the keys carry (the `.pub` comment is usually an email).
+      const hosted = !capabilities().localHandoff;
+      const home = homedir();
+      const shownPath = (path: string | undefined) =>
+        path && hosted && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
       return c.json({
         runtime,
         enabled,
@@ -6821,7 +6861,7 @@ export function createApp(deps: ServerDeps) {
             id: source.id,
             label: source.label,
             kind: source.kind,
-            hostPath: hostPathOf(source),
+            hostPath: shownPath(hostPathOf(source)),
             env: source.env ?? [],
             defaultMode: source.defaultMode,
             note: source.note,
@@ -6831,10 +6871,13 @@ export function createApp(deps: ServerDeps) {
             // What the operator could tick instead of the whole directory.
             // Read fresh on every request rather than cached: a key generated a
             // minute ago should appear without restarting the cockpit.
-            entries: source.selectable === 'ssh' ? listSshEntries() : [],
+            entries: source.selectable === 'ssh'
+              ? listSshEntries().map((entry) => (hosted ? { name: entry.name, kind: entry.kind } : entry))
+              : [],
           })),
           enabled: sandbox?.credentials?.enabled ?? {},
-          custom: sandbox?.credentials?.custom ?? [],
+          custom: (sandbox?.credentials?.custom ?? []).map((entry) =>
+            hosted && entry.hostPath ? { ...entry, hostPath: shownPath(entry.hostPath) } : entry),
           // The REPO's own choices, apart from what it inherits. The page edits
           // these: writing the merged view back pinned every machine-wide grant
           // into the repo, so revoking one machine-wide later did nothing there.
@@ -6883,6 +6926,24 @@ export function createApp(deps: ServerDeps) {
       } catch {
         // missing or malformed — start fresh
       }
+      // Credential GRANTS go where `loadConfig` honors them. A committed config.json grants nothing
+      // (a clone must not be able to grant itself the operator's credentials), so for one the
+      // grant is written to the git-ignored `config.local.json` instead — still this project's,
+      // never in its history.
+      if (parsed.data.sandbox?.credentials !== undefined && !capabilities().localHandoff) {
+        return c.json(hostedGrantRefusal, 409);
+      }
+      const grantsLocally = (await configIsTracked(repoRoot)) && parsed.data.sandbox?.credentials !== undefined;
+      const localPath = join(dataDir, LOCAL_CONFIG_FILE);
+      let local: Record<string, unknown> = {};
+      if (grantsLocally) {
+        try {
+          const existing: unknown = JSON.parse(await readFile(localPath, 'utf8'));
+          if (existing && typeof existing === 'object') local = existing as Record<string, unknown>;
+        } catch {
+          // none yet
+        }
+      }
       if (parsed.data.baseBranch !== undefined) {
         if (parsed.data.baseBranch === null) delete raw.baseBranch;
         else raw.baseBranch = parsed.data.baseBranch;
@@ -6893,13 +6954,16 @@ export function createApp(deps: ServerDeps) {
         const existingSandbox = raw.sandbox && typeof raw.sandbox === 'object' && !Array.isArray(raw.sandbox)
           ? raw.sandbox as Record<string, unknown>
           : {};
+        const localSandbox = local.sandbox && typeof local.sandbox === 'object' && !Array.isArray(local.sandbox)
+          ? local.sandbox as Record<string, unknown>
+          : {};
         // Nested blocks merge too: a page that edits only `resources.memory`
         // must not drop the credential selection sitting beside it.
         const patch = { ...parsed.data.sandbox } as Record<string, unknown>;
         for (const key of ['resources', 'credentials'] as const) {
           const incoming = patch[key];
           if (incoming === undefined) continue;
-          const existing = existingSandbox[key];
+          const existing = key === 'credentials' && grantsLocally ? localSandbox[key] : existingSandbox[key];
           const base = existing && typeof existing === 'object' && !Array.isArray(existing)
             ? existing as Record<string, unknown>
             : {};
@@ -6920,6 +6984,10 @@ export function createApp(deps: ServerDeps) {
           // `null` clears a key rather than storing a null the schema would reject.
           for (const [k, v] of Object.entries(merged)) if (v === null) delete merged[k];
           patch[key] = merged;
+        }
+        if (grantsLocally) {
+          local.sandbox = { ...localSandbox, credentials: patch.credentials };
+          delete patch.credentials;
         }
         raw.sandbox = { ...existingSandbox, ...patch };
       }
@@ -6996,6 +7064,7 @@ export function createApp(deps: ServerDeps) {
       try {
         await mkdir(dataDir, { recursive: true });
         await writeFile(configPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
+        if (grantsLocally) await writeFile(localPath, `${JSON.stringify(local, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
       } catch (err) {
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
       }
@@ -7023,9 +7092,11 @@ export function createApp(deps: ServerDeps) {
   // R6 keys) clears a knob back to its default.
   const modelPresetSchema = z.string().trim().max(200).nullable().optional();
   const autoModelSchema = z.boolean().nullable().optional();
+  // Bounded: `dismiss` entries are persisted and re-read on every status call and every observed
+  // install, so an unbounded list was a way to grow a state file without limit.
   const suggestionDecisionSchema = z.object({
-    accept: z.array(z.string().min(1)).optional(),
-    dismiss: z.array(z.string().min(1)).optional(),
+    accept: z.array(z.string().min(1).max(1_000)).max(100).optional(),
+    dismiss: z.array(z.string().min(1).max(1_000)).max(100).optional(),
   });
 
   const setConfigSchema = z.object({
@@ -7035,45 +7106,9 @@ export function createApp(deps: ServerDeps) {
      * edits deliberately, and a switch that could rewrite mount paths would be
      * a much larger blast radius than a switch needs.
      */
-    sandbox: z
-      .object({
-        enabled: z.boolean().optional(),
-        resources: z
-          .object({
-            memory: z.string().trim().min(1).max(20).nullable().optional(),
-            cpus: z.number().positive().max(256).nullable().optional(),
-            shmSize: z.string().trim().min(1).max(20).optional(),
-          })
-          .optional(),
-        credentials: z
-          .object({
-            enabled: z.record(z.string(), z.union([
-        z.boolean(),
-        z.object({
-          mode: z.enum(['mount', 'copy']).optional(),
-          // Narrow a directory credential to individual files — `~/.ssh` today.
-          // Each is one path segment: these become host AND guest paths.
-          keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
-        }),
-      ])).optional(),
-            custom: z
-              .array(z.object({
-                id: z.string().trim().min(1),
-                label: z.string().trim().optional(),
-                hostPath: z.string().trim().optional(),
-                guestPath: z.string().trim().optional(),
-                env: z.array(z.string().trim().min(1)).optional(),
-                mode: z.enum(['mount', 'copy']).optional(),
-                // A REFERENCE to a secret store, never a value — see the config
-                // schema. `vault://<mount>/<path>#<field>`.
-                valueFrom: z.string().trim().min(1).max(512).optional(),
-                required: z.boolean().optional(),
-              }))
-              .optional(),
-          })
-          .optional(),
-      })
-      .optional(),
+    // The contract's own patch shape — one definition, bounded, with no host or guest paths (a
+    // custom mount is hand-written config, not a request field).
+    sandbox: setConfigInputSchema.shape.sandbox,
     baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
     defaultRunner: z.enum(RUNNER_IDS).optional(),
     systemPrompt: z.string().trim().max(20_000, 'must be at most 20000 characters').nullable().optional(),

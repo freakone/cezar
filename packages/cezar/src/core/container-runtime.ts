@@ -14,11 +14,21 @@
 export const HOST_ONLY_ENV: ReadonlySet<string> = new Set([
   'PATH', 'HOME', 'SHELL', 'USER', 'LOGNAME', 'PWD', 'OLDPWD', 'SHLVL', '_',
   'TMPDIR', 'TEMP', 'TMP',
-  // A host path to a Kimi home (an agent account sets it): inside the container
-  // the agent's Kimi home is the mounted `/root/.kimi-code`, and a Mac path would
-  // send it looking for a login that is not there.
-  'KIMI_CODE_HOME',
+  // Host paths to an agent's home (an agent account sets them). Inside the container the agent's
+  // home is the mounted one, logged in with the SELECTED account's credential; a Mac path would
+  // send it looking for a login — and a place to keep its conversation — that is not there.
+  'KIMI_CODE_HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
+  // Host paths that mean nothing in Linux and change how tools behave: gh reads its config from
+  // XDG_CONFIG_HOME (so the copied hosts.yml was ignored), NODE_OPTIONS can `--require` a Mac
+  // file, and the ssh variables point at a socket or a command on the host.
+  'XDG_CONFIG_HOME', 'NODE_OPTIONS', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'GIT_SSH_COMMAND', 'GIT_SSH',
 ]);
+
+/** A proxy on the host's loopback is the CONTAINER's loopback inside it: nothing listens there. */
+const PROXY_NAMES = new Set(['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']);
+function isLoopbackProxy(value: string): boolean {
+  return /\/\/(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:|\/|$)/i.test(value);
+}
 
 /**
  * `KEY=VALUE` pairs to hand a container runtime's `-e`. Everything cezar set
@@ -35,6 +45,7 @@ export function containerEnvPairs(env: NodeJS.ProcessEnv, guestTmp: string): str
   const pairs: string[] = [];
   for (const [k, v] of Object.entries(env)) {
     if (v === undefined || HOST_ONLY_ENV.has(k)) continue;
+    if (PROXY_NAMES.has(k) && isLoopbackProxy(v)) continue;
     pairs.push(`${k}=${v}`);
   }
   for (const name of ['TMPDIR', 'TEMP', 'TMP']) pairs.push(`${name}=${guestTmp}`);

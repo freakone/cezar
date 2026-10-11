@@ -129,7 +129,13 @@ export class ClaudeCliRunner implements AgentRunner {
     onEvent?: (event: AgentEvent) => void,
     opts: SessionOptions = {},
   ): AgentSession {
-    const mcpConfig = writeClaudeMcpConfig(spec.mcpServers);
+    // A container sees only its mounts: the host's `$TMPDIR` is not one of them, so an isolated
+    // claude was handed a `--mcp-config` path that did not exist and failed to start. The run's
+    // own scratch dir IS mounted (at the same absolute path), so the file goes there instead.
+    const mcpConfig = writeClaudeMcpConfig(
+      spec.mcpServers,
+      this.launcher.id === 'local' ? undefined : spec.env?.TMPDIR,
+    );
     const args = buildClaudeArgs(spec, process.env, mcpConfig?.path);
 
     let child: ChildProcessWithoutNullStreams;
@@ -463,10 +469,11 @@ export function buildClaudeArgs(
  */
 export function writeClaudeMcpConfig(
   servers: readonly PrivateMcpServer[] | undefined,
+  parent: string = tmpdir(),
 ): { path: string; cleanup: () => void } | undefined {
   if (!servers?.length) return undefined;
   try {
-    const dir = mkdtempSync(join(tmpdir(), 'cez-mcp-'));
+    const dir = mkdtempSync(join(parent, 'cez-mcp-'));
     const path = join(dir, 'mcp.json');
     writeFileSync(path, JSON.stringify(toClaudeMcpConfig(servers)), { mode: 0o600 });
     return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };

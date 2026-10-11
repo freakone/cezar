@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { SandboxConfig } from '../config.ts';
 import { agentKimiHome } from './kimi-home.ts';
-import { BASE_IMAGE_TAG, GUEST_KIMI_HOME, hostKimiLogin, podmanExecArgs, podmanRunArgs } from './podman-launcher.ts';
+import { BASE_IMAGE_TAG, GUEST_KIMI_HOME, hostKimiLogin, podmanExec, podmanRunArgs } from './podman-launcher.ts';
 import { baseContainerfileHash, ensureBaseImage, ensureImage, syncKimiConfig } from './podman-lifecycle.ts';
 
 /**
@@ -39,10 +39,15 @@ describe('a Kimi agent in a podman container', () => {
   it('mounts the host’s Kimi login directories under passthrough, and only those that exist', () => {
     const [[credentials, guestCredentials], [oauth, guestOauth]] = hostKimiLogin() as [[string, string], [string, string]];
     const present = (path: string) => path === credentials;
-    const args = podmanRunArgs(cfg(), 'c', REPO, { credentialPassthrough: true, credentialExists: present });
+    const args = podmanRunArgs(cfg(), 'c', REPO, { credentialPassthrough: true, credentialExists: present, backends: ['kimi'] });
     expect(args).toContain(`${credentials}:${guestCredentials}`);
     expect(args.join(' ')).not.toContain(`${oauth}:${guestOauth}`);
     expect(guestCredentials).toBe('/root/.kimi-code/credentials');
+  });
+
+  it('mounts no Kimi login into a container that is not running Kimi — a Claude task never sees it', () => {
+    const args = podmanRunArgs(cfg(), 'c', REPO, { credentialPassthrough: true, credentialExists: () => true, backends: ['claude'] });
+    expect(args.join(' ')).not.toContain('/root/.kimi-code/credentials');
   });
 
   it('passes no Kimi login when credential passthrough is off', () => {
@@ -51,7 +56,7 @@ describe('a Kimi agent in a podman container', () => {
   });
 
   it('never hands the container a host path as KIMI_CODE_HOME', () => {
-    const args = podmanExecArgs(
+    const { args, env } = podmanExec(
       cfg(),
       'c',
       'kimi',
@@ -59,8 +64,10 @@ describe('a Kimi agent in a podman container', () => {
       { cwd: REPO, env: { KIMI_CODE_HOME: '/Users/k/profiles/work', KIMI_API_KEY: 'k' } },
       '/tmp/pid',
     );
-    expect(args).toContain('KIMI_API_KEY=k');
+    expect(args).toContain('KIMI_API_KEY');
+    expect(env.KIMI_API_KEY).toBe('k');
     expect(args.join(' ')).not.toContain('KIMI_CODE_HOME');
+    expect(env.KIMI_CODE_HOME).toBeUndefined();
   });
 
   it('copies the host’s config.toml into the agent home, and is silent without one', () => {

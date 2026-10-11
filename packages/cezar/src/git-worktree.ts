@@ -75,7 +75,7 @@ async function fetchBase(repoRoot: string, remote: string, base: string): Promis
   // own — see `nonInteractiveSsh` — and the timeout bounds whatever is left.
   await git(repoRoot, ['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', remote, refspec], {
     timeout: FETCH_TIMEOUT_MS,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: await nonInteractiveSsh(repoRoot) },
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...(await nonInteractiveSshEnv(repoRoot)) },
   });
 }
 
@@ -93,10 +93,16 @@ async function fetchBase(repoRoot: string, remote: string, base: string): Promis
  * to authenticate at all; overriding it with a bare `ssh` would turn a working
  * fetch into a failing one.
  */
-async function nonInteractiveSsh(repoRoot: string): Promise<string> {
+async function nonInteractiveSshEnv(repoRoot: string): Promise<Record<string, string>> {
+  // git's own precedence, which the override must not reorder: an exported GIT_SSH_COMMAND beats
+  // `core.sshCommand`, which beats GIT_SSH. GIT_SSH names a bare program git runs with no shell,
+  // so there is nothing to append options to — it is left alone, and the timeout still bounds it.
+  const exported = process.env.GIT_SSH_COMMAND?.trim();
+  if (exported) return { GIT_SSH_COMMAND: `${exported} -o BatchMode=yes -o ConnectTimeout=10` };
   const configured = await git(repoRoot, ['config', '--get', 'core.sshCommand']);
-  const own = (configured.ok && configured.stdout.trim()) || process.env.GIT_SSH_COMMAND || 'ssh';
-  return `${own} -o BatchMode=yes -o ConnectTimeout=10`;
+  const own = configured.ok ? configured.stdout.trim() : '';
+  if (!own && process.env.GIT_SSH) return {};
+  return { GIT_SSH_COMMAND: `${own || 'ssh'} -o BatchMode=yes -o ConnectTimeout=10` };
 }
 
 export function branchFor(runId: string): string {

@@ -3,11 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import type { AgentEvent } from './agent-runner.js';
+import type { AgentEvent, AgentRunSpec } from './agent-runner.js';
 import { buildChildEnv } from './agent-env.js';
 import { detectEnvironment } from './backend-detect.js';
 import { kimiModelsFromConfig } from './kimi-model-catalog.js';
 import { kimiHome } from './kimi-home.js';
+import type { PrivateMcpServer } from './private-mcp.js';
+import { localLauncher, type ProcessLauncher } from './process-launcher.js';
 import { KimiRunner, KimiUsageReader, resolveKimiExecutable } from './kimi-runner.js';
 import { backendSupportsLauncher, createRunner } from './runner-factory.js';
 import type { UiEvent } from './ui-events.js';
@@ -190,6 +192,245 @@ describe('a KimiRunner session over the ACP mock', () => {
   });
 });
 
+/**
+ * A stand-in `kimi acp` written for one test. `body` runs with `send(value)` and an `on(method,
+ * (msg) => …)` router over stdin; an unrouted request is left unanswered.
+ */
+function fakeKimi(body: string): string {
+  const file = join(dir, `fake-kimi-${Math.random().toString(36).slice(2)}.mjs`);
+  writeFileSync(
+    file,
+    `#!/usr/bin/env node
+import readline from 'node:readline';
+const send = (value) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\\n');
+const routes = new Map();
+const on = (method, fn) => routes.set(method, fn);
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line);
+  routes.get(msg.method)?.(msg);
+});
+process.stdin.resume();
+${body}
+`,
+  );
+  chmodSync(file, 0o755);
+  return file;
+}
+
+/** The local launcher, recording every signal it is asked to deliver. */
+function recordingLauncher(): ProcessLauncher & { signals: NodeJS.Signals[] } {
+  const signals: NodeJS.Signals[] = [];
+  return {
+    id: 'local',
+    describe: () => 'this machine (recorded)',
+    spawn: (bin, args, opts) => localLauncher.spawn(bin, args, opts),
+    signal: async (child, sig) => {
+      signals.push(sig);
+      await localLauncher.signal(child, sig);
+    },
+    signals,
+  };
+}
+
+function start(
+  bin: string,
+  spec: Partial<AgentRunSpec> = {},
+  options: { handshakeTimeoutMs?: number; launcher?: ProcessLauncher; autoEnd?: boolean } = {},
+) {
+  const events: AgentEvent[] = [];
+  const ui: UiEvent[] = [];
+  const runner = new KimiRunner({ bin, handshakeTimeoutMs: options.handshakeTimeoutMs, launcher: options.launcher });
+  const session = runner.startSession(
+    { userPrompt: 'investigate the login redirect bug', cwd: dir, timeoutMs: 20_000, ...spec },
+    (event) => events.push(event),
+    { autoEndAfterFirstTurn: options.autoEnd ?? true, onUiEvent: (event) => ui.push(event) },
+  );
+  return { session, events, ui };
+}
+
+const settled = (p: Promise<unknown>) => p.then(() => 'resolved', (err: Error) => `rejected: ${err.message}`);
+
+describe('a Kimi session that dies or hangs before its first prompt still settles', () => {
+  it('rejects at once when the binary does not exist', async () => {
+    const { session } = start(join(dir, 'no-such-kimi'));
+    await expect(session.result).rejects.toThrow(/not found on PATH/);
+  });
+
+  it('rejects with the exit code and stderr when Kimi exits 1 at startup', async () => {
+    const { session, events } = start(fakeKimi(`process.stderr.write('config.toml is broken\\n'); process.exit(1);`));
+    await expect(session.result).rejects.toThrow(/exited with code 1 — config\.toml is broken/);
+    expect(events.filter((e) => e.type === 'error')).toHaveLength(1);
+  });
+
+  it('rejects when Kimi exits 0 without ever starting a session', async () => {
+    const { session } = start(fakeKimi(`on('initialize', () => process.exit(0));`));
+    await expect(session.result).rejects.toThrow(/exited before it started a session/);
+  });
+
+  it('bounds a handshake Kimi never answers', async () => {
+    const { session, ui } = start(fakeKimi(''), {}, { handshakeTimeoutMs: 200 });
+    await expect(session.result).rejects.toThrow(/initialize got no answer within 200ms/);
+    expect(ui.at(-1)).toEqual({ type: 'session.ended', reason: 'error' });
+  }, 10_000);
+
+  it('settles as cancelled when interrupted mid-handshake', async () => {
+    const { session, ui, events } = start(fakeKimi(''));
+    setTimeout(() => session.interrupt(), 100);
+    await expect(session.result).resolves.toMatchObject({ toolCalls: [] });
+    expect(ui.at(-1)).toEqual({ type: 'session.ended', reason: 'cancelled' });
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+  }, 10_000);
+
+  it('settles on the run deadline during the handshake', async () => {
+    const { session, ui } = start(fakeKimi(''), { timeoutMs: 300 });
+    await session.result;
+    expect(ui.at(-1)).toEqual({ type: 'session.ended', reason: 'timeout' });
+  }, 10_000);
+
+  it('reports a handshake error once, not once from the mapper and again from the runner', async () => {
+    const { session, events, ui } = start(
+      fakeKimi(`on('initialize', (m) => send({ id: m.id, error: { code: -32000, message: 'Authentication required' } }));`),
+    );
+    await expect(session.result).rejects.toThrow(/Authentication required/);
+    expect(events.filter((e) => e.type === 'error')).toEqual([{ type: 'error', message: 'kimi: Authentication required' }]);
+    expect(ui.filter((e) => e.type === 'session.error')).toHaveLength(1);
+  });
+});
+
+describe('a Kimi that ignores SIGTERM is killed', () => {
+  // Ignores SIGTERM and outlives its stdin, like a CLI that does not take EOF as a goodbye.
+  const stubborn = () => fakeKimi(`process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);`);
+
+  it('interrupt escalates SIGTERM to SIGKILL through the launcher', async () => {
+    const launcher = recordingLauncher();
+    const { session, ui } = start(stubborn(), {}, { launcher });
+    // Long enough for node to boot the fake and install its SIGTERM handler.
+    setTimeout(() => session.interrupt(), 1_000);
+    expect(await settled(session.result)).toBe('resolved');
+    expect(launcher.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(ui.at(-1)).toEqual({ type: 'session.ended', reason: 'cancelled' });
+  }, 15_000);
+
+  it('hardStop kills now', async () => {
+    const launcher = recordingLauncher();
+    const { session } = start(stubborn(), {}, { launcher });
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const began = Date.now();
+    session.hardStop?.();
+    expect(await settled(session.result)).toBe('resolved');
+    expect(Date.now() - began).toBeLessThan(2_000);
+    expect(launcher.signals).toContain('SIGKILL');
+  }, 15_000);
+});
+
+describe('a turn Kimi never answered is not a success', () => {
+  it('a Kimi that exits 0 mid-turn fails the run, settles the turn as an error and the running tool as failed', async () => {
+    const { session, events, ui } = start(MOCK, { userPrompt: 'go die:0' });
+    await expect(session.result).rejects.toThrow(/exited with code 0 without answering the prompt/);
+    expect(ui.find((e) => e.type === 'turn.completed')).toMatchObject({ stopReason: 'error' });
+    expect(ui).toContainEqual({
+      type: 'item.completed',
+      item: expect.objectContaining({ kind: 'tool', name: 'Bash', status: 'failed' }),
+    });
+    expect(ui.at(-1)).toEqual({ type: 'session.ended', reason: 'error' });
+    expect(events.filter((e) => e.type === 'error')).toHaveLength(1);
+    expect(events.some((e) => e.type === 'note' && e.message.includes('token usage'))).toBe(false);
+  });
+
+  it('a Kimi that crashes mid-turn reports its exit code', async () => {
+    const { session, ui } = start(MOCK, { userPrompt: 'go die:3' });
+    await expect(session.result).rejects.toThrow(/exited with code 3/);
+    expect(ui.find((e) => e.type === 'turn.completed')).toMatchObject({ stopReason: 'error' });
+  });
+
+  it('an interrupted turn completes as cancelled and the session ends cancelled', async () => {
+    const { session, events, ui } = start(MOCK, { userPrompt: 'go hang:' });
+    const wait = setInterval(() => {
+      if (ui.some((e) => e.type === 'turn.started')) {
+        clearInterval(wait);
+        session.interrupt();
+      }
+    }, 20);
+    await session.result;
+    expect(ui.find((e) => e.type === 'turn.completed')).toMatchObject({ stopReason: 'cancelled' });
+    expect(ui.at(-1)).toEqual({ type: 'session.ended', reason: 'cancelled' });
+    expect(events.some((e) => e.type === 'note' && e.message.includes('token usage'))).toBe(false);
+  }, 10_000);
+
+  it('a turn the deadline cut off completes as timeout', async () => {
+    const { session, ui } = start(MOCK, { userPrompt: 'go hang:', timeoutMs: 500 });
+    await session.result;
+    expect(ui.find((e) => e.type === 'turn.completed')).toMatchObject({ stopReason: 'timeout' });
+    expect(ui.at(-1)).toEqual({ type: 'session.ended', reason: 'timeout' });
+  }, 10_000);
+});
+
+describe('private MCP servers reach Kimi', () => {
+  const servers: PrivateMcpServer[] = [
+    { name: 'local-db', transport: 'stdio', command: 'db-mcp', args: [], env: {}, headers: {} },
+    { name: 'remote', transport: 'http', url: 'https://mcp.example.com', args: [], env: {}, headers: {} },
+    { name: 'legacy', transport: 'sse', url: 'https://old.example.com', args: [], env: {}, headers: {} },
+  ];
+
+  it('rides session/new, honouring the transports Kimi advertised', async () => {
+    const { session, events } = start(MOCK, { userPrompt: 'mcp?', mcpServers: servers });
+    expect((await session.result).text).toContain('mcp: local-db,remote');
+    expect(events).toContainEqual({
+      type: 'note',
+      message: 'private MCP: kimi cannot attach legacy — the CLI did not advertise that MCP transport',
+    });
+  });
+
+  it('rides session/resume too', async () => {
+    const { session } = start(MOCK, { userPrompt: 'mcp?', mcpServers: servers, resume: true, sessionId: 'session_old' });
+    const result = await session.result;
+    expect(result.text).toContain('mcp: local-db,remote');
+    expect(result.sessionId).toBe('session_old');
+  });
+});
+
+describe('Continue on a session Kimi no longer knows', () => {
+  it('notes it and starts a fresh session instead of failing', async () => {
+    const { session, events } = start(MOCK, { resume: true, sessionId: 'session_gone' });
+    const result = await session.result;
+    expect(result.sessionId).toBe('session_00000000-0000-4000-8000-00000000kimi');
+    expect(result.text).toContain('Investigating: investigate the login redirect bug');
+    expect(events).toContainEqual({
+      type: 'note',
+      message: expect.stringMatching(/could not resume session session_gone \(kimi: Internal error: Unknown sessionId: session_gone\) — starting a fresh session/),
+    });
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+  });
+});
+
+describe('an image-only follow-up', () => {
+  it('reaches Kimi as an ACP image block', async () => {
+    const image = { type: 'image' as const, source: { type: 'base64' as const, media_type: 'image/png', data: 'iVBORw0KGgo=' } };
+    let ends = 0;
+    const events: AgentEvent[] = [];
+    const session = new KimiRunner({ bin: MOCK }).startSession({ userPrompt: 'first', cwd: dir, timeoutMs: 20_000 }, (event) => {
+      events.push(event);
+      if (event.type !== 'turn-end') return;
+      ends += 1;
+      if (ends === 1) expect(session.sendMessage([image])).toBe(true);
+      else session.end();
+    });
+    const result = await session.result;
+    expect(result.text).toContain('images: 1');
+  });
+});
+
+describe('allowedTools Kimi cannot enforce', () => {
+  it('says so, rather than looking like a sandbox', async () => {
+    const { session, events } = start(MOCK, { allowedTools: ['Read', 'Bash'] });
+    await session.result;
+    expect(events).toContainEqual({
+      type: 'note',
+      message: 'kimi: allowedTools cannot keep Edit, Write, Grep, Glob out — Kimi runs them without asking permission (only Bash can be denied)',
+    });
+  });
+});
+
 describe('KimiUsageReader', () => {
   const record = (input: number) =>
     `${JSON.stringify({ type: 'usage.record', agentId: 'main', usage: { inputOther: input, output: 1 } })}\n`;
@@ -228,6 +469,27 @@ describe('KimiUsageReader', () => {
     expect(reader.read().records).toEqual([]);
     writeFileSync(join(main, 'wire.jsonl'), line);
     expect(reader.read().records).toHaveLength(1);
+  });
+
+  it('keeps byte offsets: multi-byte text already in a resumed log does not swallow the next record', () => {
+    const main = join(dir, 'sessions', 'wd', 'session_5', 'agents', 'main');
+    mkdirSync(main, { recursive: true });
+    const earlier = `${JSON.stringify({ type: 'content.part', text: 'zażółć gęślą jaźń 🙂'.repeat(20) })}\n`;
+    writeFileSync(join(main, 'wire.jsonl'), earlier);
+    const reader = new KimiUsageReader(dir, 'session_5');
+    writeFileSync(join(main, 'wire.jsonl'), earlier + record(9) + ended);
+    expect(reader.read()).toEqual({
+      records: [expect.objectContaining({ usage: { inputOther: 9, output: 1 } })],
+      turnEnded: true,
+    });
+  });
+
+  it('reads the turn.ended marker by its parsed type, whatever the spacing', () => {
+    const main = join(dir, 'sessions', 'wd', 'session_6', 'agents', 'main');
+    mkdirSync(main, { recursive: true });
+    const reader = new KimiUsageReader(dir, 'session_6');
+    writeFileSync(join(main, 'wire.jsonl'), '{"type": "turn.ended", "agentId": "main"}\n');
+    expect(reader.read().turnEnded).toBe(true);
   });
 
   it('degrades to "nothing to wait for" when the log cannot be found or read', () => {

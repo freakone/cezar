@@ -28,6 +28,12 @@ export interface ProcessLauncher {
   /** One line naming where this launcher puts the agent — shown in run notes. */
   describe(): string;
   /**
+   * The agent homes an isolated agent uses, on the host (per project — `agentHomesFor`).
+   * Undefined on this machine's launcher, where an agent uses its own home. A runner that reads
+   * its agent's files from the host (Kimi's usage log) looks there.
+   */
+  readonly agentHomes?: { claude: string; kimi: string };
+  /**
    * A host port forwarded into the container, for a backend that talks HTTP to
    * its own agent process (opencode `serve`) rather than over stdio.
    *

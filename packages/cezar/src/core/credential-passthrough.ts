@@ -441,7 +441,11 @@ export function resolvePassthrough(
       ...(custom.valueFrom ? { valueFrom: custom.valueFrom } : {}),
       ...(custom.required ? { required: true } : {}),
     };
-    if (hostPath && exists(hostPath)) resolved.hostPath = hostPath;
+    const refused = hostPath ? refusedHostPath(hostPath, home) : undefined;
+    if (refused) resolved.skipped = refused;
+    else if (custom.guestPath !== undefined && !isGuestPath(custom.guestPath)) {
+      resolved.skipped = `guest path ${JSON.stringify(custom.guestPath)} must be an absolute path without ':' or ','`;
+    } else if (hostPath && exists(hostPath)) resolved.hostPath = hostPath;
     else if (hostPath) resolved.skipped = `${hostPath} does not exist on this machine`;
     out.push(resolved);
   }
@@ -505,6 +509,31 @@ function resolveSshKeys(
 }
 
 /** `-v host:guest` arguments for the credentials that are MOUNTED. */
+/** A podman named volume: no path separators, no option syntax. */
+export function isVolumeName(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
+}
+
+/** An absolute container path that cannot carry `-v` option syntax (`:`, `,`) or climb (`..`). */
+export function isGuestPath(value: string): boolean {
+  return /^\/[^:,\0\n]*$/.test(value) && value.length <= 512 && !value.split('/').includes('..');
+}
+
+/**
+ * Why a custom credential's host path is refused, or undefined when it is fine. A credential is a
+ * credential — a file or a tool's config directory — never the filesystem root, the home
+ * directory itself, or anything above it: those are "everything", which is exactly what isolation
+ * withholds.
+ */
+export function refusedHostPath(hostPath: string, home: string): string | undefined {
+  const normalized = hostPath.replace(/\/+$/, '') || '/';
+  if (normalized.includes(':') || normalized.includes(',')) return `${hostPath} contains ':' or ','`;
+  if (normalized === '/' || home === normalized || home.startsWith(`${normalized}/`)) {
+    return `${hostPath} is not a credential — it would expose the whole home directory or more`;
+  }
+  return undefined;
+}
+
 export function credentialMountArgs(resolved: ResolvedCredential[]): string[] {
   const args: string[] = [];
   for (const c of resolved) {

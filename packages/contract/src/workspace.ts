@@ -119,6 +119,39 @@ export const workspaceConfigResponseSchema = z.object({
 });
 export type WorkspaceConfigResponse = z.infer<typeof workspaceConfigResponseSchema>;
 
+/** An environment variable NAME — it becomes a `-e NAME` for podman, so nothing else is allowed. */
+const envNameSchema = z.string().trim().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'must be an environment variable name').max(128);
+
+/**
+ * One secret passed to isolated agents, as a REFERENCE (`vault://<mount>/<path>#<field>`) — never
+ * a value — and the variables it lands in. No host or guest paths over the API: a custom MOUNT is
+ * something a person writes into an untracked config by hand, not a field a request can set.
+ */
+export const secretReferenceSchema = z.object({
+  id: z.string().trim().min(1).max(512),
+  label: z.string().trim().max(120).optional(),
+  env: z.array(envNameSchema).max(8).optional(),
+  valueFrom: z.string().trim().min(1).max(512).optional(),
+  required: z.boolean().optional(),
+});
+export type SecretReference = z.infer<typeof secretReferenceSchema>;
+
+/** One catalog credential's choice: on/off, mount or copy, and — for `~/.ssh` — the files picked. */
+export const credentialChoiceSchema = z.union([
+  z.boolean(),
+  z.object({
+    mode: z.enum(['mount', 'copy']).optional(),
+    keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+  }),
+]);
+
+/** Which credentials isolated agents get — the shape both the project and the machine edit. */
+export const credentialGrantsSchema = z.object({
+  enabled: z.record(z.string().max(64), credentialChoiceSchema).optional(),
+  /** Secrets, as references. The whole array is sent on every edit. */
+  custom: z.array(secretReferenceSchema).max(64).optional(),
+});
+
 /**
  * `PUT /api/v1/workspace/config` body — partial: absent keys stay untouched. A rejected workspace
  * root (not writable) 400s with the reason and persists NOTHING, resources included, so callers
@@ -149,7 +182,16 @@ export const setWorkspaceConfigInputSchema = z.object({
         .object({
           provider: z.enum(['podman', 'sbx']).nullable().optional(),
           claudeCredentialPassthrough: z.boolean().nullable().optional(),
-          cacheVolumes: z.record(z.string(), z.string()).nullable().optional(),
+          /** NAMED volumes only → an absolute guest path. A path-shaped key would bind a host
+           *  directory into every container, and `:`/`,` would smuggle mount options. */
+          cacheVolumes: z
+            .record(
+              z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/, 'must be a volume name'),
+              z.string().regex(/^\/[^:,\n]*$/, 'must be an absolute path without : or ,').max(512),
+            )
+            .refine((volumes) => Object.keys(volumes).length <= 32, 'at most 32 cache volumes')
+            .nullable()
+            .optional(),
           resources: z
             .object({
               memory: z.string().trim().min(1).max(20).nullable().optional(),
@@ -157,25 +199,7 @@ export const setWorkspaceConfigInputSchema = z.object({
               shmSize: z.string().trim().min(1).max(20).nullable().optional(),
             })
             .optional(),
-          credentials: z
-            .object({
-              enabled: z.record(z.string(), z.union([
-                z.boolean(),
-                z.object({
-                  mode: z.enum(['mount', 'copy']).optional(),
-                  keys: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
-                }),
-              ])).optional(),
-              /** Secrets, as references. The whole array is sent on every edit. */
-              custom: z.array(z.object({
-                id: z.string().trim().min(1).max(64),
-                label: z.string().trim().max(120).optional(),
-                env: z.array(z.string().trim().min(1).max(128)).max(8).optional(),
-                valueFrom: z.string().trim().min(1).max(512).optional(),
-                required: z.boolean().optional(),
-              })).max(64).optional(),
-            })
-            .optional(),
+          credentials: credentialGrantsSchema.optional(),
         })
         .optional(),
       /** `null` on a key clears it. Never carries a token. */
@@ -520,10 +544,9 @@ export type SetConfigResponse = z.infer<typeof setConfigResponseSchema>;
  */
 export const setConfigInputSchema = z.object({
   /**
-   * Agent isolation. Only `enabled` crosses the wire: the rest of the repo's
-   * `sandbox` block (image, mounts, credential wiring) is configuration a
-   * person edits deliberately, and the server MERGES this patch rather than
-   * replacing the block, so a switch can never drop those keys.
+   * Agent isolation, as a PATCH the server merges into the repo's `sandbox` block, so a switch can
+   * never drop the keys it does not send (image, Containerfile). Credential grants are written
+   * where they can be trusted — see `config.local.json` in the service's config loader.
    */
   sandbox: z
     .object({
@@ -535,21 +558,7 @@ export const setConfigInputSchema = z.object({
           shmSize: z.string().trim().min(1).max(20).optional(),
         })
         .optional(),
-      credentials: z
-        .object({
-          enabled: z.record(z.string(), z.union([z.boolean(), z.object({ mode: z.enum(['mount', 'copy']).optional() })])).optional(),
-          custom: z
-            .array(z.object({
-              id: z.string().trim().min(1),
-              label: z.string().trim().optional(),
-              hostPath: z.string().trim().optional(),
-              guestPath: z.string().trim().optional(),
-              env: z.array(z.string().trim().min(1)).optional(),
-              mode: z.enum(['mount', 'copy']).optional(),
-            }))
-            .optional(),
-        })
-        .optional(),
+      credentials: credentialGrantsSchema.optional(),
     })
     .optional(),
   baseBranch: z.string().trim().min(1).max(200).nullable().optional(),

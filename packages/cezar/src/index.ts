@@ -13,6 +13,7 @@ import {
 import { applyProviderEnablement } from './core/provider-availability.ts';
 import { ensureDataGitignore } from './data-gitignore.ts';
 import { pruneOrphans } from './git-worktree.ts';
+import { removeContainersOf } from './core/podman-lifecycle.ts';
 import { getRepoInfo } from './server/git.ts';
 import { DEFAULT_WORKTREE_RETENTION, loadConfig, resolveWorktreeRetention } from './config.ts';
 import { reclaimWorktrees } from './runs/retention.ts';
@@ -300,6 +301,7 @@ async function serveCommand(
     // Best-effort; never blocks boot.
     const keep = await resolveWorktreeRetention(repoRoot).catch(() => DEFAULT_WORKTREE_RETENTION);
     const reclaimed = await reclaimWorktrees(repoRoot, store, keep).catch(() => [] as string[]);
+    void removeContainersOf(reclaimed, (id) => store.getRun(id)?.isolation?.container !== undefined);
     if (reclaimed.length > 0) {
       console.log(`  reclaimed ${reclaimed.length} old worktree(s), branch kept: ${reclaimed.map((id) => id.slice(0, 8)).join(', ')}`);
     }

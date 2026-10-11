@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyCredentialsToRunning, syncClaudeCredential, taskContainerName } from './podman-lifecycle.ts';
+import { applyCredentialsToRunning, syncClaudeCredential, taskContainerName, type MountSpec } from './podman-lifecycle.ts';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -277,12 +277,28 @@ describe('a credential mounted after the task container started', () => {
     credentials: { enabled: { railway: true } },
   } as unknown as SandboxConfig;
 
-  /** A fake podman: the task container exists, `inspect` lists the guest paths in `mounts`. */
-  function existingContainer(mounts: string[]): { bin: string; calls: () => string[] } {
+  /** What `startTaskContainer` asks for — the same options, so the comparison is like for like. */
+  async function wanted(runId: string): Promise<MountSpec[]> {
+    const { wantedMounts } = await import('./podman-lifecycle.ts');
+    const { agentHomesFor } = await import('./kimi-home.ts');
+    const { mkdirSync } = await import('node:fs');
+    // The dirs `startTaskContainer` creates before it compares — a mount is wanted only for a
+    // path that exists.
+    for (const dir of [join(repo, '.ai/cezar/tmp', runId), join(repo, '.ai/cezar/runs')]) mkdirSync(dir, { recursive: true });
+    return wantedMounts(cfg, repo, `cez-${runId.slice(0, 8)}`, { runId, homes: agentHomesFor(repo), backends: [], accountEnv: {} });
+  }
+
+  /** A fake podman: the task container exists, `inspect` reports `mounts` as podman's JSON. */
+  function existingContainer(mounts: MountSpec[]): { bin: string; calls: () => string[] } {
     const dir = mkdtempSync(join(tmpdir(), 'cez-fake-remount-'));
     const bin = join(dir, 'podman');
     const log = join(dir, 'calls.log');
-    writeFileSync(join(dir, 'mounts'), mounts.join('\n') + '\n');
+    writeFileSync(join(dir, 'mounts'), JSON.stringify(mounts.map((m) => ({
+      Type: m.type,
+      ...(m.type === 'volume' ? { Name: m.source } : { Source: m.source }),
+      Destination: m.destination,
+      RW: !m.readOnly,
+    }))) + '\n');
     writeFileSync(bin, `#!/bin/sh
 echo "$*" >> "${log}"
 case "$1 $2" in
@@ -298,15 +314,15 @@ exit 0
   }
 
   it('recreates the container to mount it, between turns', async () => {
-    const { startTaskContainer, wantedMounts } = await import('./podman-lifecycle.ts');
+    const { startTaskContainer } = await import('./podman-lifecycle.ts');
     const savedHome = process.env.HOME;
     process.env.HOME = home;
     try {
       const { mkdirSync } = await import('node:fs');
       mkdirSync(join(home, '.railway'), { recursive: true });
-      const wanted = wantedMounts(cfg, repo, 'cez-run12345');
-      expect(wanted).toContain('/root/.railway');
-      const podman = existingContainer(wanted.filter((m) => m !== '/root/.railway'));
+      const all = await wanted('run12345-0000');
+      expect(all.map((m) => m.destination)).toContain('/root/.railway');
+      const podman = existingContainer(all.filter((m) => m.destination !== '/root/.railway'));
       const container = await startTaskContainer(cfg, repo, 'run12345-0000', podman.bin);
       expect(container.remounted).toEqual(['/root/.railway']);
       const calls = podman.calls();
@@ -317,9 +333,30 @@ exit 0
     }
   });
 
+  it('recreates a container that has a mount it should NOT — an unticked credential leaves', async () => {
+    const { startTaskContainer } = await import('./podman-lifecycle.ts');
+    const extra: MountSpec = { type: 'bind', source: join(home, '.ssh'), destination: '/root/.ssh', readOnly: false };
+    const podman = existingContainer([...(await wanted('runaaaaa-0000')), extra]);
+    const container = await startTaskContainer(cfg, repo, 'runaaaaa-0000', podman.bin);
+    expect(container.remounted).toEqual(['/root/.ssh']);
+    expect(podman.calls()).toContain('rm -f -v cez-runaaaaa');
+  });
+
+  it('recreates a container whose cezar data mount is writable where it should be read-only', async () => {
+    const { startTaskContainer } = await import('./podman-lifecycle.ts');
+    const all = await wanted('runbbbbb-0000');
+    // Containers made before the hardening mounted `.ai/cezar` writable — where the agent could
+    // grant itself credentials. The flag alone differs, and that is drift.
+    const data = all.find((m) => m.destination === join(repo, '.ai/cezar'));
+    expect(data?.readOnly).toBe(true);
+    const podman = existingContainer(all.map((m) => (m === data ? { ...m, readOnly: false } : m)));
+    const container = await startTaskContainer(cfg, repo, 'runbbbbb-0000', podman.bin);
+    expect(container.remounted).toEqual([data!.destination]);
+  });
+
   it('reuses a container that already has every mount it should', async () => {
-    const { startTaskContainer, wantedMounts } = await import('./podman-lifecycle.ts');
-    const podman = existingContainer(wantedMounts(cfg, repo, 'cez-run67890'));
+    const { startTaskContainer } = await import('./podman-lifecycle.ts');
+    const podman = existingContainer(await wanted('run67890-0000'));
     const container = await startTaskContainer(cfg, repo, 'run67890-0000', podman.bin);
     expect(container.remounted).toBeUndefined();
     expect(podman.calls().some((c) => c.startsWith('rm '))).toBe(false);

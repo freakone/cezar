@@ -231,8 +231,9 @@ function providerId(value: unknown): ThreadProviderAuthRequired['provider'] | un
     value === 'opencode' ||
     value === 'cursor' ||
     value === 'pi' ||
-    value === 'copilot'
-  ) || value === 'kimi'
+    value === 'copilot' ||
+    value === 'kimi'
+  )
     ? value
     : undefined
 }

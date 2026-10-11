@@ -2,12 +2,12 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { promisify } from 'node:util';
-import { BASE_IMAGE_TAG, agentClaudeHome, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
-import { agentKimiHome, kimiHome } from './kimi-home.ts';
+import { BASE_IMAGE_TAG, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
+import { agentHomesFor, agentKimiHome, kimiHome } from './kimi-home.ts';
 import type { SandboxConfig } from '../config.ts';
 import { parseMachines } from './container-probe.ts';
 import {
@@ -112,10 +112,27 @@ async function imageLabel(tag: string, label: string, bin: string): Promise<stri
   }
 }
 
+/** One build per tag at a time. Two tasks started together each saw a stale image and each ran
+ *  a full `podman build` of it; the second now waits for the first and reuses its answer. */
+const imageBuilds = new Map<string, Promise<void>>();
+
 export async function ensureImage(
   cfg: SandboxConfig,
   repoRoot: string,
   bin = 'podman',
+): Promise<void> {
+  const key = `${bin}\0${repoRoot}\0${cfg.image ?? ''}\0${cfg.containerfile}`;
+  const inFlight = imageBuilds.get(key);
+  if (inFlight) return inFlight;
+  const build = ensureImageOnce(cfg, repoRoot, bin).finally(() => imageBuilds.delete(key));
+  imageBuilds.set(key, build);
+  return build;
+}
+
+async function ensureImageOnce(
+  cfg: SandboxConfig,
+  repoRoot: string,
+  bin: string,
 ): Promise<void> {
   const containerfile = join(repoRoot, cfg.containerfile);
   const hasFile = existsSync(containerfile);
@@ -193,104 +210,240 @@ export async function startTaskContainer(
   repoRoot: string,
   runId: string,
   bin = 'podman',
+  opts: {
+    /** The agent CLI this turn runs; its login — and only its — is passed. */
+    backend?: string;
+    /** The selected agent account's env (`CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME`): whose login. */
+    accountEnv?: Record<string, string>;
+  } = {},
 ): Promise<TaskContainer> {
   const name = taskContainerName(runId);
   const startedMachine = await ensurePodmanMachine(bin);
+  const homes = agentHomesFor(repoRoot);
+  prepareHostDirs(repoRoot, runId, homes);
+  const runOpts = {
+    runId,
+    homes,
+    backends: opts.backend ? [opts.backend] : [],
+    accountEnv: opts.accountEnv ?? {},
+  };
   let running = await run(bin, ['container', 'exists', name]).then(() => true).catch(() => false);
-  // A mount is fixed when a container is created, so a credential ticked in mount mode during a
-  // task (Railway, gcloud…) never reached it: the agent reported the CLI logged out while
-  // Settings said it was passed through. This runs between turns, with no agent process inside,
-  // and everything a task needs to continue lives on the host — the worktree and the agent's
-  // conversation are both bind mounts — so the container is recreated with the mounts it lacks.
-  // What goes is container-only state: a background server, a package installed outside the repo.
+  // A mount is fixed when a container is created, so one that changed during a task — a
+  // credential ticked or narrowed, a different agent, a hardened repo layout — never reached it:
+  // a ticked Railway login stayed missing, and a narrowed `~/.ssh` stayed mounted whole. This runs
+  // between turns, with no agent process inside, and everything a task needs to continue lives on
+  // the host — the worktree and the agent's conversation are both bind mounts — so the container
+  // is recreated with exactly the mounts it should have. What goes is container-only state: a
+  // background server, a package installed outside the repo.
   let remounted: string[] | undefined;
   if (running) {
-    const missing = await missingMounts(name, wantedMounts(cfg, repoRoot, name), bin);
-    if (missing.length > 0) {
+    const drift = await mountDrift(name, wantedMounts(cfg, repoRoot, name, runOpts), cfg.ephemeralPaths ?? [], bin);
+    if (drift.length > 0) {
       await run(bin, ['rm', '-f', '-v', name]).catch(() => undefined);
       running = false;
-      remounted = missing;
+      remounted = drift;
     }
   }
+  const credentials = resolvePassthrough(cfg.credentials);
+  const passLogins = cfg.claudeCredentialPassthrough;
   if (running) {
     // A stopped container from an earlier turn still has to be woken.
     await run(bin, ['start', name]).catch(() => undefined);
     // Every spawn re-copies, so a token refreshed on the host reaches the next
     // turn of a long task — the property a mount was supposed to give and
     // could not (see `podmanRunArgs`).
-    if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
-    if (cfg.claudeCredentialPassthrough) syncKimiConfig();
+    await syncAgentLogins(name, bin, homes, opts, passLogins);
     // And the same for everything else that is COPIED, so a credential ticked
     // after this container started reaches the next turn of the task instead of
-    // waiting for a task that does not exist yet. Mounts cannot be refreshed
-    // this way — they are fixed at creation — which is the practical argument
-    // for copying anything that does not have to be live.
-    await applyCredentials(name, resolvePassthrough(cfg.credentials), bin);
-    return { name, publishedPort: await publishedPortOf(name, bin), ...(startedMachine ? { startedMachine } : {}) };
+    // waiting for a task that does not exist yet.
+    await applyCredentials(name, credentials, bin);
+    return { name, homes, publishedPort: await publishedPortOf(name, bin), ...(startedMachine ? { startedMachine } : {}) };
   }
   // Allocated BEFORE the container exists, because publishing is a
   // creation-time property: an HTTP-speaking backend that discovers it needs a
   // port later would have nowhere to put it.
   const publishPort = await freePort();
   await ensureImage(cfg, repoRoot, bin);
-  // The agent's own claude home must exist before it is mounted, or podman
-  // creates it root-owned inside the VM and the agent cannot write its
-  // transcripts.
-  mkdirSync(agentClaudeHome(), { recursive: true });
-  mkdirSync(agentKimiHome(), { recursive: true });
-  if (cfg.claudeCredentialPassthrough) syncKimiConfig();
-  const credentials = resolvePassthrough(cfg.credentials);
+  if (passLogins && opts.backend === 'kimi') syncKimiConfig(join(kimiHome({ ...process.env, ...opts.accountEnv }), 'config.toml'), homes.kimi);
   await podman(bin, podmanRunArgs(cfg, name, repoRoot, {
-    credentialPassthrough: cfg.claudeCredentialPassthrough,
+    credentialPassthrough: passLogins,
     credentials,
     publishPort,
     hasContainerfile: existsSync(join(repoRoot, cfg.containerfile)),
+    ...runOpts,
   }));
   // Copies happen after the container exists, because `podman cp` needs a
   // target. Failing to place one is not fatal to the run: the agent will report
   // the tool being logged out, which is a far clearer symptom than a container
   // that refused to start.
-  if (cfg.claudeCredentialPassthrough) await syncClaudeCredential(name, bin);
+  await syncAgentLogins(name, bin, homes, opts, passLogins);
   await applyCredentials(name, credentials, bin);
   return {
     name,
+    homes,
     publishedPort: publishPort,
     ...(startedMachine ? { startedMachine } : {}),
     ...(remounted ? { remounted } : {}),
   };
 }
 
+/** The agent's own login, for the agent this turn runs, from the selected account. */
+async function syncAgentLogins(
+  name: string,
+  bin: string,
+  homes: { claude: string; kimi: string },
+  opts: { backend?: string; accountEnv?: Record<string, string> },
+  passLogins: boolean,
+): Promise<void> {
+  if (!passLogins) return;
+  if (opts.backend === undefined || opts.backend === 'claude' || opts.backend === 'claude-cli') {
+    const configDir = opts.accountEnv?.CLAUDE_CONFIG_DIR?.trim();
+    await syncClaudeCredential(name, bin, undefined, configDir ? join(configDir, '.credentials.json') : hostClaudeCredential());
+  }
+  if (opts.backend === 'kimi') {
+    syncKimiConfig(join(kimiHome({ ...process.env, ...opts.accountEnv }), 'config.toml'), homes.kimi);
+  }
+}
+
 /**
- * The guest paths this task's container should have mounted, read off the very argv that would
- * create it — so this cannot drift from `podmanRunArgs`. Bind mounts and named volumes only:
- * anonymous volumes (`ephemeralPaths`) are per-container scratch, not something a task can lack.
+ * Create, on the host, every directory a task's container mounts — podman refuses a missing
+ * source, and one it creates itself inside the VM is root-owned and unwritable by the agent —
+ * and, once, bring this project's conversations over from the shared agent home of earlier
+ * cezar versions, so a Continue still finds its session. Best-effort throughout.
  */
-export function wantedMounts(cfg: SandboxConfig, repoRoot: string, name: string): string[] {
+function prepareHostDirs(repoRoot: string, runId: string, homes: { claude: string; kimi: string }): void {
+  const data = join(repoRoot, '.ai', 'cezar');
+  for (const dir of [homes.claude, homes.kimi, join(data, 'tmp', runId), join(data, 'runs')]) {
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      // the mount is skipped when its source is missing
+    }
+  }
+  migrateLegacyClaudeSessions(repoRoot, homes.claude);
+  // `extensions.worktreeConfig` makes git read the worktree's own `config.worktree`, which lives in
+  // the git dir the task must write. It is mounted read-only (`repoMounts`) — which needs it to
+  // exist first.
+  try {
+    const gitConfig = readFileSync(join(repoRoot, '.git', 'config'), 'utf8');
+    const ownGitDir = join(repoRoot, '.git', 'worktrees', runId);
+    if (/worktreeconfig\s*=\s*true/i.test(gitConfig) && existsSync(ownGitDir)) {
+      const file = join(ownGitDir, 'config.worktree');
+      if (!existsSync(file)) writeFileSync(file, '');
+    }
+  } catch {
+    // no git dir, or not a worktree task
+  }
+}
+
+/**
+ * Earlier versions kept ONE `~/.claude-agent` for every isolated task. Claude files a session
+ * under `projects/<cwd with every non-alphanumeric as "-">`, so this project's sessions are the
+ * entries starting with its root encoded the same way — copied (never moved: an older cezar
+ * may still be running) into the per-project home, once.
+ */
+function migrateLegacyClaudeSessions(repoRoot: string, claudeHome: string): void {
+  try {
+    const legacy = join(homedir(), '.claude-agent', 'projects');
+    const target = join(claudeHome, 'projects');
+    if (!existsSync(legacy) || existsSync(target)) return;
+    const prefix = repoRoot.replace(/[^A-Za-z0-9]/g, '-');
+    mkdirSync(target, { recursive: true });
+    for (const entry of readdirSync(legacy)) {
+      if (entry === prefix || entry.startsWith(`${prefix}-`)) {
+        cpSync(join(legacy, entry), join(target, entry), { recursive: true });
+      }
+    }
+  } catch {
+    // a Continue then starts a fresh session — the worktree is intact either way
+  }
+}
+
+/** One mount as podman reports it, reduced to what decides whether a container still fits. */
+export interface MountSpec {
+  /** `bind` for a host path, `volume` for a named volume. */
+  type: 'bind' | 'volume';
+  /** Host path (bind) or volume name (volume). */
+  source: string;
+  destination: string;
+  readOnly: boolean;
+}
+
+/**
+ * The mounts this task's container should have, read off the very argv that would create it — so
+ * this cannot drift from `podmanRunArgs`. Anonymous volumes (`ephemeralPaths`) are per-container
+ * scratch and are left out.
+ */
+export function wantedMounts(
+  cfg: SandboxConfig,
+  repoRoot: string,
+  name: string,
+  runOpts: { runId?: string; homes?: { claude: string; kimi: string }; backends?: readonly string[]; accountEnv?: Record<string, string> } = {},
+): MountSpec[] {
   const args = podmanRunArgs(cfg, name, repoRoot, {
     credentialPassthrough: cfg.claudeCredentialPassthrough,
     credentials: resolvePassthrough(cfg.credentials),
     hasContainerfile: existsSync(join(repoRoot, cfg.containerfile)),
+    ...runOpts,
   });
-  const targets: string[] = [];
+  const out: MountSpec[] = [];
   args.forEach((arg, i) => {
     if (args[i - 1] !== '-v') return;
-    const parts = arg.split(':');
-    if (parts.length >= 2 && parts[1]) targets.push(parts[1]);
+    const [source, destination, options] = arg.split(':');
+    if (!source || !destination) return;
+    out.push({
+      type: source.startsWith('/') ? 'bind' : 'volume',
+      source: trimSlash(source),
+      destination: trimSlash(destination),
+      readOnly: (options ?? '').split(',').includes('ro'),
+    });
   });
-  return targets;
+  return out;
 }
 
-/** Wanted guest paths the container does not have mounted. Unreadable answers none — never a
- *  reason to recreate a container on a probe that could not tell. */
-async function missingMounts(name: string, wanted: readonly string[], bin: string): Promise<string[]> {
+function trimSlash(path: string): string {
+  return path.length > 1 ? path.replace(/\/+$/, '') : path;
+}
+
+/**
+ * How the container's mounts differ from the wanted ones, as human-readable guest paths: wanted
+ * and absent, present and no longer wanted, or present with the wrong source or access. Empty when
+ * it fits. Unreadable answers none — never a reason to recreate a container on a probe that could
+ * not tell.
+ */
+export async function mountDrift(
+  name: string,
+  wanted: readonly MountSpec[],
+  ephemeralPaths: readonly string[],
+  bin: string,
+): Promise<string[]> {
+  let have: MountSpec[];
   try {
-    const { stdout } = await run(bin, ['inspect', name, '--format', '{{range .Mounts}}{{.Destination}}\n{{end}}']);
-    const have = new Set(stdout.split('\n').map((line) => line.trim()).filter(Boolean));
-    if (have.size === 0) return [];
-    return wanted.filter((target) => !have.has(target));
+    const { stdout } = await run(bin, ['inspect', name, '--format', '{{json .Mounts}}']);
+    const rows = JSON.parse(stdout.trim() || '[]') as Array<{ Type?: string; Name?: string; Source?: string; Destination?: string; RW?: boolean }>;
+    have = rows
+      .filter((row) => row.Destination)
+      .map((row) => ({
+        type: row.Type === 'volume' ? 'volume' as const : 'bind' as const,
+        source: trimSlash(row.Type === 'volume' ? row.Name ?? '' : row.Source ?? ''),
+        destination: trimSlash(row.Destination!),
+        readOnly: row.RW === false,
+      }));
   } catch {
     return [];
   }
+  if (have.length === 0) return [];
+  const ephemeral = new Set(ephemeralPaths.map(trimSlash));
+  const key = (m: MountSpec) => `${m.type}|${m.source}|${m.destination}|${m.readOnly}`;
+  const wantedKeys = new Set(wanted.map(key));
+  const haveKeys = new Set(have.filter((m) => !(m.type === 'volume' && ephemeral.has(m.destination))).map(key));
+  const drift = new Set<string>();
+  for (const m of wanted) if (!haveKeys.has(key(m))) drift.add(m.destination);
+  for (const m of have) {
+    if (m.type === 'volume' && ephemeral.has(m.destination)) continue;
+    if (!wantedKeys.has(key(m))) drift.add(m.destination);
+  }
+  return [...drift];
 }
 
 /**
@@ -312,7 +465,16 @@ export async function applyCredentials(
   credentials: ResolvedCredential[],
   bin = 'podman',
 ): Promise<void> {
-  const plan = credentialCopyPlan(credentials, container);
+  // Never through a mount. A path under a bind-mounted directory IS the host's file: a container
+  // created when `~/.ssh` was passed through whole still has it mounted after the operator
+  // narrowed to single keys, and "copying" the narrowed key, chmodding it or — on un-tick —
+  // `rm -f`-ing it then rewrote or DELETED the operator's real key on the Mac. Such a container is
+  // recreated with the right mounts on its next turn (`mountDrift`); until then, hands off.
+  const mounted = await mountDestinations(container, bin);
+  const plan = credentialCopyPlan(credentials, container).filter((args) => {
+    const dest = args[2]?.split(':')[1];
+    return dest !== undefined && !isUnderMount(dest, mounted);
+  });
   const placing = plan.map((args) => args[2]?.split(':')[1]).filter((p): p is string => Boolean(p));
   // REVOKE before granting. Un-ticking a credential used to change the config
   // and nothing in the container: this function only ever copied, so a revoked
@@ -321,7 +483,7 @@ export async function applyCredentials(
   // task you are in. The manifest records what cezar itself placed, so only
   // that is ever removed; files the agent made are not cezar's to delete.
   for (const path of await readCredentialManifest(container, bin)) {
-    if (placing.includes(path)) continue;
+    if (placing.includes(path) || isUnderMount(path, mounted)) continue;
     await run(bin, ['exec', container, 'rm', '-f', path]).catch(() => undefined);
   }
   for (const planned of plan) {
@@ -347,9 +509,28 @@ export async function applyCredentials(
       await run(bin, ['exec', container, 'chmod', perms.dir, dirname(dest)]).catch(() => undefined);
       await run(bin, ['exec', container, 'chmod', perms.file, dest]).catch(() => undefined);
     }
-    if (staged) rmSync(staged, { force: true });
+    // The whole temp DIRECTORY, not just the file: removing the file alone left one empty
+    // `cez-cred-*` directory behind per turn.
+    if (staged) rmSync(dirname(staged), { recursive: true, force: true });
   }
   await writeCredentialManifest(container, placing, bin);
+}
+
+/** Every mount destination of a container. Unreadable answers EVERYTHING-is-mounted for safety:
+ *  `undefined`, which `isUnderMount` reads as "touch nothing". */
+async function mountDestinations(container: string, bin: string): Promise<string[] | undefined> {
+  try {
+    const { stdout } = await run(bin, ['inspect', container, '--format', '{{range .Mounts}}{{.Destination}}\n{{end}}']);
+    return stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Is `path` a mount destination or inside one? An unknown mount table means yes. */
+export function isUnderMount(path: string, mounts: readonly string[] | undefined): boolean {
+  if (mounts === undefined) return true;
+  return mounts.some((m) => path === m || path.startsWith(m.endsWith('/') ? m : `${m}/`));
 }
 
 /**
@@ -368,9 +549,12 @@ async function readCredentialManifest(container: string, bin: string): Promise<s
     const { stdout } = await run(bin, ['exec', container, 'cat', CREDENTIAL_MANIFEST]);
     const parsed: unknown = JSON.parse(stdout);
     if (!Array.isArray(parsed)) return [];
-    // Only paths cezar could have placed: absolute, and no way out of /root.
+    // Absolute paths only, no climbing. Not limited to /root: a custom credential may name any
+    // guest path, and was never revoked when it lay elsewhere. The file lives in the container, so
+    // an agent could edit it — which is why every removal also refuses a path under a mount
+    // (`isUnderMount`): the worst an edited manifest does is delete a file inside the container.
     return parsed.filter((p): p is string =>
-      typeof p === 'string' && p.startsWith('/root/') && !p.split('/').includes('..'));
+      typeof p === 'string' && p.startsWith('/') && !p.split('/').includes('..'));
   } catch {
     return []; // first apply, or a container from before the manifest existed
   }
@@ -505,9 +689,14 @@ function stageSanitized(credential: ResolvedCredential): string | undefined {
   if (!credential.hostPath) return undefined;
   try {
     const dir = mkdtempSync(join(tmpdir(), 'cez-cred-'));
-    const staged = join(dir, basename(credential.hostPath));
-    writeFileSync(staged, sanitizeSshConfig(readFileSync(credential.hostPath, 'utf8')), { mode: 0o600 });
-    return staged;
+    try {
+      const staged = join(dir, basename(credential.hostPath));
+      writeFileSync(staged, sanitizeSshConfig(readFileSync(credential.hostPath, 'utf8')), { mode: 0o600 });
+      return staged;
+    } catch {
+      rmSync(dir, { recursive: true, force: true });
+      return undefined;
+    }
   } catch {
     return undefined;
   }
@@ -525,8 +714,10 @@ export interface TaskContainer {
   publishedPort?: number;
   /** Set when cezar had to start the stopped podman VM first — worth a line on the task. */
   startedMachine?: string;
-  /** Guest paths a running task's container lacked, so it was recreated to mount them. */
+  /** Guest paths whose mount changed since the container started, so it was recreated. */
   remounted?: string[];
+  /** This project's agent homes on the host. */
+  homes?: { claude: string; kimi: string };
 }
 
 /**
@@ -678,6 +869,28 @@ async function credentialReadable(container: string, ask: PodmanQuery): Promise<
 /** Remove this task's container. Never throws — teardown must not fail a run. */
 export async function removeTaskContainer(runId: string, bin = 'podman'): Promise<void> {
   // `-v` so the anonymous volumes (node_modules and friends) go with it —
-  // without it every task would leak a multi-hundred-MB volume.
-  await run(bin, ['rm', '-f', '-v', taskContainerName(runId)]).catch(() => undefined);
+  // without it every task would leak a multi-hundred-MB volume. Bounded: a
+  // wedged podman VM must not hold a reclaim (or a boot sweep) open forever.
+  await run(bin, ['rm', '-f', '-v', taskContainerName(runId)], { timeout: REMOVE_TIMEOUT_MS }).catch(() => undefined);
+}
+
+const REMOVE_TIMEOUT_MS = 30_000;
+
+/**
+ * Remove the containers of tasks whose worktree was just reclaimed or pruned. A container has
+ * its worktree's lifetime (see `enforceRetention`), so every path that drops a worktree drops
+ * its container too — otherwise each one leaked a stopped container and its volumes.
+ *
+ * `wasIsolated` gates the spawn: a host-only task never had a container, and a workspace that
+ * never used isolation should not start a `podman` process at all. Fire-and-forget by design —
+ * callers `void` it; it never throws.
+ */
+export async function removeContainersOf(
+  runIds: readonly string[],
+  wasIsolated: (runId: string) => boolean,
+  bin = 'podman',
+): Promise<void> {
+  for (const runId of runIds) {
+    if (wasIsolated(runId)) await removeTaskContainer(runId, bin);
+  }
 }

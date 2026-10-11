@@ -28,7 +28,8 @@ Three words, no jargon — **task**, **skill**, **chain**:
   the live session while it works.
 - 📖 **Skills** are Markdown playbooks. Drop them in `.ai/skills/` or
   `.ai/cezar/skills/`, or pull them from a shared **team skills repo** (a bare
-  git clone cached globally in `~/.cache/cez/`). A workflow step references one by
+  git clone cached globally in `~/.cache/cez/`, or `$CEZ_HOME/cache/` when
+  `CEZ_HOME` is set). A workflow step references one by
   `skill: <name>` and its body becomes the agent's extra system prompt — so you
   shape *how* the agent reasons without touching code.
 - 🔗 **Chains (workflows)** stitch steps into a pipeline: agent steps plus shell
@@ -439,9 +440,11 @@ cezar shells out to your locally installed, logged-in agent CLI —
 means headless `stream-json` mode, tool access via `--allowedTools`, with
 unapproved tools denied without prompting (`--permission-mode dontAsk`) inside
 the task's worktree — but note the zero-config default list (`Read`, `Edit`,
-`Write`, `Grep`, `Glob`, `Bash`) grants unrestricted `Bash` unless a step sets
-`bashAllowlist`, so treat a run as having full shell access in its worktree,
-not a sandboxed allowlist. Set `CEZ_APPROVAL_GATE=1` to select Claude's
+`Write`, `Grep`, `Glob`, `Bash`, `WebFetch`, `WebSearch`, `Skill`) grants
+unrestricted `Bash` unless a step sets `bashAllowlist`, so treat a run as having
+full shell access in its worktree, not a sandboxed allowlist. The web tools and
+`Skill` are on the list because `dontAsk` refuses anything unlisted without a
+prompt: left off, an agent could not look anything up or invoke a skill at all. Set `CEZ_APPROVAL_GATE=1` to select Claude's
 `acceptEdits` mode, but cezar has no cockpit permission response channel, so
 approval prompts are not actionable in the cockpit. Codex, Junie and OpenCode are driven through their own
 native protocols and don't honor `allowedTools` at all — see
@@ -456,7 +459,7 @@ Useful environment variables:
 | `CEZ_TELEMETRY=0` | Block usage telemetry even after you opted in. Telemetry is opt-in — nothing is sent until you answer yes in the cockpit, Settings → Privacy or `cezar telemetry enable` ([docs/telemetry.md](telemetry.md)). `DO_NOT_TRACK=1` works too. `CEZ_TELEMETRY=1` only lifts the CI / test-runner / `CEZ_DRY_RUN=1` block; it never grants consent. |
 | `CEZ_INSTANCE_ID` | Internal server-install identity set automatically in generated systemd/launchd services; normally leave unset. It is surfaced additively by `/api/v1/health` for install verification. |
 | `CEZ_AGENT_MODELS_LOCKED=1` | Globally lock each runner to the model configured in its native Claude/Codex/OpenCode settings while keeping runner selection available. Exact `1` also delegates authentication and provider enablement to those native agents, so Cezar skips its credential probes and provider-disable preferences. Existing Cezar presets are preserved but ignored, and an environment change requires a restart. The config-file equivalent is `"modelsLocked": true` in global `~/.cezar/config.json` or one repository's `.ai/cezar/config.json`; config-file locks do not disable provider checks. |
-| `CEZ_MCP_TOOLS=0` | Refuse MCP tools to Claude agents. By default a step with no tool list of its own may use every tool of every MCP server Claude would load — the claude.ai connectors (Gmail, BigQuery, Notion…) and any configured server — found with `claude mcp list` and from each session's own tool list. That includes tools that act as you (sending mail, writing data), in tasks nobody is watching. |
+| `CEZ_MCP_TOOLS=0` | Stop granting your own MCP servers to Claude agents by default. By default a step with no tool list of its own may use every tool of every MCP server Claude would load — the claude.ai connectors (Gmail, BigQuery, Notion…) and any configured server — found with `claude mcp list` and from each session's own tool list. That includes tools that act as you (sending mail, writing data), in tasks nobody is watching. With `0`, the project's private servers (`.ai/cezar/mcp.local.json`) are still attached and granted, and so is any `mcp__…` entry a workflow step names explicitly in its tool list. |
 | `CEZ_APPROVAL_GATE=1` | Select Claude's `acceptEdits` mode. Cezar has no cockpit permission response channel; by default, unapproved tools are denied without interrupting the run. |
 | `CEZ_FOLLOWUPS=1` | Turn on the global follow-up **Inbox**: agents are asked to leave follow-ups in `todos.json` when they finish, and the Inbox view appears. Off by default — each task's own **Notes** handoff journal runs either way. |
 | `CEZ_AUTOMATIONS=0` | Turn **automations** off. On by default since the automations redesign (spec `.ai/specs/2026-09-14-automations-redesign.md`): the Automations view lists GitHub-triggered and scheduled automations, and cezar polls GitHub or fires schedules on each enabled one while it is running — nothing runs until you enable an automation yourself. An agent can also **create an automation from a prompt**: type "whenever a PR is opened, review it" into New task — pick the built-in `create-cezar-automation` skill, or just ask; every task's system prompt teaches it to recognise the intent — and the agent writes the definition and creates it through `cez automation create` (paused, with a `cez automation check` preview of what it would match), then links the Automations page. Only the exact value `0` opts out (`CEZ_AUTOMATIONS=1`, the old opt-in, is accepted and changes nothing); opted out, the nav item is absent, the endpoints answer `409`, and the workspace scheduler never starts. Read at boot, so restart after changing it; definitions, receipts and high-watermarks are kept either way. |

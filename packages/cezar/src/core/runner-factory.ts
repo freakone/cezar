@@ -49,12 +49,18 @@ export function createRunner(
 }
 
 /**
- * True when `backend` honours a launcher. The engine must never claim isolation
- * on a backend that would ignore it, so this is an allowlist of the runners that
- * take one — a runner added without a launcher (Cursor, Junie and Copilot
- * arrived that way) runs on the host and is reported as such, not as isolated.
+ * True when `backend` can really run in a task container. The engine must never claim isolation
+ * on a backend that would ignore it — or that cannot work there — so this is an allowlist.
+ *
+ * Taking a launcher is necessary, not sufficient: the agent's CLI must be IN the image and its
+ * login must reach the container. Only Claude Code and Kimi Code meet both (the base image
+ * installs them; `syncClaudeCredential` / the mounted Kimi login carry them). Codex, OpenCode and
+ * pi take a launcher, but the image has no binary for them and nothing passes their login — an
+ * isolated task with them failed with `exec: codex: not found` while its record said isolated.
+ * They run on this machine, reported as such, until the image and their logins exist. Runners
+ * without a launcher at all (Cursor, Junie, Copilot) likewise.
  */
-const LAUNCHER_BACKENDS: ReadonlySet<string> = new Set(['claude', 'claude-cli', 'codex', 'opencode', 'pi', 'kimi']);
+const LAUNCHER_BACKENDS: ReadonlySet<string> = new Set(['claude', 'claude-cli', 'kimi']);
 
 export function backendSupportsLauncher(backend: AgentBackend | RunnerId | undefined): boolean {
   return LAUNCHER_BACKENDS.has(backend ?? 'claude');

@@ -287,8 +287,20 @@ type CloneOutcome = { ok: true } | { ok: false; error: string; notFound?: boolea
  * key is how that machine authenticates at all), the same rule
  * `nonInteractiveSsh` in git-worktree.ts follows for fetches.
  */
-export function nonInteractiveSsh(env: NodeJS.ProcessEnv = process.env): string {
-  return `${env.GIT_SSH_COMMAND?.trim() || 'ssh'} -o BatchMode=yes -o ConnectTimeout=15`;
+export function nonInteractiveSsh(env: NodeJS.ProcessEnv = process.env, configured = ''): Record<string, string> {
+  // git's precedence: GIT_SSH_COMMAND, then `core.sshCommand` (global, for a clone), then GIT_SSH
+  // — a bare program with nowhere to put options, so it is left alone rather than overridden.
+  const own = env.GIT_SSH_COMMAND?.trim() || configured.trim();
+  if (!own && env.GIT_SSH) return {};
+  return { GIT_SSH_COMMAND: `${own || 'ssh'} -o BatchMode=yes -o ConnectTimeout=15` };
+}
+
+/** The operator's global `core.sshCommand` — a clone has no repo config yet. Empty when unset. */
+function globalSshCommand(): Promise<string> {
+  return new Promise((resolvePromise) => {
+    execFile('git', ['config', '--global', '--get', 'core.sshCommand'], { timeout: 5_000 }, (err, stdout) =>
+      resolvePromise(err ? '' : String(stdout).trim()));
+  });
 }
 
 function spawnClone(
@@ -399,9 +411,10 @@ export const gitlabCloneRunner: CloneRunner = async (ref, dir, onLine, signal) =
   // An ssh address goes straight to git: glab picks its own protocol from its
   // config, and the user just told us which one works here.
   if (ref.transport === 'ssh') {
-    const viaSsh = await spawnClone('git', ['clone', '--progress', url, dir], onLine, signal, {
-      GIT_SSH_COMMAND: nonInteractiveSsh(),
-    });
+    const viaSsh = await spawnClone(
+      'git', ['clone', '--progress', url, dir], onLine, signal,
+      nonInteractiveSsh(process.env, await globalSshCommand()),
+    );
     if (viaSsh.ok || signal?.aborted || !SSH_UNUSABLE.test(viaSsh.error)) return viaSsh;
     // ssh itself could not be used — no key, an unknown host key — which is
     // the case HTTPS exists for: a public project clones with nothing set up.
@@ -417,9 +430,22 @@ export const gitlabCloneRunner: CloneRunner = async (ref, dir, onLine, signal) =
 /** ssh failed before GitLab could say anything about the project itself. */
 const SSH_UNUSABLE = /Permission denied \(publickey|Host key verification failed|no such identity|Connection timed out|Could not resolve hostname/i;
 
+/**
+ * `glab repo clone` gets the full HTTPS URL, never the bare slug — the same
+ * rule as `ghCloneArgs`. A slug is resolved against glab's configured DEFAULT
+ * host, so on a machine logged in to a company GitLab, `gitlab.com/acme/app`
+ * pasted into the dialog would clone `acme/app` from the company instance: a
+ * different repository, or a confusing "not found", under the right name. The
+ * URL pins the host the user typed. Kept pure so that is testable without a
+ * `glab` binary.
+ */
+export function glabCloneArgs(ref: RepoRef, dir: string): string[] {
+  return ['repo', 'clone', ref.cloneUrl, dir, '--', '--progress'];
+}
+
 const cloneGitlabOverHttps: CloneRunner = async (ref, dir, onLine, signal) => {
   const url = ref.cloneUrl ?? `https://gitlab.com/${ref.slug}.git`;
-  const viaGlab = await spawnClone('glab', ['repo', 'clone', ref.slug, dir, '--', '--progress'], onLine, signal);
+  const viaGlab = await spawnClone('glab', glabCloneArgs(ref, dir), onLine, signal);
   if (viaGlab.ok || !viaGlab.notFound) return viaGlab;
   return spawnClone('git', ['clone', '--progress', url, dir], onLine, signal);
 };

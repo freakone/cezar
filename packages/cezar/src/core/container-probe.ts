@@ -50,7 +50,13 @@ export function parseMachines(stdout: string): { running: boolean; name?: string
     const rows = JSON.parse(stdout) as Array<{ Name?: string; Running?: boolean; LastUp?: string }>;
     if (!Array.isArray(rows) || rows.length === 0) return { running: false };
     const up = rows.find((r) => r.Running === true);
-    return up ? { running: true, name: up.Name } : { running: false, name: rows[0]?.Name };
+    if (up) return { running: true, name: up.Name };
+    // Which one to START: the machine podman itself connects to (`Default`, starred `*` in the
+    // name on some versions), not merely the first row — starting a machine the CLI does not
+    // talk to leaves every container command failing with the VM "up".
+    const preferred = rows.find((r) => (r as { Default?: boolean }).Default === true || r.Name?.endsWith('*'))
+      ?? rows[0];
+    return { running: false, name: preferred?.Name?.replace(/\*$/, '') };
   } catch {
     return { running: false };
   }

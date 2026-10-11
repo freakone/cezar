@@ -24,6 +24,7 @@ import {
   ghCloneArgs,
   ghCloneRunner,
   gitlabCloneRunner,
+  glabCloneArgs,
   isValidCheckoutName,
   parseRepoRef,
   type CloneRunner,
@@ -187,6 +188,35 @@ describe('checkout — GitHub transport', () => {
   });
 });
 
+describe('checkout — glab gets the host the user typed', () => {
+  // `glab repo clone acme/app` resolves the slug against glab's configured
+  // DEFAULT host — on a machine logged in to a company GitLab, a pasted
+  // gitlab.com URL would clone from the company instance instead.
+  it('passes the full https clone URL, never the bare slug', () => {
+    const ref = parseRepoRef('https://gitlab.com/acme/platform/app')!;
+    expect(glabCloneArgs(ref, '/checkouts/app')).toEqual([
+      'repo', 'clone', 'https://gitlab.com/acme/platform/app.git', '/checkouts/app', '--', '--progress',
+    ]);
+  });
+
+  it('the runner hands that URL to a real glab invocation', async () => {
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'cez-glab-url-'));
+    const bin = join(root, 'bin');
+    const log = join(root, 'calls.log');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'glab'), `#!/bin/sh\necho "glab $*" >> "${log}"\nmkdir -p "$4" && exit 0\n`, { mode: 0o755 });
+    vi.stubEnv('PATH', `${bin}:/usr/bin:/bin`);
+    try {
+      const dir = join(root, 'out');
+      expect(await gitlabCloneRunner(parseRepoRef('gitlab.com/acme/app')!, dir, () => {}, undefined)).toEqual({ ok: true });
+      expect(readFileSync(log, 'utf8').trim()).toBe(`glab repo clone https://gitlab.com/acme/app.git ${dir} -- --progress`);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('checkout — a GitLab ssh address', () => {
   /** A fake `git` that logs its argv and GIT_SSH_COMMAND, and fails an ssh URL with `sshError`. No `glab`:
    *  the HTTPS fallback then goes to git, as on a machine without the GitLab CLI. */
@@ -196,7 +226,9 @@ describe('checkout — a GitLab ssh address', () => {
     const log = join(root, 'calls.log');
     mkdirSync(bin);
     const fail = sshError === null ? '' : `case "$3" in git@*) echo "${sshError}" >&2; exit 128;; esac\n`;
-    writeFileSync(join(bin, 'git'), `#!/bin/sh\necho "git $* | $GIT_SSH_COMMAND" >> "${log}"\n${fail}mkdir -p "$4" && exit 0\n`, { mode: 0o755 });
+    // `git config --global --get core.sshCommand` answers from $FAKE_SSH_COMMAND (unset → exit 1).
+    const config = 'if [ "$1" = config ]; then [ -n "$FAKE_SSH_COMMAND" ] && echo "$FAKE_SSH_COMMAND" && exit 0; exit 1; fi\n';
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\n${config}echo "git $* | $GIT_SSH_COMMAND" >> "${log}"\n${fail}mkdir -p "$4" && exit 0\n`, { mode: 0o755 });
     // System dirs only besides the fakes: a real glab (Homebrew) must not answer for the absent one.
     vi.stubEnv('PATH', `${bin}:/usr/bin:/bin`);
     vi.stubEnv('GIT_SSH_COMMAND', '');
@@ -212,6 +244,17 @@ describe('checkout — a GitLab ssh address', () => {
     expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual([
       `git clone --progress git@gitlab.com:flossa.ai/voice.git ${dir} | ssh -o BatchMode=yes -o ConnectTimeout=15`,
     ]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('extends the operator\'s global core.sshCommand rather than replacing it — git\'s own precedence', async () => {
+    const { root, log } = fakeClis(null);
+    vi.stubEnv('FAKE_SSH_COMMAND', 'ssh -i ~/.ssh/work');
+    const dir = join(root, 'out');
+    expect(await gitlabCloneRunner(parseRepoRef('git@gitlab.com:flossa.ai/voice.git')!, dir, () => {}, undefined)).toEqual({ ok: true });
+    expect(readFileSync(log, 'utf8').trim()).toBe(
+      `git clone --progress git@gitlab.com:flossa.ai/voice.git ${dir} | ssh -i ~/.ssh/work -o BatchMode=yes -o ConnectTimeout=15`,
+    );
     rmSync(root, { recursive: true, force: true });
   });
 

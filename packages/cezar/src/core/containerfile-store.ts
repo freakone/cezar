@@ -106,8 +106,6 @@ export function acceptSuggestions(
   const chosen = current.pending.filter((s) => commands.includes(s.command));
   const keptPending = current.pending.filter((s) => !commands.includes(s.command));
 
-  // Everything accepted so far, in order, so the file is rewritten whole rather
-  // than appended to — an appended file drifts out of order and duplicates.
   const acceptedAll = mergeSuggestions(
     current.accepted.map((command) => ({ command, manager: managerOf(command) })),
     chosen,
@@ -115,7 +113,25 @@ export function acceptSuggestions(
 
   const target = join(repoRoot, containerfileRelPath);
   mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, render(acceptedAll), 'utf8');
+  let existing: string | undefined;
+  try {
+    existing = readFileSync(target, 'utf8');
+  } catch {
+    existing = undefined;
+  }
+  if (existing === undefined) {
+    writeFileSync(target, render(acceptedAll), 'utf8');
+  } else {
+    // A file that exists is the USER's, whoever wrote its first line: they may have hand-edited
+    // cezar's render or written their own `FROM`. Rewriting it from `accepted` silently threw
+    // that work away, so only the commands it does not already run are appended.
+    const present = new Set(existing.split('\n').map((line) => line.trim()));
+    const added = chosen.filter((s) => !present.has(`RUN ${s.command}`)).map((s) => `RUN ${s.command}`);
+    if (added.length > 0) {
+      const separator = existing === '' || existing.endsWith('\n') ? '' : '\n';
+      writeFileSync(target, `${existing}${separator}${added.join('\n')}\n`, 'utf8');
+    }
+  }
 
   save(dataDir, {
     pending: keptPending,

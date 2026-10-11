@@ -454,7 +454,7 @@ export const CONFIG_FILES: ConfigFileDef[] = [
     holdsMcp: true,
     private: true,
     precedence:
-      'Private MCP servers for this project only — same shape as .mcp.json (key: mcpServers). Lives in cezar\'s git-ignored data dir, never in a worktree, so it is never committed. cezar adds these servers to every run of this project at launch (Claude --mcp-config, Codex thread config, OpenCode OPENCODE_CONFIG_CONTENT, Junie/Copilot ACP session); the agent\'s own MCP config still loads, and on a name clash this file wins. Cursor and pi have no launch-time MCP channel.',
+      'Private MCP servers for this project only — same shape as .mcp.json (key: mcpServers). Lives in cezar\'s git-ignored data dir, never in a worktree, so it is never committed. cezar adds these servers to every run of this project at launch (Claude --mcp-config, Codex thread config, OpenCode OPENCODE_CONFIG_CONTENT, Junie/Copilot/Kimi ACP session); the agent\'s own MCP config still loads, and on a name clash this file wins. Cursor and pi have no launch-time MCP channel.',
     docsUrl: PRIVATE_MCP_DOCS,
   },
 

@@ -313,20 +313,43 @@ function mapUsageRecord(value: Record<string, unknown>, state: KimiUiMapperState
   return { events: [{ type: 'usage.updated', usage: summed }], state: { ...state, turnUsage: summed } };
 }
 
-function completeTurn(reason: StopReason, state: KimiUiMapperState): KimiUiMapping {
+/**
+ * A turn no `session/prompt` answer will ever end: Kimi died, or cezar stopped it, mid-prompt.
+ * With a `message` it settles as an error answer would (`session.error`, then
+ * `turn.completed{error}`); without one it settles with `stopReason` — `cancelled` for a stop
+ * cezar asked for, `timeout` for the run's own deadline. The Kimi twin of `abortAcpTurn`.
+ */
+export function abortKimiTurn(state: KimiUiMapperState, stopReason: StopReason, message?: string): KimiUiMapping {
+  if (!state.turnId) return closeOpen(state);
+  return message === undefined ? completeTurn(stopReason, state) : completeTurn('error', state, message);
+}
+
+function completeTurn(reason: StopReason, state: KimiUiMapperState, errorMessage?: string): KimiUiMapping {
   const closed = closeOpen(state);
   if (!closed.state.turnId) return closed;
+  const events = [...closed.events];
+  let next = closed.state;
+  // Tools a cancelled, failed or abandoned turn left running would spin forever: settle them.
+  if (reason !== 'end_turn') {
+    const tools = new Map(next.tools);
+    for (const [id, tool] of next.tools) {
+      if (tool.status !== 'pending' && tool.status !== 'running') continue;
+      const item: UiToolItem = { ...tool, status: 'failed', error: `turn ended (${reason}) before the tool finished` };
+      tools.set(id, item);
+      events.push({ type: 'item.completed', item });
+    }
+    next = { ...next, tools };
+  }
+  if (errorMessage !== undefined) events.push({ type: 'session.error', message: errorMessage, fatal: false });
   const event: Extract<UiEvent, { type: 'turn.completed' }> = {
     type: 'turn.completed',
-    turnId: closed.state.turnId,
+    turnId: next.turnId!,
     stopReason: reason,
   };
-  if (closed.state.turnUsage) event.usage = closed.state.turnUsage;
+  if (next.turnUsage) event.usage = next.turnUsage;
+  events.push(event);
   // Cleared with the turn: the next turn's counts are its own.
-  return {
-    events: [...closed.events, event],
-    state: { ...closed.state, turnId: null, turnUsage: null },
-  };
+  return { events, state: { ...next, turnId: null, turnUsage: null } };
 }
 
 /** ACP stop reasons, onto the protocol's (they are nearly the same set). */

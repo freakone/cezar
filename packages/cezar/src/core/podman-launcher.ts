@@ -1,12 +1,19 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { LaunchOpts, ProcessLauncher } from './process-launcher.ts';
 import { containerEnvPairs, guestKillScript, guestScript } from './container-runtime.ts';
 import type { SandboxConfig } from '../config.ts';
-import { credentialEnvPairs, credentialMountArgs, resolvePassthrough, type ResolvedCredential } from './credential-passthrough.ts';
+import {
+  credentialEnvPairs,
+  credentialMountArgs,
+  isGuestPath,
+  isVolumeName,
+  resolvePassthrough,
+  type ResolvedCredential,
+} from './credential-passthrough.ts';
 import { agentKimiHome, kimiHome } from './kimi-home.ts';
 
 /**
@@ -76,6 +83,9 @@ export const GUEST_KIMI_HOME = '/root/.kimi-code';
 /** The shared base every repo image builds FROM, shipped with cezar itself. */
 export const BASE_IMAGE_TAG = 'localhost/cezar-agent/base:latest';
 
+/** The follow-up inbox an isolated agent writes, inside the run's scratch dir — see `podmanExec`. */
+export const ISOLATED_TODOS_FILE = 'todos.json';
+
 /**
  * The image a repo's containers run. Precedence, highest first:
  *
@@ -117,26 +127,40 @@ export function podmanRunArgs(
     hasContainerfile?: boolean;
     /** Injectable for tests; defaults to a real filesystem check. */
     credentialExists?: (path: string) => boolean;
+    /** The task this container serves. Decides which parts of the repo are writable. */
+    runId?: string;
+    /** This project's agent homes on the host (`agentHomesFor`). */
+    homes?: { claude: string; kimi: string };
+    /**
+     * The agent CLIs this task runs. An agent's own login reaches only a task that runs it — a
+     * Claude task has no business holding the operator's Kimi login. Absent means "unknown", and
+     * passes none.
+     */
+    backends?: readonly string[];
+    /** The selected agent account's env (`KIMI_CODE_HOME`), whose login is passed. */
+    accountEnv?: Record<string, string>;
+    /** Injectable for tests. */
+    fs?: RepoFs;
   } = { credentialPassthrough: true },
 ): string[] {
+  const homes = opts.homes ?? { claude: agentClaudeHome(), kimi: agentKimiHome() };
   const args = [
     'run', '--detach', '--name', containerName,
-    // Same absolute path inside — see the header.
-    '-v', `${workspace}:${workspace}`,
-    // The agent's OWN claude home: conversations land on the host, readable
-    // from here and impossible to strand inside a container that is gone.
-    '-v', `${agentClaudeHome()}:/root/.claude`,
-    // The same for Kimi — and it is also where cezar reads a Kimi turn's token
-    // usage from, since Kimi logs it to its session files rather than the wire.
-    '-v', `${agentKimiHome()}:${GUEST_KIMI_HOME}`,
+    // The repo at its own absolute path — writable only where a task must write (see `repoMounts`).
+    ...repoMounts(workspace, opts.runId, opts.fs),
+    // The agent's OWN claude home, per project: conversations land on the host, readable from here
+    // and impossible to strand inside a container that is gone.
+    '-v', `${homes.claude}:/root/.claude`,
+    // The same for Kimi — and it is also where cezar reads a Kimi turn's token usage from, since
+    // Kimi logs it to its session files rather than the wire.
+    '-v', `${homes.kimi}:${GUEST_KIMI_HOME}`,
   ];
-  // Kimi's login, mounted at directory granularity (see `hostKimiLogin`) and
-  // under the same switch as Claude's: the agent CLI's own identity. Only what
-  // exists — podman refuses a missing mount source, and a host that never ran
-  // `kimi login` has nothing to pass.
-  if (opts.credentialPassthrough) {
+  // Kimi's login, mounted at directory granularity (see `hostKimiLogin`): only for a task that
+  // runs Kimi, and the SELECTED account's — an agent profile's KIMI_CODE_HOME, not the default's.
+  // Only what exists: podman refuses a missing mount source.
+  if (opts.credentialPassthrough && opts.backends?.includes('kimi')) {
     const exists = opts.credentialExists ?? existsSync;
-    for (const [host, guest] of hostKimiLogin()) {
+    for (const [host, guest] of hostKimiLogin({ ...process.env, ...opts.accountEnv })) {
       if (exists(host)) args.push('-v', `${host}:${guest}`);
     }
   }
@@ -152,8 +176,11 @@ export function podmanRunArgs(
   // re-copying keeps it fresh.
   // Package caches survive the per-task container, so a fresh container still
   // installs fast. This is what makes "container per task" affordable.
+  // NAMED volumes only. The key is spliced into `-v <key>:<target>`, so a path-shaped key would
+  // bind that host directory — `{"/Users/me": "/h"}` mounted a whole home — and a `:` in either
+  // half would smuggle mount options. Anything else is skipped, not trusted.
   for (const [volume, target] of Object.entries(cfg.cacheVolumes ?? {})) {
-    args.push('-v', `${volume}:${target}`);
+    if (isVolumeName(volume) && isGuestPath(target)) args.push('-v', `${volume}:${target}`);
   }
   // Anonymous volumes: a bare target with no source. Podman creates one per
   // container and drops it on `rm -v`, which is exactly the lifetime build
@@ -177,8 +204,110 @@ export function podmanRunArgs(
   return args;
 }
 
-/** `podman exec` argv for one agent process inside an existing container. */
-export function podmanExecArgs(
+export interface RepoFs {
+  exists: (path: string) => boolean;
+  isDir: (path: string) => boolean;
+}
+
+const realFs: RepoFs = {
+  exists: existsSync,
+  isDir: (path) => {
+    try {
+      return statSync(path).isDirectory();
+    } catch {
+      return false;
+    }
+  },
+};
+
+/**
+ * The repo's mounts for one task's container: read-only, except what the task must write.
+ *
+ * The repo used to be mounted read-WRITE whole, and the host acts on files in it: host `git`
+ * obeys `.git/config` (`core.fsmonitor`, filters, `core.sshCommand`) and `.git/hooks`, so an agent
+ * that wrote one had code running on the Mac at the next `git status`, diff or autosave — with
+ * every credential isolation exists to keep from it. `.ai/cezar/config.json` (which credentials
+ * and mounts this repo's containers get), automations, private MCP config and skills are read by
+ * the host too, and so is the operator's own checkout (`.envrc`, `.claude/settings.json`,
+ * `.mcp.json`).
+ *
+ * A worktree task (the ordinary case) gets the repo read-only, with writable holes for exactly:
+ * its own worktree, its scratch dir, the runs dir (its handoff file lives there), the dispatch
+ * channel, and the git stores a commit or fetch writes — objects, refs, logs and this worktree's
+ * own git dir. The worktree's `.git` pointer and its git dir's `commondir`/`gitdir` stay read-only:
+ * rewritten, they would point host git at a config the agent wrote. Its `config.worktree` too,
+ * when it exists (`extensions.worktreeConfig` makes git read it).
+ *
+ * An in-place task (no worktree) works in the checkout itself, so it stays writable; only the
+ * git config, hooks and info dir, and cezar's own state, are made read-only. Weaker by
+ * construction — an in-place run has no copy to work on.
+ */
+export function repoMounts(repoRoot: string, runId: string | undefined, fs: RepoFs = realFs): string[] {
+  const out: string[] = [];
+  const bind = (path: string, readOnly = false): void => {
+    out.push('-v', `${path}:${path}${readOnly ? ':ro' : ''}`);
+  };
+  const gitDir = join(repoRoot, '.git');
+  const data = join(repoRoot, '.ai', 'cezar');
+  const worktree = runId ? join(data, 'worktrees', runId) : undefined;
+  const hasGitDir = fs.isDir(gitDir);
+  if (worktree && fs.isDir(worktree)) {
+    bind(repoRoot, true);
+    bind(worktree);
+    const pointer = join(worktree, '.git');
+    if (fs.exists(pointer) && !fs.isDir(pointer)) bind(pointer, true);
+    if (hasGitDir) {
+      for (const store of ['objects', 'refs', 'logs']) {
+        const path = join(gitDir, store);
+        if (fs.isDir(path)) bind(path);
+      }
+      const ownGitDir = join(gitDir, 'worktrees', runId!);
+      if (fs.isDir(ownGitDir)) {
+        bind(ownGitDir);
+        for (const name of ['commondir', 'gitdir', 'config.worktree']) {
+          const path = join(ownGitDir, name);
+          if (fs.exists(path)) bind(path, true);
+        }
+      }
+    }
+  } else {
+    bind(repoRoot);
+    if (hasGitDir) {
+      for (const name of ['config', 'hooks', 'info']) {
+        const path = join(gitDir, name);
+        if (fs.exists(path)) bind(path, true);
+      }
+    }
+    if (fs.isDir(data)) bind(data, true);
+  }
+  // cezar's own state a task writes, in either mode.
+  if (runId) {
+    for (const path of [join(data, 'tmp', runId), join(data, 'runs')]) {
+      if (fs.isDir(path)) bind(path);
+    }
+  }
+  const dispatch = join(data, 'dispatch');
+  if (fs.isDir(dispatch)) bind(dispatch);
+  return out;
+}
+
+/**
+ * GitHub tokens `buildChildEnv` forwards to every agent on the host. Inside a container they would
+ * hand the operator's GitHub identity to a task whose GitHub CLI was never ticked, so they cross
+ * only when it was (`github-cli`), in which case the ticked credential supplies them anyway.
+ */
+const GITHUB_TOKEN_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']);
+
+/**
+ * `podman exec` for one agent process inside an existing container: the argv, and the env the
+ * `podman` client itself is spawned with.
+ *
+ * Values are NEVER on the argv. `-e KEY=VALUE` put every secret — Vault values, `GH_TOKEN`, API
+ * keys, private MCP config — on the command line of a process that lives for the whole turn,
+ * readable by anything that can list processes. `-e KEY` alone makes podman read the value from
+ * its own environment, which is where they go instead.
+ */
+export function podmanExec(
   cfg: SandboxConfig,
   containerName: string,
   bin: string,
@@ -192,33 +321,58 @@ export function podmanExecArgs(
    * on. The container receives values, never the credential that fetched them.
    */
   fetchedEnv: readonly string[] = [],
-): string[] {
-  const env = { ...opts.env, CEZ_PID_FILE: pidFile };
+): { args: string[]; env: Record<string, string> } {
+  const resolved = resolvePassthrough(cfg.credentials);
+  const githubTicked = resolved.some((c) => c.id === 'github-cli' && !c.skipped);
   // Credentials passed as environment variables (AWS_PROFILE, a custom
   // STRIPE_API_KEY…). Applied per EXEC rather than baked into the container, so
   // a token rotated on the host reaches the next turn of a long task. Read from
   // the host env, not from `opts.env`, which `buildChildEnv` has already
   // filtered — that filtering is why they were absent before.
-  const credentialEnv = credentialEnvPairs(resolvePassthrough(cfg.credentials));
-  const envArgs = [...containerEnvPairs(env, cfg.tmpdir), ...credentialEnv, ...fetchedEnv]
-    .flatMap((pair) => ['-e', pair]);
-  return [
-    'exec',
-    // `-i` keeps stdin open for the stream-json conversation. No `-t`: cezar
-    // pipes rather than allocating a terminal, and a pty would corrupt the
-    // protocol with echo and line editing.
-    '-i',
-    '-w', opts.cwd,
-    ...envArgs,
-    containerName,
-    // NOT `unsetPlaceholderCredentials`: that exists because *sbx* injects
-    // `ANTHROPIC_API_KEY=proxy-managed` and a fake GH_TOKEN into PID 1. Podman
-    // injects nothing, and `buildChildEnv` forwards the host's REAL
-    // `ANTHROPIC_*` and `GH_TOKEN` in the `-e` pairs above — unsetting them
-    // here would delete the only credential an API-key user has.
-    'sh', '-c', guestScript([]),
-    'cez-podman', bin, ...args,
-  ];
+  const base = containerEnvPairs({ ...opts.env, CEZ_PID_FILE: pidFile }, cfg.tmpdir)
+    .filter((pair) => githubTicked || !GITHUB_TOKEN_NAMES.has(pair.slice(0, pair.indexOf('='))));
+  const env: Record<string, string> = {};
+  for (const pair of [...base, ...credentialEnvPairs(resolved), ...fetchedEnv]) {
+    const at = pair.indexOf('=');
+    if (at > 0) env[pair.slice(0, at)] = pair.slice(at + 1);
+  }
+  // `.ai/cezar` — and the inbox in it — is read-only in here, so follow-ups go to the run's own
+  // writable scratch dir (the HOST path, mounted at the same path) and the engine moves them into
+  // the inbox at turn end. An empty CEZ_TODOS_FILE is "follow-ups off" and stays empty.
+  if (env.CEZ_TODOS_FILE && opts.env?.TMPDIR) env.CEZ_TODOS_FILE = join(opts.env.TMPDIR, ISOLATED_TODOS_FILE);
+  return {
+    args: [
+      'exec',
+      // `-i` keeps stdin open for the stream-json conversation. No `-t`: cezar
+      // pipes rather than allocating a terminal, and a pty would corrupt the
+      // protocol with echo and line editing.
+      '-i',
+      '-w', opts.cwd,
+      ...Object.keys(env).sort().flatMap((name) => ['-e', name]),
+      containerName,
+      // NOT `unsetPlaceholderCredentials`: that exists because *sbx* injects
+      // `ANTHROPIC_API_KEY=proxy-managed` and a fake GH_TOKEN into PID 1. Podman
+      // injects nothing, and `buildChildEnv` forwards the host's REAL
+      // `ANTHROPIC_*` in the env above — unsetting it here would delete the only
+      // credential an API-key user has.
+      'sh', '-c', guestScript([]),
+      'cez-podman', bin, ...args,
+    ],
+    env,
+  };
+}
+
+/** The argv half of `podmanExec` — names only, never values. */
+export function podmanExecArgs(
+  cfg: SandboxConfig,
+  containerName: string,
+  bin: string,
+  args: string[],
+  opts: LaunchOpts,
+  pidFile: string,
+  fetchedEnv: readonly string[] = [],
+): string[] {
+  return podmanExec(cfg, containerName, bin, args, opts, pidFile, fetchedEnv).args;
 }
 
 export class PodmanLauncher implements ProcessLauncher {
@@ -241,6 +395,8 @@ export class PodmanLauncher implements ProcessLauncher {
      * Continue, so a rotated secret still reaches the next turn.
      */
     private readonly fetchedEnv: readonly string[] = [],
+    /** This project's agent homes on the host — see `ProcessLauncher.agentHomes`. */
+    readonly agentHomes?: { claude: string; kimi: string },
   ) {}
 
   describe(): string {
@@ -249,12 +405,13 @@ export class PodmanLauncher implements ProcessLauncher {
 
   spawn(bin: string, args: string[], opts: LaunchOpts): ChildProcessWithoutNullStreams {
     const pidFile = `${this.cfg.tmpdir}/cez-${randomUUID()}.pid`;
+    const exec = podmanExec(this.cfg, this.containerName, bin, args, opts, pidFile, this.fetchedEnv);
     const child = nodeSpawn(
       this.bin,
-      podmanExecArgs(this.cfg, this.containerName, bin, args, opts, pidFile, this.fetchedEnv),
-      // The host env is what `podman` itself needs; what the AGENT sees was
-      // passed explicitly via `-e` above.
-      { cwd: opts.cwd, env: process.env },
+      exec.args,
+      // The host env is what `podman` itself needs; the values of the `-e NAME` the agent gets ride
+      // on top, where podman reads them — never on the argv (see `podmanExec`).
+      { cwd: opts.cwd, env: { ...process.env, ...exec.env } },
     ) as ChildProcessWithoutNullStreams;
     this.pidFiles.set(child, pidFile);
     return child;

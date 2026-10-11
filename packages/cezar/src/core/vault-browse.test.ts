@@ -124,3 +124,74 @@ describe('what the secret picker is allowed to see', () => {
     expect(parseVaultRef(ref)).toEqual({ mount: 'secret', path: 'dev/api', field: 'stripe' });
   });
 });
+
+describe('which KV paths the picker may browse, and the resolver may fetch', () => {
+  // One table for both: the browse route's query schema (the contract) and the
+  // reference parser (this module). A path the picker can browse but the task
+  // cannot fetch would save a secret that silently never arrives.
+  const accepted = [
+    'dev/api',
+    'team space/api keys',      // spaces — real Vault paths have them
+    '_shared/config',            // a leading underscore
+    'svc@prod/db',               // `@`
+    'ünïcode/ścieżka',           // letters in any script
+    'a.b/c-d/e+f=g,h:i~j',
+  ];
+  const rejected = [
+    '../etc',                    // traversal
+    'dev/../../etc',
+    'dev/./api',
+    '-format=json',              // reads as a flag in argv
+    'dev//api',                  // empty segment
+    'dev/api#field',             // the reference's field separator
+    'dev/a\u0000b',              // NUL
+    'dev/a\nb',                  // newline
+    'dev/a\tb',
+    'dev/a%2e%2e',
+    'dev/a?b',
+    'dev\\api',
+    'x'.repeat(513),             // bounded
+  ];
+
+  it('accepts what real Vault paths look like', async () => {
+    const { vaultBrowseQuerySchema } = await import('@open-mercato/cezar-contract');
+    const { isVaultKvPath, parseVaultRef } = await import('./vault-secrets.ts');
+    for (const path of accepted) {
+      expect(vaultBrowseQuerySchema.safeParse({ mount: 'kv', path }).success, path).toBe(true);
+      expect(isVaultKvPath(path), path).toBe(true);
+      expect(parseVaultRef(formatVaultRef('kv', path, 'token')), path).toEqual({ mount: 'kv', path, field: 'token' });
+    }
+  });
+
+  it('refuses traversal, flags, separators and control characters — in both places', async () => {
+    const { vaultBrowseQuerySchema } = await import('@open-mercato/cezar-contract');
+    const { isVaultKvPath } = await import('./vault-secrets.ts');
+    for (const path of rejected) {
+      expect(vaultBrowseQuerySchema.safeParse({ mount: 'kv', path }).success, JSON.stringify(path)).toBe(false);
+      expect(isVaultKvPath(path), JSON.stringify(path)).toBe(false);
+    }
+  });
+
+  it('accepts field names the picker shows, still never a flag-shaped one', async () => {
+    const { parseVaultRef } = await import('./vault-secrets.ts');
+    expect(parseVaultRef('vault://kv/app#_token')).toEqual({ mount: 'kv', path: 'app', field: '_token' });
+    expect(parseVaultRef('vault://kv/app#api key')).toEqual({ mount: 'kv', path: 'app', field: 'api key' });
+    expect(parseVaultRef('vault://kv/app#-format')).toBeNull();
+    expect(parseVaultRef('vault://kv/app#a\nb')).toBeNull();
+  });
+
+  it('hands the path to `vault` as ONE argv entry, whatever it contains', async () => {
+    // execFile, no shell: a space or `@` cannot split into a second argument.
+    const calls: string[][] = [];
+    const exec = async (args: string[]): Promise<string> => {
+      calls.push(args);
+      return args[1] === 'list' ? '[]' : JSON.stringify({ data: { data: {} } });
+    };
+    await listPaths('kv', 'team space/svc@prod', exec);
+    await listFields('kv', 'team space/svc@prod', exec);
+    expect(calls).toEqual([
+      ['kv', 'list', '-format=json', '-mount=kv', 'team space/svc@prod'],
+      ['kv', 'get', '-format=json', '-mount=kv', 'team space/svc@prod'],
+    ]);
+  });
+});

@@ -201,10 +201,26 @@ export const vaultBrowseQuerySchema = z.object({
     .string()
     .trim()
     .transform((p) => p.replace(/^\/+|\/+$/g, ''))
-    .refine(
-      (p) => p === '' || (/^[A-Za-z0-9][A-Za-z0-9._\-/]*$/.test(p) && !p.split('/').includes('..')),
-      'path must be a KV path',
-    )
+    .refine((p) => p === '' || isVaultBrowsePath(p), 'path must be a KV path')
     .default(''),
 });
+
+/**
+ * A KV path as real Vaults spell them — spaces, a leading `_`, `@`, letters in
+ * any script — while still refusing what could be read as something else:
+ * a `.`/`..` segment, an empty segment, a leading `-` (the path is one argv
+ * entry, so a flag is the only other thing it could be), `#` (the reference's
+ * field separator), and every control character, NUL and newline included.
+ * Bounded at 512.
+ *
+ * Mirrors `isVaultKvPath` in packages/cezar/src/core/vault-secrets.ts, which
+ * decides whether a picked reference can be fetched; the contract is Node-free
+ * and cannot import it, so vault-browse.test.ts runs both over one table.
+ */
+function isVaultBrowsePath(path: string): boolean {
+  if (path.length > 512 || path.startsWith('-')) return false;
+  return path
+    .split('/')
+    .every((segment) => segment !== '.' && segment !== '..' && /^[\p{L}\p{N}\p{M} ._@+=,:~-]+$/u.test(segment));
+}
 export type VaultBrowseQuery = z.infer<typeof vaultBrowseQuerySchema>;

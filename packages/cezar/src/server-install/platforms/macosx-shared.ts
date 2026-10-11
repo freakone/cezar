@@ -129,7 +129,11 @@ export async function removeLaunchdAgent(ctx: InstallContext, label: string): Pr
   rmSync(launchAgentPath(label), { force: true });
 }
 
-/** Restart a running agent (server-deploy). Non-zero kickstart warns, never throws. */
+/**
+ * Restart a running agent (server-deploy). Throws `StepAborted` when
+ * `launchctl kickstart` exits non-zero, and when it exits 0 but launchd still
+ * reports the same PID — a redeploy that restarted nothing must not read as done.
+ */
 export async function kickstartAgent(ctx: InstallContext, label: string, what: string): Promise<void> {
   if (ctx.dryRun) {
     ctx.ui.info(`DRY RUN — would restart ${what}.`);
