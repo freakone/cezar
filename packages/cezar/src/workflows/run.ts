@@ -6160,6 +6160,9 @@ export class RunManager {
       return undefined;
     }
     return rec!.sessionId;
+  }
+
+  /**
    * The tool list for a step that names none: `DEFAULT_ALLOWED_TOOLS`, plus — for Claude — the
    * user's MCP servers, without which `dontAsk` refused every MCP tool they had connected (see
    * `claude-mcp.ts`). Keyed on the project, not the task worktree: same servers, one discovery.

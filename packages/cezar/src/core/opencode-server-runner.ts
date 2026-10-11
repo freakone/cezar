@@ -191,14 +191,15 @@ class OpencodeSession implements AgentSession {
     const port = published ?? 40000 + Math.floor(Math.random() * 20000);
     const hostname = published ? '0.0.0.0' : '127.0.0.1';
     try {
-      this.child = this.launcher.spawn(bin, ['serve', '--hostname', hostname, '--port', String(port)], {
-        cwd: spec.cwd,
-        env: buildChildEnv({ backend: 'opencode', extraEnv: spec.env }),
+      const env = buildChildEnv({ backend: 'opencode', extraEnv: spec.env });
       // Private MCP servers (spec 2026-10-07-private-project-mcp): OpenCode loads
       // OPENCODE_CONFIG_CONTENT after the project config, so these are added and win on a clash.
       if (spec.mcpServers?.length) {
         env.OPENCODE_CONFIG_CONTENT = opencodeConfigContent(spec.mcpServers, env.OPENCODE_CONFIG_CONTENT);
       }
+      this.child = this.launcher.spawn(bin, ['serve', '--hostname', hostname, '--port', String(port)], {
+        cwd: spec.cwd,
+        env,
       });
     } catch (err) {
       throw wrapSpawnError(err, bin);
@@ -228,7 +229,7 @@ class OpencodeSession implements AgentSession {
     this.child.stderr.on('data', (chunk: string) => stderrChunks.push(chunk));
 
     // The server prints its URL on stdout once listening.
-    const urlReady = this.waitForServerUrl(, published ? '127.0.0.1' : undefined);
+    const urlReady = this.waitForServerUrl(published ? '127.0.0.1' : undefined);
 
     const limitMs = spec.timeoutMs ?? timeoutMs;
     let deadline: NodeJS.Timeout | undefined;
@@ -364,7 +365,7 @@ class OpencodeSession implements AgentSession {
 
   // ---- server lifecycle ---------------------------------------------------
 
-  private waitForServerUrl(, dialHost?: string): Promise<string> {
+  private waitForServerUrl(dialHost?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       let buffer = '';
       const timer = setTimeout(() => {

@@ -346,6 +346,9 @@ describe('ClaudeCliRunner private MCP (spec 2026-10-07-private-project-mcp)', ()
     } finally {
       rmSync(cwd, { force: true, recursive: true });
     }
+  });
+});
+
 describe('the default tools a headless claude may use', () => {
   it('include web search, page fetching and skills — dontAsk silently refuses anything left out', async () => {
     const { DEFAULT_ALLOWED_TOOLS } = await import('../workflows/types.ts');
