@@ -386,6 +386,30 @@ exit 0
     expect(container.remounted).toEqual([data!.destination]);
   });
 
+  it('recreates a container whose image lacks the runner this turn needs, from an image that has it', async () => {
+    const { startTaskContainer } = await import('./podman-lifecycle.ts');
+    const podman = existingContainer(await wanted('runccccc-0000'));
+    // The fake answers "not found" for the CLI probe, as an image built before Codex was needed would.
+    const script = readFileSync(podman.bin, 'utf8').replace(
+      'if [ "$1" = inspect ]',
+      'case "$*" in *"command -v codex"*) exit 1;; esac\nif [ "$1" = inspect ]',
+    );
+    writeFileSync(podman.bin, script);
+    const container = await startTaskContainer(cfg, repo, 'runccccc-0000', podman.bin, { backend: 'codex' });
+    expect(container.addedAgent).toBe('codex');
+    const calls = podman.calls();
+    expect(calls).toContain('rm -f -v cez-runccccc');
+    expect(calls.some((c) => c.startsWith('build ') && c.includes('CEZ_AGENTS=codex') && c.includes('dev.cezar.agents=codex'))).toBe(true);
+  });
+
+  it('reuses a container whose image already has the runner', async () => {
+    const { startTaskContainer } = await import('./podman-lifecycle.ts');
+    const podman = existingContainer(await wanted('runddddd-0000'));
+    const container = await startTaskContainer(cfg, repo, 'runddddd-0000', podman.bin, { backend: 'codex' });
+    expect(container.addedAgent).toBeUndefined();
+    expect(podman.calls().some((c) => c.startsWith('rm '))).toBe(false);
+  });
+
   it('reuses a container that already has every mount it should', async () => {
     const { startTaskContainer } = await import('./podman-lifecycle.ts');
     const podman = existingContainer(await wanted('run67890-0000'));

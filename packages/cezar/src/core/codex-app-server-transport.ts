@@ -121,6 +121,8 @@ export function endCodexAppServer(
   child: ChildProcessWithoutNullStreams,
   onTimers?: (term: NodeJS.Timeout, kill: NodeJS.Timeout | undefined) => void,
   onSignal?: () => void,
+  /** How to signal it — the launcher's, so a server inside a container is reached too. */
+  send: (sig: NodeJS.Signals) => void = (sig) => child.kill(sig),
 ): void {
   try {
     child.stdin.end();
@@ -135,12 +137,12 @@ export function endCodexAppServer(
   const termTimer = setTimeout(() => {
     if (!hasExited()) {
       onSignal?.();
-      child.kill('SIGTERM');
+      send('SIGTERM');
     }
     killTimer = setTimeout(() => {
       if (!hasExited()) {
         onSignal?.();
-        child.kill('SIGKILL');
+        send('SIGKILL');
       }
     }, EOF_KILL_GRACE_MS);
     killTimer.unref?.();

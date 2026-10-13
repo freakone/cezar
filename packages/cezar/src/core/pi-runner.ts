@@ -45,9 +45,11 @@ export class PiRunner implements AgentRunner {
   private lastSession: AgentSession | null = null;
 
   constructor(opts: PiRunnerOptions = {}) {
-    this.bin = opts.bin ?? process.env.CEZ_PI_BIN ?? (process.env.CEZ_DRY_RUN === '1' ? mockPiPath() : 'pi');
-    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.launcher = opts.launcher ?? localLauncher;
+    // Host overrides and the dry-run mock are HOST paths; inside a container the image's `pi` runs.
+    this.bin = opts.bin
+      ?? (this.launcher.id !== 'local' ? 'pi' : process.env.CEZ_PI_BIN ?? (process.env.CEZ_DRY_RUN === '1' ? mockPiPath() : 'pi'));
+    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
   run(spec: AgentRunSpec, onEvent?: (event: AgentEvent) => void): Promise<AgentRunResult> {
@@ -147,7 +149,8 @@ export class PiRunner implements AgentRunner {
       interrupt();
       if (hardKillTimer || hasExited()) return;
       hardKillTimer = setTimeout(() => {
-        if (!hasExited()) child.kill('SIGKILL');
+        // Through the launcher: killing a `podman exec` client leaves the agent running inside.
+        if (!hasExited()) void this.launcher.signal(child, 'SIGKILL');
       }, KILL_GRACE_MS);
       hardKillTimer.unref?.();
     };

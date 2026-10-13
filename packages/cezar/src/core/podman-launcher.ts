@@ -2,7 +2,8 @@ import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:ch
 import { randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { CONTAINER_AGENTS } from './container-agents.ts';
 import type { LaunchOpts, ProcessLauncher } from './process-launcher.ts';
 import { containerEnvPairs, guestKillScript, guestScript } from './container-runtime.ts';
 import type { SandboxConfig } from '../config.ts';
@@ -154,6 +155,12 @@ export function podmanRunArgs(
     // The same for Kimi — and it is also where cezar reads a Kimi turn's token usage from, since
     // Kimi logs it to its session files rather than the wire.
     '-v', `${homes.kimi}:${GUEST_KIMI_HOME}`,
+    // Every other runner's home beside them, so a Continue finds its conversation after the
+    // container is recreated. Per-project homes only (`agentHomesFor`); all of them, so switching
+    // runner mid-task is not a mount change.
+    ...(opts.homes
+      ? Object.values(CONTAINER_AGENTS).flatMap((agent) => ['-v', `${join(dirname(homes.claude), agent.id)}:${agent.guestHome}`])
+      : []),
   ];
   // Kimi's login, mounted at directory granularity (see `hostKimiLogin`): only for a task that
   // runs Kimi, and the SELECTED account's — an agent profile's KIMI_CODE_HOME, not the default's.

@@ -32,13 +32,13 @@ export function createRunner(
     case 'opencode':
       return new OpencodeServerRunner({ launcher: opts.launcher });
     case 'cursor':
-      return new CursorAgentRunner();
+      return new CursorAgentRunner({ launcher: opts.launcher });
     case 'pi':
       return new PiRunner({ launcher: opts.launcher });
     case 'junie':
-      return new JunieRunner();
+      return new JunieRunner({ launcher: opts.launcher });
     case 'copilot':
-      return new CopilotAcpRunner();
+      return new CopilotAcpRunner({ launcher: opts.launcher });
     case 'kimi':
       return new KimiRunner({ launcher: opts.launcher });
     case 'claude':
@@ -53,14 +53,14 @@ export function createRunner(
  * on a backend that would ignore it — or that cannot work there — so this is an allowlist.
  *
  * Taking a launcher is necessary, not sufficient: the agent's CLI must be IN the image and its
- * login must reach the container. Only Claude Code and Kimi Code meet both (the base image
- * installs them; `syncClaudeCredential` / the mounted Kimi login carry them). Codex, OpenCode and
- * pi take a launcher, but the image has no binary for them and nothing passes their login — an
- * isolated task with them failed with `exec: codex: not found` while its record said isolated.
- * They run on this machine, reported as such, until the image and their logins exist. Runners
- * without a launcher at all (Cursor, Junie, Copilot) likewise.
+ * login must reach the container. Claude and Kimi are always in the base image; every other
+ * runner's CLI is added to it the first time a task needs it, and its login is passed per turn
+ * (`container-agents.ts`). A runner on this list that has no login in the container still runs
+ * there, and the task log says which variable to set.
  */
-const LAUNCHER_BACKENDS: ReadonlySet<string> = new Set(['claude', 'claude-cli', 'kimi']);
+const LAUNCHER_BACKENDS: ReadonlySet<string> = new Set([
+  'claude', 'claude-cli', 'kimi', 'codex', 'opencode', 'pi', 'cursor', 'junie', 'copilot',
+]);
 
 export function backendSupportsLauncher(backend: AgentBackend | RunnerId | undefined): boolean {
   return LAUNCHER_BACKENDS.has(backend ?? 'claude');

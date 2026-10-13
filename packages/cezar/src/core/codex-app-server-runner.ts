@@ -70,9 +70,10 @@ export class CodexAppServerRunner implements AgentRunner {
   private lastSession: CodexSession | null = null;
 
   constructor(opts: CodexRunnerOptions = {}) {
-    this.bin = resolveCodexExecutable(opts.bin);
-    this.timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
     this.launcher = opts.launcher ?? localLauncher;
+    // A host override (`CEZ_CODEX_BIN`) names a HOST path; inside a container the image's is used.
+    this.bin = opts.bin ?? (this.launcher.id === 'local' ? resolveCodexExecutable() : 'codex');
+    this.timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
   }
 
   run(spec: AgentRunSpec, onEvent?: (event: AgentEvent) => void): Promise<AgentRunResult> {
@@ -379,6 +380,7 @@ class CodexSession implements AgentSession {
         () => {
           this.terminatedByCezar = true;
         },
+        (sig) => void this.launcher.signal(this.child, sig),
       );
     } catch {
       // already gone
@@ -407,7 +409,8 @@ class CodexSession implements AgentSession {
     this.hardKillTimer = setTimeout(() => {
       if (!this.hasExited()) {
         this.terminatedByCezar = true;
-        this.child.kill('SIGKILL');
+        // Through the launcher: killing a `podman exec` client leaves the agent running inside.
+        void this.launcher.signal(this.child, 'SIGKILL');
       }
     }, KILL_GRACE_MS);
     this.hardKillTimer.unref?.();

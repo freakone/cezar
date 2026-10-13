@@ -48,6 +48,7 @@ import {
 } from '../handoff.ts';
 import { ingestTodos, todosPath } from '../todos.ts';
 import { ISOLATED_TODOS_FILE } from '../core/podman-launcher.ts';
+import { containerAgent, missingLoginNote } from '../core/container-agents.ts';
 // Contract VALUES, like `workspaceUiStateSchema` in workspace/migrations.ts: the attachment
 // vocabulary the routes validate with is the same one the engine stores and re-reads by, so the
 // wire and the disk can never disagree about what counts as an image (#950).
@@ -3187,6 +3188,16 @@ export class RunManager {
       }
       const loginNote = claudeLoginNote(container.claudeLoginExpiresAt, Date.now());
       if (loginNote) this.store.appendEvent(runId, { type: 'note', stepId, message: loginNote });
+      if (container.addedAgent) {
+        this.store.appendEvent(runId, {
+          type: 'note',
+          stepId,
+          message: `this task's container was recreated with ${container.addedAgent} in its image — the worktree and `
+            + 'conversations are intact; anything that lived only inside the old container is gone.',
+        });
+      }
+      const missing = containerAgent(container.missingLogin);
+      if (missing) this.store.appendEvent(runId, { type: 'note', stepId, message: missingLoginNote(missing) });
       this.store.updateRun(runId, { isolation: { effective: true, container: container.name } });
       return { sandbox: placed, container };
     } catch (err) {

@@ -147,6 +147,16 @@ Every entry is the credential **alone**, never a home directory — the same rul
 `~/.claude/.credentials.json` rather than all of `~/.claude`, so the agent has a working login and
 none of the operator's conversations.
 
+Every runner can be isolated (2026-10-13). Claude and Kimi are always in the base image; Codex,
+OpenCode, pi, Cursor, Junie and Copilot are installed into it the first time a task needs one
+(`CEZ_AGENTS` build arg, recorded in the `dev.cezar.agents` label), so the image grows only with
+what is used, about 1.5 GB for all six. A container whose image lacks this turn's runner is
+recreated from one that has it. Each runner keeps a per-project home on the host. Logins follow
+Claude's rule below: Codex, OpenCode and pi login files are copied per turn with refresh tokens
+removed; Cursor, Junie and Copilot use a static key from the environment (`CURSOR_API_KEY`,
+`JUNIE_API_KEY`, `COPILOT_GITHUB_TOKEN`), and the task log names it when it is missing
+(`core/container-agents.ts`).
+
 Claude's own login is the exception to "copy": it is copied **without its refresh token**
 (2026-10-13). OAuth refresh tokens are single-use, so a container that refreshed its copy left the
 host holding a spent one, and the host's next refresh logged the operator out of Claude everywhere.

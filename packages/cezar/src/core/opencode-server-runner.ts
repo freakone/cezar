@@ -79,9 +79,10 @@ export class OpencodeServerRunner implements AgentRunner {
   private readonly launcher: ProcessLauncher;
 
   constructor(opts: OpencodeRunnerOptions = {}) {
-    this.bin = opts.bin ?? process.env.CEZ_OPENCODE_BIN ?? 'opencode';
-    this.timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
     this.launcher = opts.launcher ?? localLauncher;
+    // A host override names a HOST path; inside a container the image's `opencode` runs.
+    this.bin = opts.bin ?? (this.launcher.id === 'local' ? process.env.CEZ_OPENCODE_BIN ?? 'opencode' : 'opencode');
+    this.timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
   }
 
   run(spec: AgentRunSpec, onEvent?: (event: AgentEvent) => void): Promise<AgentRunResult> {

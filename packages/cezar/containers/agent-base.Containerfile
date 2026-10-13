@@ -31,6 +31,23 @@ RUN npm install -g @anthropic-ai/claude-code @moonshot-ai/kimi-code
 # authenticate. `gh` is installed above from its own apt repo.
 RUN npm install -g @railway/cli
 
+# The other runners' CLIs, only those a task has needed (`CEZ_AGENTS`, set by cezar
+# from the runner a task asks for): together they add ~1.5 GB, most of it Cursor.
+# Junie's npm package is a shim that downloads the real binary on first run, so
+# that run happens here rather than in every new container.
+ARG CEZ_AGENTS=""
+RUN set -e; for agent in $CEZ_AGENTS; do case "$agent" in \
+      codex)    npm install -g --no-fund --no-audit @openai/codex ;; \
+      opencode) npm install -g --no-fund --no-audit opencode-ai ;; \
+      pi)       npm install -g --no-fund --no-audit @mariozechner/pi-coding-agent ;; \
+      copilot)  npm install -g --no-fund --no-audit @github/copilot ;; \
+      junie)    npm install -g --no-fund --no-audit @jetbrains/junie && junie --version ;; \
+      cursor)   curl -fsSL https://cursor.com/install | bash ;; \
+      *)        echo "unknown agent: $agent" >&2; exit 1 ;; \
+    esac; done
+# Cursor's installer puts `agent` here.
+ENV PATH=/root/.local/bin:$PATH
+
 # The image is the version pin: an agent that updates itself inside a
 # per-task container would re-download on every task and drift from it.
 ENV KIMI_CODE_NO_AUTO_UPDATE=1

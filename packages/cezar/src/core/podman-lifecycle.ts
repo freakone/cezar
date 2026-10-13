@@ -8,6 +8,7 @@ import { homedir, tmpdir, userInfo } from 'node:os';
 import { promisify } from 'node:util';
 import { BASE_IMAGE_TAG, GIT_EXEC_PATHS, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import { agentHomesFor, agentKimiHome, kimiHome } from './kimi-home.ts';
+import { CONTAINER_AGENTS, containerAgent, syncContainerAgentLogin } from './container-agents.ts';
 import type { SandboxConfig } from '../config.ts';
 import { parseMachines } from './container-probe.ts';
 import {
@@ -76,7 +77,11 @@ export function baseContainerfilePath(): string {
  * the user has never heard of. The base is cezar's own artifact, so cezar
  * builds it.
  */
-export async function ensureBaseImage(bin = 'podman'): Promise<void> {
+export async function ensureBaseImage(
+  bin = 'podman',
+  /** Runner CLIs the image must carry beyond Claude and Kimi (`CONTAINER_AGENTS`). */
+  agents: readonly string[] = [],
+): Promise<void> {
   const file = baseContainerfilePath();
   const exists = await run(bin, ['image', 'exists', BASE_IMAGE_TAG]).then(() => true).catch(() => false);
   if (!existsSync(file)) {
@@ -91,8 +96,27 @@ export async function ensureBaseImage(bin = 'podman'): Promise<void> {
   // By CONTENT, stamped on the image as a label: an installed package's files
   // all carry npm's fixed 1985 mtime, so a date comparison could never fire.
   const hash = baseContainerfileHash(file);
-  if (exists && (await imageLabel(BASE_IMAGE_TAG, BASE_HASH_LABEL, bin)) === hash) return;
-  await podman(bin, ['build', '-t', BASE_IMAGE_TAG, '--label', `${BASE_HASH_LABEL}=${hash}`, '-f', file, dirname(file)]);
+  // The runner CLIs it carries are stamped beside the hash. A rebuild keeps every one an earlier
+  // task needed and adds this task's, so the image grows only with what is actually used.
+  const have = exists ? parseAgentsLabel(await imageLabel(BASE_IMAGE_TAG, BASE_AGENTS_LABEL, bin)) : [];
+  const want = parseAgentsLabel([...have, ...agents].join(','));
+  const fresh = exists && (await imageLabel(BASE_IMAGE_TAG, BASE_HASH_LABEL, bin)) === hash;
+  if (fresh && want.every((agent) => have.includes(agent))) return;
+  await podman(bin, [
+    'build', '-t', BASE_IMAGE_TAG,
+    '--label', `${BASE_HASH_LABEL}=${hash}`,
+    '--label', `${BASE_AGENTS_LABEL}=${want.join(',')}`,
+    '--build-arg', `CEZ_AGENTS=${want.join(' ')}`,
+    '-f', file, dirname(file),
+  ]);
+}
+
+/** The label listing the runner CLIs a base image was built with. */
+const BASE_AGENTS_LABEL = 'dev.cezar.agents';
+
+/** Known runner ids only, sorted and unique — a label is read back from an image, not trusted. */
+function parseAgentsLabel(value: string | undefined): string[] {
+  return [...new Set((value ?? '').split(',').map((a) => a.trim()).filter((a) => containerAgent(a) !== undefined))].sort();
 }
 
 /** The label carrying the hash of the Containerfile a base image was built from. */
@@ -120,11 +144,13 @@ export async function ensureImage(
   cfg: SandboxConfig,
   repoRoot: string,
   bin = 'podman',
+  /** Runner CLIs this task needs in the image (see `ensureBaseImage`). */
+  agents: readonly string[] = [],
 ): Promise<void> {
-  const key = `${bin}\0${repoRoot}\0${cfg.image ?? ''}\0${cfg.containerfile}`;
+  const key = `${bin}\0${repoRoot}\0${cfg.image ?? ''}\0${cfg.containerfile}\0${agents.join(',')}`;
   const inFlight = imageBuilds.get(key);
   if (inFlight) return inFlight;
-  const build = ensureImageOnce(cfg, repoRoot, bin).finally(() => imageBuilds.delete(key));
+  const build = ensureImageOnce(cfg, repoRoot, bin, agents).finally(() => imageBuilds.delete(key));
   imageBuilds.set(key, build);
   return build;
 }
@@ -133,6 +159,7 @@ async function ensureImageOnce(
   cfg: SandboxConfig,
   repoRoot: string,
   bin: string,
+  agents: readonly string[],
 ): Promise<void> {
   const containerfile = join(repoRoot, cfg.containerfile);
   const hasFile = existsSync(containerfile);
@@ -145,12 +172,12 @@ async function ensureImageOnce(
     // misconfiguration — and the settings page promises exactly this ("tasks
     // run on the generic base image"). Throwing here made the DEFAULT config
     // unable to isolate at all.
-    await ensureBaseImage(bin);
+    await ensureBaseImage(bin, agents);
     return;
   }
   // A repo Containerfile builds FROM the base, so the base has to be current
   // first — and a base rebuilt just now makes the repo image stale with it.
-  await ensureBaseImage(bin);
+  await ensureBaseImage(bin, agents);
   const tag = imageTag(cfg, hasFile);
   const exists = await run(bin, ['image', 'exists', tag]).then(() => true).catch(() => false);
   // An existing image is reused UNLESS its Containerfile has changed since it
@@ -244,6 +271,17 @@ export async function startTaskContainer(
       remounted = drift;
     }
   }
+  // A runner whose CLI the container's image lacks — the first Codex turn of a task that ran
+  // Claude — gets a container from an image that has it. Only for images cezar builds: a pinned
+  // image cannot gain a CLI, and recreating it every turn would change nothing.
+  const agent = containerAgent(opts.backend);
+  const cezarBuilt = !cfg.image || existsSync(join(repoRoot, cfg.containerfile));
+  let addedAgent: string | undefined;
+  if (running && agent && cezarBuilt && !(await hasBinary(name, agent.bin, bin))) {
+    await run(bin, ['rm', '-f', '-v', name]).catch(() => undefined);
+    running = false;
+    addedAgent = agent.id;
+  }
   const credentials = resolvePassthrough(cfg.credentials);
   const passLogins = cfg.claudeCredentialPassthrough;
   if (running) {
@@ -263,13 +301,14 @@ export async function startTaskContainer(
       publishedPort: await publishedPortOf(name, bin),
       ...(startedMachine ? { startedMachine } : {}),
       ...(login?.expiresAt !== undefined ? { claudeLoginExpiresAt: login.expiresAt } : {}),
+      ...(login?.missingLogin ? { missingLogin: login.missingLogin } : {}),
     };
   }
   // Allocated BEFORE the container exists, because publishing is a
   // creation-time property: an HTTP-speaking backend that discovers it needs a
   // port later would have nowhere to put it.
   const publishPort = await freePort();
-  await ensureImage(cfg, repoRoot, bin);
+  await ensureImage(cfg, repoRoot, bin, agent ? [agent.id] : []);
   if (passLogins && opts.backend === 'kimi') syncKimiConfig(join(kimiHome({ ...process.env, ...opts.accountEnv }), 'config.toml'), homes.kimi);
   await podman(bin, podmanRunArgs(cfg, name, repoRoot, {
     credentialPassthrough: passLogins,
@@ -290,7 +329,9 @@ export async function startTaskContainer(
     publishedPort: publishPort,
     ...(startedMachine ? { startedMachine } : {}),
     ...(remounted ? { remounted } : {}),
+    ...(addedAgent ? { addedAgent } : {}),
     ...(login?.expiresAt !== undefined ? { claudeLoginExpiresAt: login.expiresAt } : {}),
+    ...(login?.missingLogin ? { missingLogin: login.missingLogin } : {}),
   };
 }
 
@@ -301,15 +342,19 @@ async function syncAgentLogins(
   homes: { claude: string; kimi: string },
   opts: { backend?: string; accountEnv?: Record<string, string> },
   passLogins: boolean,
-): Promise<{ expiresAt?: number } | undefined> {
+): Promise<{ expiresAt?: number; missingLogin?: string } | undefined> {
   if (!passLogins) return undefined;
-  let login: { expiresAt?: number } | undefined;
+  let login: { expiresAt?: number; missingLogin?: string } | undefined;
   if (opts.backend === undefined || opts.backend === 'claude' || opts.backend === 'claude-cli') {
     const configDir = opts.accountEnv?.CLAUDE_CONFIG_DIR?.trim() || undefined;
     login = await syncClaudeCredential(name, bin, undefined, hostClaudeLogins(configDir));
   }
   if (opts.backend === 'kimi') {
     syncKimiConfig(join(kimiHome({ ...process.env, ...opts.accountEnv }), 'config.toml'), homes.kimi);
+  }
+  const agent = containerAgent(opts.backend);
+  if (agent && !syncContainerAgentLogin(agent, join(dirname(homes.claude), agent.id), { ...process.env, ...opts.accountEnv })) {
+    login = { ...login, missingLogin: agent.id };
   }
   return login;
 }
@@ -322,7 +367,8 @@ async function syncAgentLogins(
  */
 function prepareHostDirs(repoRoot: string, runId: string, homes: { claude: string; kimi: string }): void {
   const data = join(repoRoot, '.ai', 'cezar');
-  for (const dir of [homes.claude, homes.kimi, join(data, 'tmp', runId), join(data, 'runs')]) {
+  const runnerHomes = Object.values(CONTAINER_AGENTS).map((agent) => join(dirname(homes.claude), agent.id));
+  for (const dir of [homes.claude, homes.kimi, ...runnerHomes, join(data, 'tmp', runId), join(data, 'runs')]) {
     try {
       mkdirSync(dir, { recursive: true });
     } catch {
@@ -741,6 +787,10 @@ export interface TaskContainer {
   homes?: { claude: string; kimi: string };
   /** When the Claude access token handed to the container expires (ms since epoch). */
   claudeLoginExpiresAt?: number;
+  /** The runner whose CLI the old container lacked, so it was recreated from an image with it. */
+  addedAgent?: string;
+  /** The runner this turn runs, when no login for it could be put in the container. */
+  missingLogin?: string;
 }
 
 /**
@@ -966,6 +1016,17 @@ async function credentialReadable(container: string, ask: PodmanQuery): Promise<
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Is `binary` on the container's PATH? Unreadable answers true — never a recreate loop. */
+async function hasBinary(container: string, binary: string, bin: string): Promise<boolean> {
+  try {
+    await run(bin, ['exec', container, 'sh', '-c', `command -v ${binary}`], { timeout: 15_000 });
+    return true;
+  } catch (err) {
+    // `command -v` exits 1 for "not found"; anything else (podman itself failing) is not an answer.
+    return (err as { code?: unknown }).code !== 1;
   }
 }
 
