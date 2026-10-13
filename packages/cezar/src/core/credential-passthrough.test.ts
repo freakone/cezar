@@ -83,8 +83,7 @@ describe('credential passthrough', () => {
     const resolved = resolvePassthrough({ enabled: { aws: true } }, HOME, allExist);
     const pairs = credentialEnvPairs(resolved, { AWS_PROFILE: 'dev', AWS_REGION: '' });
     expect(pairs).toContain('AWS_PROFILE=dev');
-    // An empty value would SHADOW a credential the container already has —
-    // exactly how sbx's ANTHROPIC_API_KEY placeholder broke the claude login.
+    // An empty value would SHADOW a credential the container already has.
     expect(pairs.some((p) => p.startsWith('AWS_REGION'))).toBe(false);
   });
 

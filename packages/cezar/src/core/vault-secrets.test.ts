@@ -73,8 +73,7 @@ describe('fetching a credential value', () => {
   });
 
   it('never injects an EMPTY value when the fetch fails', async () => {
-    // An empty value shadows a credential the container already holds — exactly
-    // how sbx's `ANTHROPIC_API_KEY=proxy-managed` placeholder broke the login.
+    // An empty value shadows a credential the container already holds.
     const failed = await resolveSecretEnv(selection(), async () => { throw new Error('permission denied'); });
     expect(failed.pairs).toEqual([]);
     expect(failed.problems[0]).toMatchObject({ id: 'stripe', reason: 'permission denied', required: false });

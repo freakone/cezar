@@ -1,6 +1,5 @@
 import type { SandboxConfig } from '../config.ts';
 import { localLauncher, type ProcessLauncher } from './process-launcher.ts';
-import { SbxLauncher } from './sbx-launcher.ts';
 import { PodmanLauncher } from './podman-launcher.ts';
 
 /**
@@ -20,18 +19,9 @@ export function createLauncher(
   fetchedEnv: readonly string[] = [],
 ): ProcessLauncher {
   if (!sandbox?.enabled) return localLauncher;
-  switch (sandbox.provider) {
-    case 'podman':
-      // Without a container there is nothing to exec into. Falling back to
-      // local would run the agent UNISOLATED while the config says otherwise,
-      // so the caller must supply one — see the engine's per-task creation.
-      if (!container) return localLauncher;
-      return new PodmanLauncher(sandbox, container.name, 'podman', container.publishedPort, fetchedEnv, container.homes);
-    case 'sbx':
-      return new SbxLauncher(sandbox);
-    default:
-      // Unreachable while `provider` is a literal, but a newer cezar's config
-      // must degrade to "no isolation claimed" rather than throw at spawn time.
-      return localLauncher;
-  }
+  // Without a container there is nothing to exec into. Falling back to local would run the agent
+  // UNISOLATED while the config says otherwise, so the caller must supply one — see the engine's
+  // per-task creation.
+  if (!container) return localLauncher;
+  return new PodmanLauncher(sandbox, container.name, 'podman', container.publishedPort, fetchedEnv, container.homes);
 }

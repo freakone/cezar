@@ -73,7 +73,7 @@ export const workspaceConfigResponseSchema = z.object({
      * key. `enabled` is not here — that is `isolation` above.
      */
     sandbox: z.object({
-      provider: z.enum(['podman', 'sbx']).optional(),
+      provider: z.literal('podman').optional(),
       claudeCredentialPassthrough: z.boolean().optional(),
       cacheVolumes: z.record(z.string(), z.string()).optional(),
       resources: z.object({
@@ -180,7 +180,7 @@ export const setWorkspaceConfigInputSchema = z.object({
       /** The machine-wide sandbox template; `null` on a key clears it. */
       sandbox: z
         .object({
-          provider: z.enum(['podman', 'sbx']).nullable().optional(),
+          provider: z.literal('podman').nullable().optional(),
           claudeCredentialPassthrough: z.boolean().nullable().optional(),
           /** NAMED volumes only → an absolute guest path. A path-shaped key would bind a host
            *  directory into every container, and `:`/`,` would smuggle mount options. */

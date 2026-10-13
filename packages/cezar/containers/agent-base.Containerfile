@@ -31,8 +31,9 @@ RUN npm install -g @anthropic-ai/claude-code @moonshot-ai/kimi-code
 # authenticate. `gh` is installed above from its own apt repo.
 RUN npm install -g @railway/cli
 
-# The other runners' CLIs, only those a task has needed (`CEZ_AGENTS`, set by cezar
-# from the runner a task asks for): together they add ~1.5 GB, most of it Cursor.
+# The other runners' CLIs, and tools a ticked credential needs (az), only once a
+# task has needed one (`CEZ_AGENTS`, set by cezar): the runners together add ~1.5 GB,
+# most of it Cursor, and az another ~640 MB.
 # Junie's npm package is a shim that downloads the real binary on first run, so
 # that run happens here rather than in every new container.
 ARG CEZ_AGENTS=""
@@ -43,6 +44,7 @@ RUN set -e; for agent in $CEZ_AGENTS; do case "$agent" in \
       copilot)  npm install -g --no-fund --no-audit @github/copilot ;; \
       junie)    npm install -g --no-fund --no-audit @jetbrains/junie && junie --version ;; \
       cursor)   curl -fsSL https://cursor.com/install | bash ;; \
+      azure-cli) curl -fsSL https://aka.ms/InstallAzureCLIDeb | bash && rm -rf /var/lib/apt/lists/* ;; \
       *)        echo "unknown agent: $agent" >&2; exit 1 ;; \
     esac; done
 # Cursor's installer puts `agent` here.

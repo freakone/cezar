@@ -8,10 +8,11 @@ import { homedir, tmpdir, userInfo } from 'node:os';
 import { promisify } from 'node:util';
 import { BASE_IMAGE_TAG, GIT_EXEC_PATHS, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import { agentHomesFor, agentKimiHome, kimiHome } from './kimi-home.ts';
-import { CONTAINER_AGENTS, containerAgent, syncContainerAgentLogin } from './container-agents.ts';
+import { CONTAINER_AGENTS, containerAgent, isImageExtra, syncContainerAgentLogin, withoutRefreshTokens } from './container-agents.ts';
 import type { SandboxConfig } from '../config.ts';
 import { parseMachines } from './container-probe.ts';
 import {
+  CREDENTIAL_CATALOG,
   credentialCopyPlan,
   resolvePassthrough,
   sanitizeSshConfig,
@@ -77,11 +78,16 @@ export function baseContainerfilePath(): string {
  * the user has never heard of. The base is cezar's own artifact, so cezar
  * builds it.
  */
-export async function ensureBaseImage(
+export function ensureBaseImage(
   bin = 'podman',
-  /** Runner CLIs the image must carry beyond Claude and Kimi (`CONTAINER_AGENTS`). */
+  /** CLIs the image must carry beyond Claude and Kimi: runners and credential tools (`isImageExtra`). */
   agents: readonly string[] = [],
 ): Promise<void> {
+  // Every project builds FROM the one base, so its builds queue machine-wide (see `serialized`).
+  return serialized(imageChains, `base\0${bin}`, () => ensureBaseImageOnce(bin, agents));
+}
+
+async function ensureBaseImageOnce(bin: string, agents: readonly string[]): Promise<void> {
   const file = baseContainerfilePath();
   const exists = await run(bin, ['image', 'exists', BASE_IMAGE_TAG]).then(() => true).catch(() => false);
   if (!existsSync(file)) {
@@ -116,7 +122,7 @@ const BASE_AGENTS_LABEL = 'dev.cezar.agents';
 
 /** Known runner ids only, sorted and unique — a label is read back from an image, not trusted. */
 function parseAgentsLabel(value: string | undefined): string[] {
-  return [...new Set((value ?? '').split(',').map((a) => a.trim()).filter((a) => containerAgent(a) !== undefined))].sort();
+  return [...new Set((value ?? '').split(',').map((a) => a.trim()).filter(isImageExtra))].sort();
 }
 
 /** The label carrying the hash of the Containerfile a base image was built from. */
@@ -136,23 +142,32 @@ async function imageLabel(tag: string, label: string, bin: string): Promise<stri
   }
 }
 
-/** One build per tag at a time. Two tasks started together each saw a stale image and each ran
- *  a full `podman build` of it; the second now waits for the first and reuses its answer. */
-const imageBuilds = new Map<string, Promise<void>>();
+/**
+ * One image build at a time per tag, QUEUED rather than shared: two tasks that need different CLIs
+ * each get their check, in turn, against what the previous build left — sharing one in-flight build
+ * let the last of two parallel builds win the tag without the other's CLI. A queued check of an
+ * image that is already right costs a few `podman image inspect`s.
+ */
+function serialized(chains: Map<string, Promise<void>>, key: string, work: () => Promise<void>): Promise<void> {
+  const next = (chains.get(key) ?? Promise.resolve()).catch(() => undefined).then(work);
+  chains.set(key, next);
+  void next.catch(() => undefined).finally(() => {
+    if (chains.get(key) === next) chains.delete(key);
+  });
+  return next;
+}
+
+const imageChains = new Map<string, Promise<void>>();
 
 export async function ensureImage(
   cfg: SandboxConfig,
   repoRoot: string,
   bin = 'podman',
-  /** Runner CLIs this task needs in the image (see `ensureBaseImage`). */
-  agents: readonly string[] = [],
+  /** CLIs this task needs in the image (see `ensureBaseImage`). */
+  extras: readonly string[] = [],
 ): Promise<void> {
-  const key = `${bin}\0${repoRoot}\0${cfg.image ?? ''}\0${cfg.containerfile}\0${agents.join(',')}`;
-  const inFlight = imageBuilds.get(key);
-  if (inFlight) return inFlight;
-  const build = ensureImageOnce(cfg, repoRoot, bin, agents).finally(() => imageBuilds.delete(key));
-  imageBuilds.set(key, build);
-  return build;
+  return serialized(imageChains, `${bin}\0${repoRoot}\0${cfg.image ?? ''}\0${cfg.containerfile}`, () =>
+    ensureImageOnce(cfg, repoRoot, bin, extras));
 }
 
 async function ensureImageOnce(
@@ -271,22 +286,29 @@ export async function startTaskContainer(
       remounted = drift;
     }
   }
-  // A runner whose CLI the container's image lacks — the first Codex turn of a task that ran
-  // Claude — gets a container from an image that has it. Only for images cezar builds: a pinned
-  // image cannot gain a CLI, and recreating it every turn would change nothing.
   const agent = containerAgent(opts.backend);
-  const cezarBuilt = !cfg.image || existsSync(join(repoRoot, cfg.containerfile));
-  let addedAgent: string | undefined;
-  if (running && agent && cezarBuilt && !(await hasBinary(name, agent.bin, bin))) {
-    await run(bin, ['rm', '-f', '-v', name]).catch(() => undefined);
-    running = false;
-    addedAgent = agent.id;
-  }
   const credentials = resolvePassthrough(cfg.credentials);
+  const extras = imageExtras(agent, credentials);
+  const hasContainerfile = existsSync(join(repoRoot, cfg.containerfile));
+  let addedAgent: string | undefined;
+  if (running) {
+    // A stopped container from an earlier turn has to be woken — before it is probed: `exec` into
+    // a stopped container fails, and that failure is not "the CLI is there".
+    await run(bin, ['start', name]).catch(() => undefined);
+    // A runner whose CLI the container's image lacks — the first Codex turn of a task that ran
+    // Claude — gets a container from an image that has it. Only when a rebuilt image WOULD have
+    // it (it derives from cezar's base, whose label lists its CLIs): a pinned image or a repo
+    // image FROM something else never gains one, and recreating it every turn changes nothing.
+    if (agent && (await hasBinary(name, agent.bin, bin)) === false) {
+      await ensureImage(cfg, repoRoot, bin, extras);
+      if (!(await imageCarries(imageTag(cfg, hasContainerfile), agent.id, bin))) throw new MissingAgentCli(agent, imageTag(cfg, hasContainerfile));
+      await run(bin, ['rm', '-f', '-v', name]).catch(() => undefined);
+      running = false;
+      addedAgent = agent.id;
+    }
+  }
   const passLogins = cfg.claudeCredentialPassthrough;
   if (running) {
-    // A stopped container from an earlier turn still has to be woken.
-    await run(bin, ['start', name]).catch(() => undefined);
     // Every spawn re-copies, so a token refreshed on the host reaches the next
     // turn of a long task — the property a mount was supposed to give and
     // could not (see `podmanRunArgs`).
@@ -308,15 +330,19 @@ export async function startTaskContainer(
   // creation-time property: an HTTP-speaking backend that discovers it needs a
   // port later would have nowhere to put it.
   const publishPort = await freePort();
-  await ensureImage(cfg, repoRoot, bin, agent ? [agent.id] : []);
+  await ensureImage(cfg, repoRoot, bin, extras);
   if (passLogins && opts.backend === 'kimi') syncKimiConfig(join(kimiHome({ ...process.env, ...opts.accountEnv }), 'config.toml'), homes.kimi);
   await podman(bin, podmanRunArgs(cfg, name, repoRoot, {
     credentialPassthrough: passLogins,
     credentials,
     publishPort,
-    hasContainerfile: existsSync(join(repoRoot, cfg.containerfile)),
+    hasContainerfile,
     ...runOpts,
   }));
+  // An image cezar cannot add the CLI to (pinned, or a repo image not built FROM the base): this
+  // turn runs on the host, saying why, rather than exec a CLI that is not there under an
+  // "isolated" badge. Checked once the container exists, so a pin that DOES carry it isolates.
+  if (agent && (await hasBinary(name, agent.bin, bin)) === false) throw new MissingAgentCli(agent, imageTag(cfg, hasContainerfile));
   // Copies happen after the container exists, because `podman cp` needs a
   // target. Failing to place one is not fatal to the run: the agent will report
   // the tool being logged out, which is a far clearer symptom than a container
@@ -891,7 +917,7 @@ export async function hostClaudeLogins(configDir?: string): Promise<string[]> {
 
 /**
  * The login a container may hold: the host login with the latest access-token expiry, with every
- * refresh token REMOVED. Refresh tokens are single-use — a container that refreshed its copy left
+ * refresh token BLANKED. Refresh tokens are single-use — a container that refreshed its copy left
  * the host holding a spent one, and the host's next refresh logged the operator out of Claude
  * everywhere (2026-10-13). The host refreshes; containers get the result on their next turn.
  */
@@ -915,17 +941,6 @@ export function containerClaudeLogin(raws: readonly string[]): { json: string; e
     json: JSON.stringify(withoutRefreshTokens(best.value)),
     ...(best.expiresAt > 0 ? { expiresAt: best.expiresAt } : {}),
   };
-}
-
-function withoutRefreshTokens(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(withoutRefreshTokens);
-  if (!value || typeof value !== 'object') return value;
-  const out: Record<string, unknown> = {};
-  for (const [key, inner] of Object.entries(value)) {
-    if (/^refreshToken/i.test(key)) continue;
-    out[key] = withoutRefreshTokens(inner);
-  }
-  return out;
 }
 
 /**
@@ -1019,14 +1034,47 @@ async function credentialReadable(container: string, ask: PodmanQuery): Promise<
   }
 }
 
-/** Is `binary` on the container's PATH? Unreadable answers true — never a recreate loop. */
-async function hasBinary(container: string, binary: string, bin: string): Promise<boolean> {
+/**
+ * Is `binary` on the container's PATH? Answered by what the probe PRINTS, never by its exit code:
+ * dash (the base image's `sh`) exits 127 for "not found" where bash exits 1, and podman failing
+ * has codes of its own. `undefined` when the probe itself failed — not an answer either way.
+ */
+async function hasBinary(container: string, binary: string, bin: string): Promise<boolean | undefined> {
   try {
-    await run(bin, ['exec', container, 'sh', '-c', `command -v ${binary}`], { timeout: 15_000 });
-    return true;
-  } catch (err) {
-    // `command -v` exits 1 for "not found"; anything else (podman itself failing) is not an answer.
-    return (err as { code?: unknown }).code !== 1;
+    const { stdout } = await run(
+      bin,
+      ['exec', container, 'sh', '-c', `if command -v ${binary} >/dev/null 2>&1; then echo present; else echo absent; fi`],
+      { timeout: 15_000 },
+    );
+    if (stdout.includes('present')) return true;
+    if (stdout.includes('absent')) return false;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Does `tag` carry `id`? Read from the base's label, which an image built FROM it inherits. */
+async function imageCarries(tag: string, id: string, bin: string): Promise<boolean> {
+  return parseAgentsLabel(await imageLabel(tag, BASE_AGENTS_LABEL, bin)).includes(id);
+}
+
+/** The CLIs this turn needs in the image: its runner's, and any a ticked credential brings. */
+function imageExtras(agent: { id: string } | undefined, credentials: readonly ResolvedCredential[]): string[] {
+  const tools = credentials
+    .filter((c) => !c.skipped)
+    .map((c) => CREDENTIAL_CATALOG.find((source) => source.id === c.id)?.imageTool)
+    .filter((tool): tool is NonNullable<typeof tool> => tool !== undefined);
+  return [...new Set([...(agent ? [agent.id] : []), ...tools])].sort();
+}
+
+/** This turn's runner has no CLI in the container's image and cezar cannot add it there. */
+export class MissingAgentCli extends PodmanUnavailable {
+  constructor(agent: { id: string; bin: string }, tag: string) {
+    super(
+      `the container image ${tag} has no \`${agent.bin}\` and cezar cannot add it (a pinned sandbox.image, or a `
+        + `repo Containerfile not built FROM ${BASE_IMAGE_TAG}) — the ${agent.id} runner cannot run in a container here`,
+    );
   }
 }
 

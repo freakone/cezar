@@ -3123,6 +3123,16 @@ export class RunManager {
       if (!recorded) this.store.updateRun(runId, { isolation: { effective: false } });
       return {};
     }
+    // A dry run's agents are the bundled mocks, which exist only on this machine — inside a
+    // container the real CLI would run instead, with a real login and a real bill.
+    if (process.env.CEZ_DRY_RUN === '1') {
+      if (!recorded) {
+        this.store.updateRun(runId, {
+          isolation: { effective: false, reason: 'dry run (CEZ_DRY_RUN=1): agents are the bundled mocks on this machine' },
+        });
+      }
+      return {};
+    }
     // Isolation is wanted and the repo has no sandbox of its own: use the
     // default. Not only for a fresh request — a run that already isolated keeps
     // isolating after its project config is removed, rather than moving to the
@@ -3135,9 +3145,8 @@ export class RunManager {
     // marked isolated and then ran the agent on the host anyway.
     const placed: SandboxConfig = { ...chosen, enabled: true };
 
-    // Checked BEFORE either provider: a runner that takes no launcher runs on this machine whatever
-    // the provider, so recording it isolated — as the sbx branch used to, ahead of this check — put
-    // an "isolated" badge on a process running on the host.
+    // Checked before any container work: a runner that cannot run in one runs on this machine, and
+    // recording it isolated would put an "isolated" badge on a process running on the host.
     if (!backendSupportsLauncher(backend)) {
       if (!recorded?.effective) {
         this.store.updateRun(runId, {
@@ -3157,13 +3166,6 @@ export class RunManager {
         });
       }
       return {};
-    }
-    if (placed.provider === 'sbx') {
-      // A Docker Sandboxes sandbox is isolation too, and has no per-task
-      // container to create — the launcher execs into it by name. Recording it
-      // as "not isolated" described a run that was not on the host.
-      this.store.updateRun(runId, { isolation: { effective: true, container: placed.name } });
-      return { sandbox: placed };
     }
     try {
       const container = await startTaskContainer(placed, this.repoRoot, runId, 'podman', {
@@ -3254,14 +3256,6 @@ export class RunManager {
       const secrets = await this.fetchSecrets(runId, placement.sandbox, stepId);
       if (secrets.fatal) return { launcher: localLauncher, fatal: secrets.fatal };
       env = secrets.env;
-    } else if (placement.sandbox && resolvePassthrough(placement.sandbox.credentials).some((c) => c.valueFrom)) {
-      // sbx cannot take per-exec values. Silence here would be a dropped secret
-      // on a run that is isolated and looks fully configured.
-      this.store.appendEvent(runId, {
-        type: 'note',
-        stepId,
-        message: `⚠ secrets from Vault are not passed to a ${placement.sandbox.provider} sandbox — only to podman containers`,
-      });
     }
     return { launcher: createLauncher(placement.sandbox, placement.container, env), fatal: null };
   }

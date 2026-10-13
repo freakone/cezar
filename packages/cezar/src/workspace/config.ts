@@ -202,7 +202,7 @@ const agentDefaultsSchema = z
      */
     sandbox: z
       .object({
-        provider: z.enum(['podman', 'sbx']).optional().catch(undefined),
+        provider: z.literal('podman').optional().catch(undefined),
         claudeCredentialPassthrough: z.boolean().optional().catch(undefined),
         cacheVolumes: salvageRecord(z.string()).optional().catch(undefined),
         resources: z

@@ -69,10 +69,7 @@ const podman = (over: Partial<SandboxConfig> = {}): SandboxConfig => ({
   enabled: true,
   provider: 'podman',
   name: 'x',
-  agent: 'shell',
-  createIfMissing: true,
   tmpdir: '/tmp/cez-agent',
-  unsetPlaceholderCredentials: false,
   containerfile: '.ai/cezar/Containerfile',
   claudeCredentialPassthrough: false,
   resources: { shmSize: '1g' },
@@ -183,16 +180,23 @@ describe('what a run records about where it ran', () => {
     expect(turn.launcher.id).toBe('local');
     expect(lifecycle.start).not.toHaveBeenCalled();
   });
+});
 
-  it('an sbx sandbox is isolation, and is recorded as such', async () => {
-    // It used to be recorded as "not isolated" while the launcher factory
-    // quietly built an sbx launcher — a record describing a run that was not
-    // on the host as one that was.
-    const { store, seam, runId } = harness();
-    const id = runId(true);
-    const turn = await seam.launcherForTurn(id, podman({ provider: 'sbx', name: 'textbook' }), 'claude', 'step');
-    expect(turn.launcher.id).toBe('sbx');
-    expect(store.getRun(id)?.isolation).toEqual({ effective: true, container: 'textbook' });
+describe('a dry run', () => {
+  it('never puts a task in a container — its agents are the bundled mocks on this machine', async () => {
+    const saved = process.env.CEZ_DRY_RUN;
+    process.env.CEZ_DRY_RUN = '1';
+    try {
+      const { store, seam, runId } = harness();
+      const id = runId(true);
+      const turn = await seam.launcherForTurn(id, podman(), 'claude', 'step');
+      expect(turn.launcher.id).toBe('local');
+      expect(lifecycle.start).not.toHaveBeenCalled();
+      expect(store.getRun(id)?.isolation).toMatchObject({ effective: false, reason: expect.stringContaining('dry run') });
+    } finally {
+      if (saved === undefined) delete process.env.CEZ_DRY_RUN;
+      else process.env.CEZ_DRY_RUN = saved;
+    }
   });
 });
 

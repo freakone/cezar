@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { applyCredentialsToRunning, containerClaudeLogin, syncClaudeCredential, taskContainerName, type MountSpec } from './podman-lifecycle.ts';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { SandboxConfig } from '../config.ts';
 
 describe('podman lifecycle', () => {
@@ -175,10 +175,11 @@ describe('the Claude login a container gets', () => {
 
   it('never carries a refresh token — a container refreshing would spend the host’s', () => {
     const out = containerClaudeLogin([login('at-1', 2_000, { mcpOAuth: { s: { accessToken: 'm', refreshToken: 'mr' } } })]);
-    expect(out?.json).not.toMatch(/refreshToken|rt-at-1|"mr"/);
+    expect(out?.json).not.toMatch(/rt-at-1|"mr"/);
+    // Blanked, not deleted: a CLI that requires the key must still accept the file.
     expect(JSON.parse(out!.json)).toEqual({
-      claudeAiOauth: { accessToken: 'at-1', expiresAt: 2_000, scopes: ['user:inference'] },
-      mcpOAuth: { s: { accessToken: 'm' } },
+      claudeAiOauth: { accessToken: 'at-1', refreshToken: '', expiresAt: 2_000, refreshTokenExpiresAt: 1, scopes: ['user:inference'] },
+      mcpOAuth: { s: { accessToken: 'm', refreshToken: '' } },
     });
     expect(out?.expiresAt).toBe(2_000);
   });
@@ -198,7 +199,7 @@ describe('the Claude login a container gets', () => {
     };
     expect(await syncClaudeCredential('cez-x', 'podman', ask, [login('at-2', 9_000)])).toEqual({ expiresAt: 9_000 });
     expect(copied).toHaveLength(1);
-    expect(copied[0]).not.toContain('refreshToken');
+    expect(JSON.parse(copied[0]!).claudeAiOauth.refreshToken).toBe('');
   });
 });
 
@@ -303,8 +304,8 @@ describe('a credential mounted after the task container started', () => {
   const repo = mkdtempSync(join(tmpdir(), 'cez-remount-repo-'));
   const home = mkdtempSync(join(tmpdir(), 'cez-remount-home-'));
   const cfg = {
-    enabled: true, provider: 'podman', name: 'app', agent: 'shell', createIfMissing: true,
-    tmpdir: '/tmp/cez-agent', unsetPlaceholderCredentials: true, containerfile: '.ai/cezar/Containerfile',
+    enabled: true, provider: 'podman', name: 'app',
+    tmpdir: '/tmp/cez-agent', containerfile: '.ai/cezar/Containerfile',
     claudeCredentialPassthrough: false, resources: { shmSize: '1g' },
     credentials: { enabled: { railway: true } },
   } as unknown as SandboxConfig;
@@ -386,28 +387,76 @@ exit 0
     expect(container.remounted).toEqual([data!.destination]);
   });
 
+  /**
+   * A fake podman with STATE: the container's CLI probe answers from a file, a `build` records the
+   * image's `dev.cezar.agents` label and `image inspect` reads it back, and `rm` gives the next
+   * container whatever the image carries.
+   */
+  function statefulContainer(mounts: MountSpec[], opts: { hasCodex: boolean }): { bin: string; calls: () => string[] } {
+    const fake = existingContainer(mounts);
+    const dir = dirname(fake.bin);
+    writeFileSync(join(dir, 'has-codex'), opts.hasCodex ? 'present' : 'absent');
+    writeFileSync(join(dir, 'labels'), '');
+    const script = readFileSync(fake.bin, 'utf8').replace('if [ "$1" = inspect ]', [
+      'case "$*" in',
+      `  *"command -v codex"*) cat "${dir}/has-codex"; exit 0;;`,
+      `  "image inspect"*dev.cezar.agents*) cat "${dir}/labels"; exit 0;;`,
+      'esac',
+      `if [ "$1" = build ]; then for a in "$@"; do case "$a" in dev.cezar.agents=*) echo "\${a#dev.cezar.agents=}" > "${dir}/labels";; esac; done; exit 0; fi`,
+      `if [ "$1" = rm ]; then case "$(cat "${dir}/labels")" in *codex*) echo present > "${dir}/has-codex";; esac; exit 0; fi`,
+      'if [ "$1" = inspect ]',
+    ].join('\n'));
+    writeFileSync(fake.bin, script);
+    return fake;
+  }
+
   it('recreates a container whose image lacks the runner this turn needs, from an image that has it', async () => {
     const { startTaskContainer } = await import('./podman-lifecycle.ts');
-    const podman = existingContainer(await wanted('runccccc-0000'));
-    // The fake answers "not found" for the CLI probe, as an image built before Codex was needed would.
-    const script = readFileSync(podman.bin, 'utf8').replace(
-      'if [ "$1" = inspect ]',
-      'case "$*" in *"command -v codex"*) exit 1;; esac\nif [ "$1" = inspect ]',
-    );
-    writeFileSync(podman.bin, script);
+    const podman = statefulContainer(await wanted('runccccc-0000'), { hasCodex: false });
     const container = await startTaskContainer(cfg, repo, 'runccccc-0000', podman.bin, { backend: 'codex' });
     expect(container.addedAgent).toBe('codex');
     const calls = podman.calls();
     expect(calls).toContain('rm -f -v cez-runccccc');
     expect(calls.some((c) => c.startsWith('build ') && c.includes('CEZ_AGENTS=codex') && c.includes('dev.cezar.agents=codex'))).toBe(true);
+    // Woken BEFORE it is probed: `exec` into a stopped container fails, and that is no answer.
+    const startAt = calls.indexOf('start cez-runccccc');
+    const probeAt = calls.findIndex((c) => c.includes('command -v codex'));
+    expect(startAt).toBeGreaterThanOrEqual(0);
+    expect(startAt).toBeLessThan(probeAt);
   });
 
   it('reuses a container whose image already has the runner', async () => {
     const { startTaskContainer } = await import('./podman-lifecycle.ts');
-    const podman = existingContainer(await wanted('runddddd-0000'));
+    const podman = statefulContainer(await wanted('runddddd-0000'), { hasCodex: true });
     const container = await startTaskContainer(cfg, repo, 'runddddd-0000', podman.bin, { backend: 'codex' });
     expect(container.addedAgent).toBeUndefined();
     expect(podman.calls().some((c) => c.startsWith('rm '))).toBe(false);
+  });
+
+  it('runs on the host, never recreating, when the image is one cezar cannot add the CLI to', async () => {
+    const { MissingAgentCli, startTaskContainer } = await import('./podman-lifecycle.ts');
+    const pinned = { ...cfg, image: 'my/claude-only:v1' } as SandboxConfig;
+    const podman = statefulContainer(await wanted('runeeeee-0000'), { hasCodex: false });
+    await expect(startTaskContainer(pinned, repo, 'runeeeee-0000', podman.bin, { backend: 'codex' }))
+      .rejects.toBeInstanceOf(MissingAgentCli);
+    expect(podman.calls().some((c) => c.startsWith('rm '))).toBe(false);
+  });
+
+  it('adds az to the image when the Azure credential is ticked', async () => {
+    const { startTaskContainer } = await import('./podman-lifecycle.ts');
+    const { mkdirSync } = await import('node:fs');
+    const savedHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      mkdirSync(join(home, '.azure'), { recursive: true });
+      const azure = { ...cfg, credentials: { enabled: { azure: true } } } as SandboxConfig;
+      // The container predates the tick: no `~/.azure` mount, so it is recreated — from an image with az.
+      const podman = statefulContainer(await wanted('runfffff-0000'), { hasCodex: true });
+      await startTaskContainer(azure, repo, 'runfffff-0000', podman.bin);
+      expect(podman.calls().some((c) => c.startsWith('build ') && c.includes('CEZ_AGENTS=azure-cli'))).toBe(true);
+    } finally {
+      process.env.HOME = savedHome;
+    }
   });
 
   it('reuses a container that already has every mount it should', async () => {

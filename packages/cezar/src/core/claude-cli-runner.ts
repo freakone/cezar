@@ -65,8 +65,8 @@ export interface ClaudeCliRunnerOptions {
   /** Wall-clock timeout for a run (ms); per-spec `timeoutMs` still wins. */
   timeoutMs?: number;
   /**
-   * WHERE the CLI runs. Defaults to this machine; an `SbxLauncher` puts the
-   * identical argv inside a sandbox instead. The runner is unaware of which —
+   * WHERE the CLI runs. Defaults to this machine; a `PodmanLauncher` puts the
+   * identical argv inside the task's container instead. The runner is unaware of which —
    * it only needs spawn + signal.
    */
   launcher?: ProcessLauncher;
@@ -204,7 +204,7 @@ export class ClaudeCliRunner implements AgentRunner {
     const signalChild = (signal: 'SIGTERM' | 'SIGKILL'): void => {
       terminatedByCezar = true;
       // Through the launcher, not `child.kill`: when the agent runs in a
-      // sandbox the child is an `sbx exec` client, and killing it leaves the
+      // container the child is a `podman exec` client, and killing it leaves the
       // agent alive inside the container. Fire-and-forget by design — the
       // caller's SIGTERM→SIGKILL escalation already owns the timing.
       void this.launcher.signal(child, signal);

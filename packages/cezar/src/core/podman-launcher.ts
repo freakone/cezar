@@ -20,11 +20,9 @@ import { agentKimiHome, kimiHome } from './kimi-home.ts';
 /**
  * Run the agent in a Podman container while cezar stays on the host.
  *
- * Chosen over Docker Sandboxes because nothing here needs an account: no
- * registry login, no OAuth token in the macOS keychain, and therefore no
- * dependence on a GUI session — which is what made `sbx` unusable over ssh.
- * Containers also live exactly as long as we say, instead of being reclaimed
- * 30s after the last client disconnects.
+ * Podman because nothing here needs an account: no registry login, no OAuth token in the macOS
+ * keychain, and therefore no dependence on a GUI session, so it works over ssh. Containers live
+ * exactly as long as we say.
  *
  * The layout, and why each part is the way it is:
  *
@@ -367,12 +365,9 @@ export function podmanExec(
       '-w', opts.cwd,
       ...Object.keys(env).sort().flatMap((name) => ['-e', name]),
       containerName,
-      // NOT `unsetPlaceholderCredentials`: that exists because *sbx* injects
-      // `ANTHROPIC_API_KEY=proxy-managed` and a fake GH_TOKEN into PID 1. Podman
-      // injects nothing, and `buildChildEnv` forwards the host's REAL
-      // `ANTHROPIC_*` in the env above — unsetting it here would delete the only
-      // credential an API-key user has.
-      'sh', '-c', guestScript([]),
+      // Nothing is unset: `buildChildEnv` forwards the host's REAL `ANTHROPIC_*` in the env above,
+      // and unsetting it would delete the only credential an API-key user has.
+      'sh', '-c', guestScript(),
       'cez-podman', bin, ...args,
     ],
     env,

@@ -68,15 +68,9 @@ Every backend gets isolation from one seam, and the four spawn sites were alread
 Making it a runner id would have multiplied the matrix — `claude`, `claude-isolated`,
 `codex`, `codex-isolated` — for two independent axes.
 
-### Why podman, not Docker Sandboxes
+### Why podman
 
-We built `sbx` support first and abandoned it in practice. Its credentials live in an OAuth token
-in the macOS keychain, so every `sbx` command needs a GUI (Aqua) security session — unusable from
-ssh, which is how this machine is driven. It also stops a sandbox 30 s after the last session
-disconnects, which makes a long-lived cockpit impossible. The `SbxLauncher` remains for hosts
-already standardised on it.
-
-Podman needs no account, no registry login and no keychain, and containers live exactly as long as
+Podman is the only runtime. It needs no account, no registry login and no keychain, and containers live exactly as long as
 we say.
 
 ### The three-layer image model

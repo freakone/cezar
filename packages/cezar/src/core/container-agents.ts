@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
  * a home that outlives the container, and a login.
  *
  * Logins follow the rule Claude's does (`containerClaudeLogin`): a login file is copied in per
- * turn with every REFRESH token removed. Refresh tokens are single-use, so a container that
+ * turn with every REFRESH token blanked. Refresh tokens are single-use, so a container that
  * refreshed its copy would leave the host holding a spent one — and log the operator out. A runner
  * whose stored login cezar cannot read safely (Cursor, Junie, Copilot) gets its static key from
  * the environment instead, and the task log names the variable when there is none.
@@ -67,16 +67,27 @@ export function containerAgent(backend: string | undefined): ContainerAgent | un
     : undefined;
 }
 
-/** A JSON login with every refresh token removed (`refresh_token`, `refreshToken`, `refresh`). */
+/**
+ * A JSON login with every refresh token BLANKED (`refresh_token`, `refreshToken`, `refresh`). The
+ * key stays, empty: Codex and OpenCode require it, and reject a login file without it.
+ */
 export function withoutRefreshTokens(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutRefreshTokens);
   if (!value || typeof value !== 'object') return value;
   const out: Record<string, unknown> = {};
   for (const [key, inner] of Object.entries(value)) {
-    if (/^refresh(_?token.*)?$/i.test(key)) continue;
-    out[key] = withoutRefreshTokens(inner);
+    out[key] = REFRESH_KEY.test(key) && typeof inner === 'string' ? '' : withoutRefreshTokens(inner);
   }
   return out;
+}
+
+const REFRESH_KEY = /^refresh(_?token)?$/i;
+
+/** Ids the base image can install on demand: the runners above, and tools a credential needs. */
+export const IMAGE_TOOLS = ['azure-cli'] as const;
+
+export function isImageExtra(id: string): boolean {
+  return containerAgent(id) !== undefined || (IMAGE_TOOLS as readonly string[]).includes(id);
 }
 
 /**

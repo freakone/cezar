@@ -108,8 +108,8 @@ describe('the repo as an isolated task sees it', () => {
 
 describe('podman exec environment', () => {
   const cfg = {
-    enabled: true, provider: 'podman', name: 'app', agent: 'shell', createIfMissing: true,
-    tmpdir: '/tmp/cez-agent', unsetPlaceholderCredentials: true, containerfile: '.ai/cezar/Containerfile',
+    enabled: true, provider: 'podman', name: 'app',
+    tmpdir: '/tmp/cez-agent', containerfile: '.ai/cezar/Containerfile',
     claudeCredentialPassthrough: false, resources: { shmSize: '1g' },
   } as unknown as SandboxConfig;
 
@@ -256,3 +256,19 @@ describe('a container’s Claude login running out', () => {
     expect(claudeLoginNote(now - 1, now)).toMatch(/has expired/);
   });
 });
+
+describe('host paths that mean nothing in a container', () => {
+  it('keeps every runner’s home and data relocation out of the container env', async () => {
+    const { containerEnvPairs } = await import('./container-runtime.ts');
+    const names = containerEnvPairs({
+      XDG_DATA_HOME: '/Users/k/.local/share', CURSOR_CONFIG_DIR: '/Users/k/.cursor', COPILOT_HOME: '/Users/k/.copilot',
+      JUNIE_DATA: '/Users/k/.local/share/junie', AZURE_CONFIG_DIR: '/Users/k/.azure', OPENCODE_CONFIG_DIR: '/Users/k/oc',
+      CURSOR_API_KEY: 'k',
+    }, '/tmp/cez-agent').map((pair) => pair.slice(0, pair.indexOf('=')));
+    expect(names).toContain('CURSOR_API_KEY');
+    for (const name of ['XDG_DATA_HOME', 'CURSOR_CONFIG_DIR', 'COPILOT_HOME', 'JUNIE_DATA', 'AZURE_CONFIG_DIR', 'OPENCODE_CONFIG_DIR']) {
+      expect(names).not.toContain(name);
+    }
+  });
+});
+

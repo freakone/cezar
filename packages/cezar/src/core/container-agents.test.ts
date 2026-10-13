@@ -15,7 +15,7 @@ const temp = (): string => {
 };
 
 describe('a runner login passed into a container', () => {
-  it('drops every refresh token, whatever the CLI calls it', () => {
+  it('blanks every refresh token, whatever the CLI calls it, keeping the key its CLI requires', () => {
     // Codex (`tokens.refresh_token`), OpenCode and pi (`refresh` per provider), Claude (`refreshToken`).
     expect(withoutRefreshTokens({
       OPENAI_API_KEY: null,
@@ -25,10 +25,10 @@ describe('a runner login passed into a container', () => {
       claudeAiOauth: { accessToken: 'a3', refreshToken: 'r3', refreshTokenExpiresAt: 2 },
     })).toEqual({
       OPENAI_API_KEY: null,
-      tokens: { access_token: 'a', id_token: 'i' },
-      anthropic: { type: 'oauth', access: 'a2', expires: 1 },
+      tokens: { access_token: 'a', refresh_token: '', id_token: 'i' },
+      anthropic: { type: 'oauth', access: 'a2', refresh: '', expires: 1 },
       openai: { type: 'api', key: 'k' },
-      claudeAiOauth: { accessToken: 'a3' },
+      claudeAiOauth: { accessToken: 'a3', refreshToken: '', refreshTokenExpiresAt: 2 },
     });
   });
 
@@ -39,7 +39,7 @@ describe('a runner login passed into a container', () => {
     writeFileSync(join(home, '.codex', 'auth.json'), JSON.stringify({ tokens: { access_token: 'a', refresh_token: 'r' } }));
     expect(syncContainerAgentLogin(CONTAINER_AGENTS.codex, agentHome, {}, home)).toBe(true);
     const copied = readFileSync(join(agentHome, 'auth.json'), 'utf8');
-    expect(JSON.parse(copied)).toEqual({ tokens: { access_token: 'a' } });
+    expect(JSON.parse(copied)).toEqual({ tokens: { access_token: 'a', refresh_token: '' } });
   });
 
   it('honours an agent account that relocates the login', () => {

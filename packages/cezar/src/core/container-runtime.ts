@@ -1,8 +1,6 @@
 /**
- * Pieces every container launcher needs, independent of the runtime driving it
- * (`sbx`, `podman`, whatever comes next). They are here rather than in one
- * launcher because each was learned from a failure, and re-deriving them per
- * provider is how the same bug ships twice.
+ * Pieces a container launcher needs, kept apart from the podman launcher because each was
+ * learned from a failure and is easier to test on its own.
  */
 
 /**
@@ -18,6 +16,12 @@ export const HOST_ONLY_ENV: ReadonlySet<string> = new Set([
   // home is the mounted one, logged in with the SELECTED account's credential; a Mac path would
   // send it looking for a login — and a place to keep its conversation — that is not there.
   'KIMI_CODE_HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
+  // The same for the other runners' homes and data dirs: each has a mounted per-project home
+  // inside, and a Mac path would bypass it (OpenCode under XDG_DATA_HOME, Junie's binaries under
+  // JUNIE_DATA, az under AZURE_CONFIG_DIR).
+  'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR',
+  'CURSOR_CONFIG_DIR', 'COPILOT_HOME', 'JUNIE_HOME', 'JUNIE_DATA', 'PI_CODING_AGENT_DIR',
+  'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_DB', 'AZURE_CONFIG_DIR',
   // Host paths that mean nothing in Linux and change how tools behave: gh reads its config from
   // XDG_CONFIG_HOME (so the copied hosts.yml was ignored), NODE_OPTIONS can `--require` a Mac
   // file, and the ssh variables point at a socket or a command on the host.
@@ -57,16 +61,11 @@ export function containerEnvPairs(env: NodeJS.ProcessEnv, guestTmp: string): str
  *
  * It records its own pid BEFORE `exec`, and `exec` replaces the shell in place
  * — so the recorded pid IS the agent's. That file is the only way to signal a
- * process no host signal can reach: killing an `exec` client (sbx or podman)
- * leaves the process inside running, which was measured, not assumed.
- *
- * `unsetCredentials` drops placeholder credentials a runtime injects into the
- * container (sbx sets `ANTHROPIC_API_KEY=proxy-managed` and a fake `GH_TOKEN`
- * in PID 1) so a real login mounted into the container wins.
+ * process no host signal can reach: killing a `podman exec` client leaves the
+ * process inside running, which was measured, not assumed.
  */
-export function guestScript(unsetCredentials: readonly string[] = []): string {
-  const unset = unsetCredentials.length > 0 ? `unset ${unsetCredentials.join(' ')}; ` : '';
-  return `${unset}mkdir -p "$TMPDIR"; echo $$ > "$CEZ_PID_FILE"; exec "$@"`;
+export function guestScript(): string {
+  return 'mkdir -p "$TMPDIR"; echo $$ > "$CEZ_PID_FILE"; exec "$@"';
 }
 
 /** `kill` the recorded pid inside the container; never fails the caller. */

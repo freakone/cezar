@@ -62,6 +62,8 @@ export interface CredentialSource {
   selectable?: 'ssh';
   /** Why this one needs mount, when it does — shown in the UI. */
   note?: string;
+  /** A CLI the base image installs only once this credential is ticked (`agent-base.Containerfile`). */
+  imageTool?: 'azure-cli';
 }
 
 /**
@@ -122,6 +124,18 @@ export const CREDENTIAL_CATALOG: CredentialSource[] = [
     env: ['RAILWAY_TOKEN', 'RAILWAY_API_TOKEN'],
     defaultMode: 'mount',
     note: 'railway rewrites config.json on login and on `railway link`; mounted, a login or a link on either side reaches the other — the repo sits at the same path in both, so links resolve.',
+  },
+  {
+    id: 'azure',
+    kind: 'dir',
+    label: 'Azure CLI (az)',
+    hostPath: '.azure',
+    guestPath: '/root/.azure',
+    // A service principal works without any login on disk — what SDKs and Terraform read.
+    env: ['AZURE_SUBSCRIPTION_ID', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET'],
+    defaultMode: 'mount',
+    note: 'az refreshes its MSAL token cache in place, so a copy goes stale. az itself (~640 MB) is added to the image the first time this is ticked.',
+    imageTool: 'azure-cli',
   },
   {
     id: 'aws',
@@ -569,9 +583,8 @@ export interface SecretProblem {
  * synchronous and pure, which is the property their tests rely on.
  *
  * A fetch that fails never yields an empty pair. An empty value SHADOWS a
- * credential the container already holds — exactly how sbx's
- * `ANTHROPIC_API_KEY=proxy-managed` placeholder broke the claude login — so a
- * failure is reported and the variable is simply absent.
+ * credential the container already holds, so a failure is reported and the
+ * variable is simply absent.
  */
 export async function resolveSecretEnv(
   resolved: readonly ResolvedCredential[],
@@ -637,8 +650,7 @@ export function credentialEnvPairs(
     for (const name of c.env) {
       const value = env[name];
       // Only forward what the host actually has. Passing an empty value would
-      // SHADOW a credential the container already holds — the exact failure
-      // mode of sbx's `ANTHROPIC_API_KEY=proxy-managed` placeholder.
+      // SHADOW a credential the container already holds.
       if (value) pairs.push(`${name}=${value}`);
     }
   }

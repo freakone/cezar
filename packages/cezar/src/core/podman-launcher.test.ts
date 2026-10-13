@@ -9,10 +9,7 @@ const cfg = (over: Partial<SandboxConfig> = {}): SandboxConfig => ({
   enabled: true,
   provider: 'podman',
   name: 'textbook',
-  agent: 'shell',
-  createIfMissing: true,
   tmpdir: '/tmp/cez-agent',
-  unsetPlaceholderCredentials: true,
   containerfile: '.ai/cezar/Containerfile',
   claudeCredentialPassthrough: true,
   resources: { shmSize: '1g' },
@@ -59,8 +56,7 @@ describe('podman launcher', () => {
       .toContain('localhost/cezar-agent/base:latest');
   });
 
-  it('does NOT unset ANTHROPIC_API_KEY/GH_TOKEN — that is an sbx quirk', () => {
-    // sbx injects placeholders into PID 1; podman injects nothing, and
+  it('does NOT unset ANTHROPIC_API_KEY/GH_TOKEN', () => {
     // buildChildEnv forwards the host's REAL keys. Unsetting them here deleted
     // the only credential an API-key user has.
     const args = podmanExecArgs(cfg(), 'c', 'claude', [], { cwd: REPO, env: {} }, '/tmp/p.pid');
@@ -134,7 +130,7 @@ describe('podman launcher', () => {
     expect(env.CEZ_TASK_ID).toBe('abc');
     expect(args.join(' ')).not.toContain('sk_live_secret_value');
     expect(env.STRIPE_KEY).toBe('sk_live_secret_value');
-    // The TMPDIR fix applies to podman exactly as it did to sbx.
+    // Container-local TMPDIR, never the host's per-run one (see the base Containerfile).
     expect(env.TMPDIR).toBe('/tmp/cez-agent');
   });
 

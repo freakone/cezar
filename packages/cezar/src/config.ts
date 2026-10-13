@@ -32,7 +32,7 @@ export const DEFAULT_WORKTREE_RETENTION = 10;
 const worktreeRetentionSchema = z.number().int().min(0).max(1000);
 
 /**
- * Where a task's agent process runs (spec: cezar+sbx). Absent = `local`, which
+ * Where a task's agent process runs (spec 2026-09-07-agent-isolation). Absent = `local`, which
  * is every existing install — isolation is opt-in, never inferred.
  *
  * The sandbox is NAMED and reused across tasks by design. A fresh container per
@@ -45,11 +45,10 @@ const sandboxSchema = z.object({
   /** Run agents inside the sandbox. False/absent keeps them on this machine. */
   enabled: z.boolean().default(false),
   /**
-   * Container runtime. `podman` is the default: it needs no account, no
-   * registry login and no macOS keychain, so it works over ssh — which is what
-   * ruled `sbx` out. `sbx` stays selectable for hosts already using it.
+   * Container runtime: podman only. A config naming a runtime cezar no longer supports reads as
+   * podman rather than failing to parse.
    */
-  provider: z.enum(['podman', 'sbx']).default('podman'),
+  provider: z.literal('podman').catch('podman').default('podman'),
   /** Sandbox name, reused across every task in this repo. */
   name: z.string().trim().min(1).max(120).default('cezar'),
   /**
@@ -134,11 +133,6 @@ const sandboxSchema = z.object({
    * revocable credential.
    */
   claudeCredentialPassthrough: z.boolean().default(true),
-  /** The `sbx create` agent kind. `shell` is right for cezar: cezar drives the
-   *  agent CLI itself and only needs a place to run it. */
-  agent: z.string().trim().min(1).max(60).default('shell'),
-  /** Create the sandbox when it does not exist yet. */
-  createIfMissing: z.boolean().default(true),
   /**
    * Per-container resource limits. Unset = the container may use whatever the
    * podman VM has, which on macOS is the VM's allocation and NOT the host's —
@@ -165,10 +159,6 @@ const sandboxSchema = z.object({
    *  workspace: the native claude binary cannot do its startup temp-file work
    *  on that mount and dies with `ENOENT … fstat`. */
   tmpdir: z.string().trim().min(1).max(300).default('/tmp/cez-agent'),
-  /** Unset the placeholder `ANTHROPIC_API_KEY` / `GH_TOKEN` sbx injects into
-   *  PID 1, so the container's own logins win. Set false when the sandbox has
-   *  real credentials bound through `sbx secret`. */
-  unsetPlaceholderCredentials: z.boolean().default(true),
 });
 
 export type SandboxConfig = z.infer<typeof sandboxSchema>;

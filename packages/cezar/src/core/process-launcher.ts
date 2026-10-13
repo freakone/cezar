@@ -7,11 +7,11 @@ import { disclaimedCommand } from './disclaim-spawn.ts';
  * Every runner (`claude`, `codex`, `opencode`, `pi`) spawns its CLI the same
  * way — `spawn(bin, args, { cwd, env })` — so isolation is not a property of
  * the backend and must not become a fifth `RunnerId`. It is a property of the
- * launcher: `local` runs the CLI on this machine, `sbx` runs the identical
- * argv inside a Docker Sandboxes sandbox.
+ * launcher: `local` runs the CLI on this machine, `podman` runs the identical
+ * argv inside the task's container.
  *
  * The seam carries `signal()` as well as `spawn()` because the two diverge:
- * locally, killing the child kills the agent; through `sbx exec`, killing the
+ * locally, killing the child kills the agent; through `podman exec`, killing the
  * client leaves the agent running inside the container (measured, not assumed).
  * Every runner arms a SIGTERM→SIGKILL watchdog on teardown and signals on
  * `interrupt()`, so a launcher that cannot reach its own process would silently
@@ -24,7 +24,7 @@ export interface LaunchOpts {
 
 export interface ProcessLauncher {
   /** Stable id for logs, run records and config. */
-  readonly id: 'local' | 'sbx' | 'podman';
+  readonly id: 'local' | 'podman';
   /** One line naming where this launcher puts the agent — shown in run notes. */
   describe(): string;
   /**
