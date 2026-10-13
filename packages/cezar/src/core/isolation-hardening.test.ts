@@ -245,3 +245,14 @@ describe('which podman machine to start', () => {
     expect(parseMachines(rows)).toEqual({ running: false, name: 'main' });
   });
 });
+
+describe('a container’s Claude login running out', () => {
+  it('says so when the copied token is spent or about to be, and stays quiet otherwise', async () => {
+    const { claudeLoginNote } = await import('../workflows/run.ts');
+    const now = 1_000_000_000;
+    expect(claudeLoginNote(undefined, now)).toBeUndefined();
+    expect(claudeLoginNote(now + 3 * 3_600_000, now)).toBeUndefined();
+    expect(claudeLoginNote(now + 10 * 60_000, now)).toMatch(/expires in 10 min/);
+    expect(claudeLoginNote(now - 1, now)).toMatch(/has expired/);
+  });
+});

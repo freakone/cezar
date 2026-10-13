@@ -4,7 +4,7 @@ import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { homedir, tmpdir } from 'node:os';
+import { homedir, tmpdir, userInfo } from 'node:os';
 import { promisify } from 'node:util';
 import { BASE_IMAGE_TAG, GIT_EXEC_PATHS, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import { agentHomesFor, agentKimiHome, kimiHome } from './kimi-home.ts';
@@ -252,12 +252,18 @@ export async function startTaskContainer(
     // Every spawn re-copies, so a token refreshed on the host reaches the next
     // turn of a long task — the property a mount was supposed to give and
     // could not (see `podmanRunArgs`).
-    await syncAgentLogins(name, bin, homes, opts, passLogins);
+    const login = await syncAgentLogins(name, bin, homes, opts, passLogins);
     // And the same for everything else that is COPIED, so a credential ticked
     // after this container started reaches the next turn of the task instead of
     // waiting for a task that does not exist yet.
     await applyCredentials(name, credentials, bin);
-    return { name, homes, publishedPort: await publishedPortOf(name, bin), ...(startedMachine ? { startedMachine } : {}) };
+    return {
+      name,
+      homes,
+      publishedPort: await publishedPortOf(name, bin),
+      ...(startedMachine ? { startedMachine } : {}),
+      ...(login?.expiresAt !== undefined ? { claudeLoginExpiresAt: login.expiresAt } : {}),
+    };
   }
   // Allocated BEFORE the container exists, because publishing is a
   // creation-time property: an HTTP-speaking backend that discovers it needs a
@@ -276,7 +282,7 @@ export async function startTaskContainer(
   // target. Failing to place one is not fatal to the run: the agent will report
   // the tool being logged out, which is a far clearer symptom than a container
   // that refused to start.
-  await syncAgentLogins(name, bin, homes, opts, passLogins);
+  const login = await syncAgentLogins(name, bin, homes, opts, passLogins);
   await applyCredentials(name, credentials, bin);
   return {
     name,
@@ -284,6 +290,7 @@ export async function startTaskContainer(
     publishedPort: publishPort,
     ...(startedMachine ? { startedMachine } : {}),
     ...(remounted ? { remounted } : {}),
+    ...(login?.expiresAt !== undefined ? { claudeLoginExpiresAt: login.expiresAt } : {}),
   };
 }
 
@@ -294,15 +301,17 @@ async function syncAgentLogins(
   homes: { claude: string; kimi: string },
   opts: { backend?: string; accountEnv?: Record<string, string> },
   passLogins: boolean,
-): Promise<void> {
-  if (!passLogins) return;
+): Promise<{ expiresAt?: number } | undefined> {
+  if (!passLogins) return undefined;
+  let login: { expiresAt?: number } | undefined;
   if (opts.backend === undefined || opts.backend === 'claude' || opts.backend === 'claude-cli') {
-    const configDir = opts.accountEnv?.CLAUDE_CONFIG_DIR?.trim();
-    await syncClaudeCredential(name, bin, undefined, configDir ? join(configDir, '.credentials.json') : hostClaudeCredential());
+    const configDir = opts.accountEnv?.CLAUDE_CONFIG_DIR?.trim() || undefined;
+    login = await syncClaudeCredential(name, bin, undefined, hostClaudeLogins(configDir));
   }
   if (opts.backend === 'kimi') {
     syncKimiConfig(join(kimiHome({ ...process.env, ...opts.accountEnv }), 'config.toml'), homes.kimi);
   }
+  return login;
 }
 
 /**
@@ -730,6 +739,8 @@ export interface TaskContainer {
   remounted?: string[];
   /** This project's agent homes on the host. */
   homes?: { claude: string; kimi: string };
+  /** When the Claude access token handed to the container expires (ms since epoch). */
+  claudeLoginExpiresAt?: number;
 }
 
 /**
@@ -801,25 +812,105 @@ async function publishedPortOf(name: string, bin: string): Promise<number | unde
 
 
 /**
- * Put the host's current Claude credential into the container.
+ * Every stored Claude login on the host for one account, as raw JSON: its `.credentials.json`
+ * and, for the default account on macOS, the Keychain item — where a background cockpit's Claude
+ * keeps it. Unreadable sources are skipped. The Keychain is never read under vitest.
+ */
+export async function hostClaudeLogins(configDir?: string): Promise<string[]> {
+  const out: string[] = [];
+  const file = configDir ? join(configDir, '.credentials.json') : hostClaudeCredential();
+  try {
+    out.push(readFileSync(file, 'utf8'));
+  } catch {
+    // no file login
+  }
+  if (!configDir && process.platform === 'darwin' && !process.env.VITEST) {
+    try {
+      const { stdout } = await run(
+        'security',
+        ['find-generic-password', '-a', userInfo().username, '-s', 'Claude Code-credentials', '-w'],
+        { timeout: 5_000 },
+      );
+      if (stdout.trim()) out.push(stdout.trim());
+    } catch {
+      // locked, absent, or not macOS's Keychain at all
+    }
+  }
+  return out;
+}
+
+/**
+ * The login a container may hold: the host login with the latest access-token expiry, with every
+ * refresh token REMOVED. Refresh tokens are single-use — a container that refreshed its copy left
+ * the host holding a spent one, and the host's next refresh logged the operator out of Claude
+ * everywhere (2026-10-13). The host refreshes; containers get the result on their next turn.
+ */
+export function containerClaudeLogin(raws: readonly string[]): { json: string; expiresAt?: number } | undefined {
+  let best: { value: Record<string, unknown>; expiresAt: number } | undefined;
+  for (const raw of raws) {
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (!value || typeof value !== 'object') continue;
+    const oauth = (value as { claudeAiOauth?: { accessToken?: unknown; expiresAt?: unknown } }).claudeAiOauth;
+    if (typeof oauth?.accessToken !== 'string' || oauth.accessToken === '') continue;
+    const expiresAt = typeof oauth.expiresAt === 'number' ? oauth.expiresAt : 0;
+    if (!best || expiresAt > best.expiresAt) best = { value: value as Record<string, unknown>, expiresAt };
+  }
+  if (!best) return undefined;
+  return {
+    json: JSON.stringify(withoutRefreshTokens(best.value)),
+    ...(best.expiresAt > 0 ? { expiresAt: best.expiresAt } : {}),
+  };
+}
+
+function withoutRefreshTokens(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutRefreshTokens);
+  if (!value || typeof value !== 'object') return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(value)) {
+    if (/^refreshToken/i.test(key)) continue;
+    out[key] = withoutRefreshTokens(inner);
+  }
+  return out;
+}
+
+/**
+ * Put the host's current Claude login into the container — WITHOUT its refresh token
+ * (`containerClaudeLogin`). Answers when the copied access token expires.
  *
  * Copied rather than mounted, and re-copied before every spawn: Claude Code
  * rewrites that file atomically when it refreshes the token, which breaks a
  * file bind mount permanently (the container keeps the unlinked inode). A copy
  * has the opposite failure — it goes stale — and re-copying is what removes it.
  *
- * Silent when the host has no credential: that is the Keychain case, and the
- * container may hold its own login.
+ * Silent when the host has no usable login: the container may hold its own.
  */
 export async function syncClaudeCredential(
   container: string,
   bin = 'podman',
   /** Injectable for tests; defaults to running the real `podman`. */
   ask: PodmanQuery = (args) => run(bin, args).then(({ stdout }) => stdout),
-  /** The host file to sync; injectable so this is testable off a real login. */
-  source = hostClaudeCredential(),
-): Promise<void> {
-  if (!existsSync(source)) return;
+  /** The host's stored logins, raw; injectable so this is testable off a real login. */
+  logins: string[] | Promise<string[]> = hostClaudeLogins(),
+): Promise<{ expiresAt?: number } | undefined> {
+  const login = containerClaudeLogin(await logins);
+  if (!login) return undefined;
+  const dir = mkdtempSync(join(tmpdir(), 'cez-claude-login-'));
+  try {
+    const source = join(dir, '.credentials.json');
+    writeFileSync(source, login.json, { mode: 0o600 });
+    await copyClaudeLogin(container, ask, source);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  return login.expiresAt !== undefined ? { expiresAt: login.expiresAt } : {};
+}
+
+async function copyClaudeLogin(container: string, ask: PodmanQuery, source: string): Promise<void> {
   await ask(['exec', container, 'mkdir', '-p', GUEST_CREDENTIAL_DIR]).catch(() => undefined);
   await ask(['cp', source, `${container}:${GUEST_CREDENTIAL}`]).catch(() => undefined);
   if (await credentialReadable(container, ask)) return;

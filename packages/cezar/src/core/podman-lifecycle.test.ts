@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyCredentialsToRunning, syncClaudeCredential, taskContainerName, type MountSpec } from './podman-lifecycle.ts';
+import { applyCredentialsToRunning, containerClaudeLogin, syncClaudeCredential, taskContainerName, type MountSpec } from './podman-lifecycle.ts';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -129,8 +129,7 @@ describe('the claude credential in a container from an older cezar', () => {
   const calls: string[][] = [];
   // A real file, so the test exercises the same path a logged-in machine does
   // and does not quietly skip itself on a machine that has never logged in.
-  const source = join(mkdtempSync(join(tmpdir(), 'cez-cred-test-')), '.credentials.json');
-  writeFileSync(source, '{"claudeAiOauth":{"accessToken":"sk-ant-test"}}');
+  const source = ['{"claudeAiOauth":{"accessToken":"sk-ant-test"}}'];
   const podman = (readable: boolean): (args: string[]) => Promise<string> => async (args) => {
     calls.push(args);
     if (args[0] === 'exec' && args[2] === 'head' && !readable) throw new Error('ENOENT');
@@ -165,8 +164,41 @@ describe('the claude credential in a container from an older cezar', () => {
     // The container may hold its own login; overwriting it with nothing, or
     // restarting it in a loop, would be worse than leaving it alone.
     calls.length = 0;
-    await syncClaudeCredential('cez-new', 'podman', podman(false), join(tmpdir(), 'cez-absent-credential'));
+    await syncClaudeCredential('cez-new', 'podman', podman(false), []);
     expect(calls).toEqual([]);
+  });
+});
+
+describe('the Claude login a container gets', () => {
+  const login = (accessToken: string, expiresAt: number, extra: object = {}) =>
+    JSON.stringify({ claudeAiOauth: { accessToken, refreshToken: `rt-${accessToken}`, expiresAt, refreshTokenExpiresAt: 1, scopes: ['user:inference'] }, ...extra });
+
+  it('never carries a refresh token — a container refreshing would spend the host’s', () => {
+    const out = containerClaudeLogin([login('at-1', 2_000, { mcpOAuth: { s: { accessToken: 'm', refreshToken: 'mr' } } })]);
+    expect(out?.json).not.toMatch(/refreshToken|rt-at-1|"mr"/);
+    expect(JSON.parse(out!.json)).toEqual({
+      claudeAiOauth: { accessToken: 'at-1', expiresAt: 2_000, scopes: ['user:inference'] },
+      mcpOAuth: { s: { accessToken: 'm' } },
+    });
+    expect(out?.expiresAt).toBe(2_000);
+  });
+
+  it('takes the freshest of the host’s logins, and skips a logged-out one', () => {
+    // A logged-out Keychain item keeps its shape with every token emptied.
+    const loggedOut = JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: 0 } });
+    expect(containerClaudeLogin([login('old', 1_000), loggedOut, login('new', 5_000), 'not json'])?.expiresAt).toBe(5_000);
+    expect(containerClaudeLogin([loggedOut])).toBeUndefined();
+  });
+
+  it('copies the stripped login, and says when it expires', async () => {
+    const copied: string[] = [];
+    const ask = async (args: string[]) => {
+      if (args[0] === 'cp') copied.push(readFileSync(args[1]!, 'utf8'));
+      return '';
+    };
+    expect(await syncClaudeCredential('cez-x', 'podman', ask, [login('at-2', 9_000)])).toEqual({ expiresAt: 9_000 });
+    expect(copied).toHaveLength(1);
+    expect(copied[0]).not.toContain('refreshToken');
   });
 });
 

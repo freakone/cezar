@@ -147,6 +147,12 @@ Every entry is the credential **alone**, never a home directory — the same rul
 `~/.claude/.credentials.json` rather than all of `~/.claude`, so the agent has a working login and
 none of the operator's conversations.
 
+Claude's own login is the exception to "copy": it is copied **without its refresh token**
+(2026-10-13). OAuth refresh tokens are single-use, so a container that refreshed its copy left the
+host holding a spent one, and the host's next refresh logged the operator out of Claude everywhere.
+The host refreshes; each turn re-copies the freshest host login (the file, or on macOS the Keychain
+item a background cockpit uses), and the task log says when the copied token is spent or about to be.
+
 ### Honesty over convenience
 
 Three decisions where the boring option would have been misleading:

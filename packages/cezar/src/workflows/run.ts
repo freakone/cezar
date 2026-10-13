@@ -1103,6 +1103,23 @@ interface PreparedUserMessage {
   imageLibraryWrites: Array<() => void>;
 }
 
+/**
+ * A container gets the host's Claude access token but never its refresh token (see
+ * `containerClaudeLogin`), so a token that is already spent, or will be within the turn, is worth
+ * a line: the fix is any Claude use on the host, which refreshes it for the next turn.
+ */
+export function claudeLoginNote(expiresAt: number | undefined, now: number): string | undefined {
+  if (expiresAt === undefined) return undefined;
+  const minutes = Math.round((expiresAt - now) / 60_000);
+  if (minutes > CLAUDE_LOGIN_WARN_MINUTES) return undefined;
+  const when = minutes <= 0 ? 'has expired' : `expires in ${minutes} min`;
+  return `⚠ the Claude login passed to this container ${when}. Containers cannot refresh it themselves `
+    + '(that would log the host out), so it stops working until Claude runs on this machine again and '
+    + 'renews it — the next turn then picks up the fresh one.';
+}
+
+const CLAUDE_LOGIN_WARN_MINUTES = 20;
+
 /** Where an isolated agent's follow-ups land — must match `podmanExec`'s CEZ_TODOS_FILE. */
 function isolatedTodosFile(dataDir: string, runId: string): string {
   return join(agentTmpDir(dataDir, runId), ISOLATED_TODOS_FILE);
@@ -3168,6 +3185,8 @@ export class RunManager {
           message: `podman's VM "${container.startedMachine}" was stopped — cezar started it, and this task runs isolated as asked`,
         });
       }
+      const loginNote = claudeLoginNote(container.claudeLoginExpiresAt, Date.now());
+      if (loginNote) this.store.appendEvent(runId, { type: 'note', stepId, message: loginNote });
       this.store.updateRun(runId, { isolation: { effective: true, container: container.name } });
       return { sandbox: placed, container };
     } catch (err) {
