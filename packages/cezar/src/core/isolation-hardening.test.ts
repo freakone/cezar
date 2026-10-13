@@ -10,7 +10,7 @@ import { acceptSuggestions } from './containerfile-store.ts';
 import { renderContainerfile } from './containerfile-suggest.ts';
 import { parseMachines } from './container-probe.ts';
 import { isGuestPath, isVolumeName, refusedHostPath } from './credential-passthrough.ts';
-import { podmanExec, repoMounts, type RepoFs } from './podman-launcher.ts';
+import { containerGitConfig, podmanExec, repoMounts, type RepoFs } from './podman-launcher.ts';
 import { isUnderMount } from './podman-lifecycle.ts';
 import { secretFragments } from './secret-redaction.ts';
 
@@ -52,42 +52,54 @@ describe('the repo as an isolated task sees it', () => {
   const R = '/Users/k/app';
   const wt = `${R}/.ai/cezar/worktrees/run1`;
 
-  it('worktree task: the checkout is read-only; only its own worktree and git’s object stores are writable', () => {
+  it('worktree task: the checkout is read-only; `.git` is writable except what git executes from', () => {
     const fs = fakeFs(
-      [R, `${R}/.git`, `${R}/.git/objects`, `${R}/.git/refs`, `${R}/.git/logs`, `${R}/.git/hooks`,
+      [R, `${R}/.git`, `${R}/.git/hooks`, `${R}/.git/info`, `${R}/.git/modules`, `${R}/.git/worktrees`,
         `${R}/.git/worktrees/run1`, wt, `${R}/.ai/cezar`, `${R}/.ai/cezar/tmp/run1`, `${R}/.ai/cezar/runs`],
-      [`${wt}/.git`, `${R}/.git/worktrees/run1/commondir`, `${R}/.git/worktrees/run1/gitdir`, `${R}/.git/config`],
+      [`${wt}/.git`, `${R}/.git/worktrees/run1/commondir`, `${R}/.git/worktrees/run1/gitdir`, `${R}/.git/config`,
+        `${R}/.git/HEAD`, `${R}/.git/index`],
     );
-    const table = mountTable(repoMounts(R, 'run1', fs));
-    expect(table).toEqual({
+    const args = repoMounts(R, 'run1', fs);
+    expect(mountTable(args)).toEqual({
       [R]: 'ro',
-      [wt]: 'rw',
-      [`${wt}/.git`]: 'ro',
-      [`${R}/.git/objects`]: 'rw',
-      [`${R}/.git/refs`]: 'rw',
-      [`${R}/.git/logs`]: 'rw',
+      // Writable: git takes `packed-refs.lock` here for every ref deletion (reset, cherry-pick…).
+      [`${R}/.git`]: 'rw',
+      // Host code execution on the operator's next `git` command, outside any container.
+      [`${R}/.git/config`]: 'ro',
+      [`${R}/.git/hooks`]: 'ro',
+      [`${R}/.git/info`]: 'ro',
+      [`${R}/.git/modules`]: 'ro',
+      // Other tasks' git dirs, and the operator's own checkout's HEAD and index.
+      [`${R}/.git/worktrees`]: 'ro',
+      [`${R}/.git/HEAD`]: 'ro',
+      [`${R}/.git/index`]: 'ro',
       [`${R}/.git/worktrees/run1`]: 'rw',
       [`${R}/.git/worktrees/run1/commondir`]: 'ro',
       [`${R}/.git/worktrees/run1/gitdir`]: 'ro',
+      [wt]: 'rw',
+      [`${wt}/.git`]: 'ro',
       [`${R}/.ai/cezar/tmp/run1`]: 'rw',
       [`${R}/.ai/cezar/runs`]: 'rw',
     });
-    // The two that turned a container into host code execution: hooks and config run on the
-    // operator's next `git` command, outside any container.
-    expect(table[`${R}/.git/hooks`]).toBeUndefined();
-    expect(table[`${R}/.git/config`]).toBeUndefined();
+    // A nested mount needs its parent first: the task's own git dir sits inside the ro `worktrees`.
+    const order = args.filter((_, i) => args[i - 1] === '-v').map((a) => a.split(':')[0]);
+    expect(order.indexOf(`${R}/.git/worktrees`)).toBeLessThan(order.indexOf(`${R}/.git/worktrees/run1`));
+    expect(order.indexOf(`${R}/.git`)).toBeLessThan(order.indexOf(`${R}/.git/config`));
   });
 
   it('in-place task: the checkout is writable, but git’s config, hooks and cezar’s own data are not', () => {
     const fs = fakeFs(
-      [R, `${R}/.git`, `${R}/.git/hooks`, `${R}/.git/info`, `${R}/.ai/cezar`, `${R}/.ai/cezar/runs`],
-      [`${R}/.git/config`],
+      [R, `${R}/.git`, `${R}/.git/hooks`, `${R}/.git/info`, `${R}/.git/modules`, `${R}/.git/worktrees`,
+        `${R}/.ai/cezar`, `${R}/.ai/cezar/runs`],
+      [`${R}/.git/config`, `${R}/.git/HEAD`],
     );
     expect(mountTable(repoMounts(R, 'run1', fs))).toEqual({
       [R]: 'rw',
       [`${R}/.git/config`]: 'ro',
       [`${R}/.git/hooks`]: 'ro',
       [`${R}/.git/info`]: 'ro',
+      [`${R}/.git/modules`]: 'ro',
+      [`${R}/.git/worktrees`]: 'ro',
       [`${R}/.ai/cezar`]: 'ro',
       [`${R}/.ai/cezar/runs`]: 'rw',
     });
@@ -108,6 +120,18 @@ describe('podman exec environment', () => {
     expect(on.env.CEZ_TODOS_FILE).toBe('/r/.ai/cezar/tmp/run1/todos.json');
     const off = podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: { CEZ_TODOS_FILE: '', TMPDIR: '/r/.ai/cezar/tmp/run1' } }, '/tmp/p');
     expect(off.env.CEZ_TODOS_FILE).toBe('');
+  });
+});
+
+describe('git settings inside a container', () => {
+  it('turns off what would write the read-only .git/config, after any settings already in the env', () => {
+    expect(containerGitConfig({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'commit.gpgsign', GIT_CONFIG_VALUE_0: 'false' })).toEqual({
+      GIT_CONFIG_COUNT: '3',
+      GIT_CONFIG_KEY_1: 'branch.autoSetupMerge',
+      GIT_CONFIG_VALUE_1: 'false',
+      GIT_CONFIG_KEY_2: 'push.default',
+      GIT_CONFIG_VALUE_2: 'current',
+    });
   });
 });
 

@@ -6,7 +6,7 @@ import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, 
 import { basename, dirname, join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { promisify } from 'node:util';
-import { BASE_IMAGE_TAG, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
+import { BASE_IMAGE_TAG, GIT_EXEC_PATHS, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import { agentHomesFor, agentKimiHome, kimiHome } from './kimi-home.ts';
 import type { SandboxConfig } from '../config.ts';
 import { parseMachines } from './container-probe.ts';
@@ -321,6 +321,18 @@ function prepareHostDirs(repoRoot: string, runId: string, homes: { claude: strin
     }
   }
   migrateLegacyClaudeSessions(repoRoot, homes.claude);
+  // `.git` is writable in the container except these, overlaid read-only — which only works for
+  // a path that exists. An absent `hooks` would otherwise be the agent's to create.
+  if (existsSync(join(repoRoot, '.git', 'config'))) {
+    for (const name of [...GIT_EXEC_PATHS, 'worktrees']) {
+      if (name === 'config') continue;
+      try {
+        mkdirSync(join(repoRoot, '.git', name), { recursive: true });
+      } catch {
+        // unwritable .git: the overlay is skipped and the mount table says so
+      }
+    }
+  }
   // `extensions.worktreeConfig` makes git read the worktree's own `config.worktree`, which lives in
   // the git dir the task must write. It is mounted read-only (`repoMounts`) — which needs it to
   // exist first.

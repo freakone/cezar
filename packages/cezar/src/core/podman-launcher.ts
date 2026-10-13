@@ -204,6 +204,13 @@ export function podmanRunArgs(
   return args;
 }
 
+/**
+ * Where git finds code to run: `config` (fsmonitor, sshCommand, filters, aliases…), `hooks`,
+ * `info` and the submodules' own git dirs. `prepareHostDirs` creates the missing ones so an agent
+ * cannot create them under a writable `.git`.
+ */
+export const GIT_EXEC_PATHS = ['config', 'hooks', 'info', 'modules'] as const;
+
 export interface RepoFs {
   exists: (path: string) => boolean;
   isDir: (path: string) => boolean;
@@ -251,16 +258,20 @@ export function repoMounts(repoRoot: string, runId: string | undefined, fs: Repo
   const data = join(repoRoot, '.ai', 'cezar');
   const worktree = runId ? join(data, 'worktrees', runId) : undefined;
   const hasGitDir = fs.isDir(gitDir);
+  // What host git EXECUTES from, or what aims the operator's own checkout: read-only in both
+  // modes. The rest of `.git` stays writable — git takes `packed-refs.lock` at its top level for
+  // every ref deletion (even CHERRY_PICK_HEAD), so a read-only `.git` broke reset/cherry-pick.
+  const guarded = (names: readonly string[]): void => {
+    for (const name of names) {
+      const path = join(gitDir, name);
+      if (fs.exists(path)) bind(path, true);
+    }
+  };
   if (worktree && fs.isDir(worktree)) {
     bind(repoRoot, true);
-    bind(worktree);
-    const pointer = join(worktree, '.git');
-    if (fs.exists(pointer) && !fs.isDir(pointer)) bind(pointer, true);
     if (hasGitDir) {
-      for (const store of ['objects', 'refs', 'logs']) {
-        const path = join(gitDir, store);
-        if (fs.isDir(path)) bind(path);
-      }
+      bind(gitDir);
+      guarded([...GIT_EXEC_PATHS, 'worktrees', 'HEAD', 'index']);
       const ownGitDir = join(gitDir, 'worktrees', runId!);
       if (fs.isDir(ownGitDir)) {
         bind(ownGitDir);
@@ -270,14 +281,12 @@ export function repoMounts(repoRoot: string, runId: string | undefined, fs: Repo
         }
       }
     }
+    bind(worktree);
+    const pointer = join(worktree, '.git');
+    if (fs.exists(pointer) && !fs.isDir(pointer)) bind(pointer, true);
   } else {
     bind(repoRoot);
-    if (hasGitDir) {
-      for (const name of ['config', 'hooks', 'info']) {
-        const path = join(gitDir, name);
-        if (fs.exists(path)) bind(path, true);
-      }
-    }
+    if (hasGitDir) guarded([...GIT_EXEC_PATHS, 'worktrees']);
     if (fs.isDir(data)) bind(data, true);
   }
   // cezar's own state a task writes, in either mode.
@@ -340,6 +349,7 @@ export function podmanExec(
   // writable scratch dir (the HOST path, mounted at the same path) and the engine moves them into
   // the inbox at turn end. An empty CEZ_TODOS_FILE is "follow-ups off" and stays empty.
   if (env.CEZ_TODOS_FILE && opts.env?.TMPDIR) env.CEZ_TODOS_FILE = join(opts.env.TMPDIR, ISOLATED_TODOS_FILE);
+  Object.assign(env, containerGitConfig(env));
   return {
     args: [
       'exec',
@@ -360,6 +370,23 @@ export function podmanExec(
     ],
     env,
   };
+}
+
+/**
+ * `.git/config` is read-only in a task container, so git settings that would WRITE it are turned
+ * off: `switch -c x origin/main` recording an upstream, and a plain `git push` needing one
+ * (`push.default=current` pushes the branch to its own name instead). Appended to any
+ * `GIT_CONFIG_COUNT` the env already carries.
+ */
+export function containerGitConfig(env: Record<string, string>): Record<string, string> {
+  const settings: Array<[string, string]> = [['branch.autoSetupMerge', 'false'], ['push.default', 'current']];
+  const start = Number.parseInt(env.GIT_CONFIG_COUNT ?? '0', 10) || 0;
+  const out: Record<string, string> = { GIT_CONFIG_COUNT: String(start + settings.length) };
+  settings.forEach(([key, value], i) => {
+    out[`GIT_CONFIG_KEY_${start + i}`] = key;
+    out[`GIT_CONFIG_VALUE_${start + i}`] = value;
+  });
+  return out;
 }
 
 /** The argv half of `podmanExec` — names only, never values. */
