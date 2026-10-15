@@ -8,7 +8,15 @@ import { homedir, tmpdir, userInfo } from 'node:os';
 import { promisify } from 'node:util';
 import { BASE_IMAGE_TAG, GIT_EXEC_PATHS, hostClaudeCredential, imageTag, podmanBuildArgs, podmanRunArgs } from './podman-launcher.ts';
 import { agentHomesFor, agentKimiHome, kimiHome } from './kimi-home.ts';
-import { CONTAINER_AGENTS, containerAgent, isImageExtra, syncContainerAgentLogin, withoutRefreshTokens } from './container-agents.ts';
+import {
+  CONTAINER_AGENTS,
+  containerAgent,
+  containerClaudeLoginDir,
+  containerClaudeLoginReady,
+  isImageExtra,
+  syncContainerAgentLogin,
+  withoutRefreshTokens,
+} from './container-agents.ts';
 import type { SandboxConfig } from '../config.ts';
 import { parseMachines } from './container-probe.ts';
 import {
@@ -373,7 +381,10 @@ async function syncAgentLogins(
   let login: { expiresAt?: number; missingLogin?: string } | undefined;
   if (opts.backend === undefined || opts.backend === 'claude' || opts.backend === 'claude-cli') {
     const configDir = opts.accountEnv?.CLAUDE_CONFIG_DIR?.trim() || undefined;
-    login = await syncClaudeCredential(name, bin, undefined, hostClaudeLogins(configDir));
+    // The container-only login refreshes itself (see `podmanExec`); a copy is only the fallback.
+    if (configDir || !containerClaudeLoginReady()) {
+      login = await syncClaudeCredential(name, bin, undefined, hostClaudeLogins(configDir));
+    }
   }
   if (opts.backend === 'kimi') {
     syncKimiConfig(join(kimiHome({ ...process.env, ...opts.accountEnv }), 'config.toml'), homes.kimi);
@@ -394,6 +405,11 @@ async function syncAgentLogins(
 function prepareHostDirs(repoRoot: string, runId: string, homes: { claude: string; kimi: string }): void {
   const data = join(repoRoot, '.ai', 'cezar');
   const runnerHomes = Object.values(CONTAINER_AGENTS).map((agent) => join(dirname(homes.claude), agent.id));
+  try {
+    mkdirSync(containerClaudeLoginDir(), { recursive: true, mode: 0o700 });
+  } catch {
+    // the mount is skipped when its source is missing
+  }
   for (const dir of [homes.claude, homes.kimi, ...runnerHomes, join(data, 'tmp', runId), join(data, 'runs')]) {
     try {
       mkdirSync(dir, { recursive: true });

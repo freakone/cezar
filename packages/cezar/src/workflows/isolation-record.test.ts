@@ -216,6 +216,47 @@ describe('secrets are fetched only where they can be delivered', () => {
   });
 });
 
+describe('a login the container keeps for itself', () => {
+  const savedHome = process.env.CEZ_HOME;
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.CEZ_HOME;
+    else process.env.CEZ_HOME = savedHome;
+  });
+
+  /** A copied Claude login about to expire, and a fresh CEZ_HOME holding only what the case stores. */
+  async function expiringTurn(store?: { name: string; value: string }) {
+    process.env.CEZ_HOME = mkdtempSync(join(tmpdir(), 'cez-container-secrets-'));
+    roots.push(process.env.CEZ_HOME);
+    if (store) {
+      const { SecretStore } = await import('../workspace/secrets.ts');
+      await new SecretStore(process.env, { keychain: async () => null }).set({ kind: 'workspace' }, store.name, store.value, ['containers']);
+    }
+    lifecycle.start.mockImplementation(async (_cfg: SandboxConfig, _root: string, runId: string) => ({
+      name: `cez-${runId.slice(0, 8)}`,
+      claudeLoginExpiresAt: Date.now() + 60_000,
+    }));
+    const { store: runs, seam, runId } = harness();
+    const id = runId(true);
+    const turn = await seam.launcherForTurn(id, podman(), 'claude', 'step');
+    const notes = runs.readEvents(id).filter((e) => e.type === 'note').map((e) => String(e.message));
+    return { turn, notes };
+  }
+
+  it('hands a `containers` secret to the container, and a stored token silences the expiry warning', async () => {
+    const { turn, notes } = await expiringTurn({ name: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'sk-ant-oat01-test-token' });
+    expect(turn.launcher.id).toBe('podman');
+    expect((turn.launcher as unknown as { fetchedEnv: string[] }).fetchedEnv).toContain('CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test-token');
+    expect(notes.some((n) => n.includes('Claude login copied'))).toBe(false);
+  });
+
+  it('warns about a copy that is about to expire, naming both lasting fixes', async () => {
+    const { notes } = await expiringTurn();
+    const warning = notes.find((n) => n.includes('Claude login copied'));
+    expect(warning).toContain('cez container-login claude');
+    expect(warning).toContain('CLAUDE_CODE_OAUTH_TOKEN');
+  });
+});
+
 describe('the default sandbox for an unconfigured repo', () => {
   it('is the same configuration the Settings switch would write', () => {
     const sandbox = defaultSandboxFor('commetria');

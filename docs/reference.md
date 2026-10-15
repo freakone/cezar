@@ -264,8 +264,9 @@ A check step runs `bash -lc <command>` in the task's worktree with the server's
 environment plus the **secrets** it may read, which no agent step ever
 receives. A secret has a scope — the project (Settings → *Secrets*,
 `cezar secrets …`) or the whole workspace (Settings → Global → *Secrets*,
-`cezar secrets … --workspace`) — and audiences: `checks` (check steps) and/or
-`cezar` (cezar's own features). By default a check step gets every
+`cezar secrets … --workspace`) — and audiences: `checks` (check steps),
+`cezar` (cezar's own features) and/or `containers` (agents isolated in a task
+container, as environment variables — never an agent on this machine). By default a check step gets every
 `checks`-audience secret of the workspace and the project, the project's
 winning on a shared name; a step can bind exactly the ones it needs instead:
 
@@ -498,6 +499,27 @@ Useful environment variables:
 | `CEZ_REVIEW_GATE=1` | Turn ON the optional diff-first review gate (#489): a successful, non-autonomous run with changes parks at `review` (Accept / Send back / Draft PR) instead of finishing. Off by default — changed runs settle to `done` with the diff left in the worktree. Only `1` enables. The Settings → Tasks toggle overrides this; autonomous runs always skip it. |
 | `CEZ_NO_BANNER=1` | Silence every promo: the `open-mercato/skills` banner and the star-ask line on `cezar serve` startup, the sidebar's ⭐ chip, and the star-ask dialog (shown at most three times per browser, only after a task ends well once three have, and only while you are at the screen). It is also the star count's off switch — with it set, `GET /api/v1/star-count` answers `available: false` and cezar makes no request to github.com for it. Unset, the count refreshes every 10 seconds while a cockpit tab is visible, paced to GitHub's rate limit (about once a minute unauthenticated; every 10 s with `GITHUB_TOKEN`/`GH_TOKEN` set, which is then sent with the request). Dismissing the banner in the cockpit (back when it had one) still silences the terminal half on its own. |
 | `VITE_CEZ_API_BASE=http://localhost:4321` | **Build time only**, and only when the cockpit bundle is deployed apart from the service it talks to. Empty (the default) means "the origin that served this page", which is right for both normal cases: the CLI serves the bundle itself, and `npm run dev` proxies `/api` to the local service. A deployment that must be configured without a rebuild can put `<meta name="cez-api-base" content="…">` in the served HTML instead, which wins over this. |
+
+### Signing in inside an isolated task's container
+
+An isolated Claude task needs a login inside its container, and cezar never
+hands a container your Mac's own refresh token: refresh tokens are single-use,
+so two copies of one login log each other out. In order of preference:
+
+1. **A container-only login** — run `cez container-login claude` once (open the
+   printed link, paste the code). It is a separate login, kept in
+   `~/.cezar/container-logins/claude` and mounted into every task container;
+   containers refresh it themselves. `cez container-login claude status` says
+   whether it is set up.
+2. **A long-lived token** — run `claude setup-token` and store the token as
+   `CLAUDE_CODE_OAUTH_TOKEN` in Settings → Secrets with the *Isolated agents*
+   audience. It never needs refreshing. If both are set up, the token wins.
+3. **Neither** — each turn gets a copy of this machine's login with its refresh
+   token blanked. A copy cannot refresh, so a turn that outlives it fails with
+   "OAuth access token has expired"; the task log warns when one is close.
+
+The same *Isolated agents* audience carries any other runner's static key into
+containers (`CURSOR_API_KEY`, `JUNIE_API_KEY`, `COPILOT_GITHUB_TOKEN`).
 
 ### Troubleshooting: the agent's shell returns nothing
 

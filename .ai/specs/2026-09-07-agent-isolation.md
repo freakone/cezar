@@ -151,6 +151,17 @@ removed; Cursor, Junie and Copilot use a static key from the environment (`CURSO
 `JUNIE_API_KEY`, `COPILOT_GITHUB_TOKEN`), and the task log names it when it is missing
 (`core/container-agents.ts`).
 
+A copied access token cannot refresh, and Claude Code refreshes only within five minutes of
+expiry, so the host cannot renew a copy early: a turn that outlives the copy fails with "OAuth access
+token has expired" (2026-10-15). Two lasting logins replace the copy when present:
+`CLAUDE_CODE_OAUTH_TOKEN` stored in the secret store's `containers` audience (`claude setup-token`,
+never refreshes; wins), or the **container-only login** — a separate `claude auth login`
+(`cez container-login claude`) kept in `~/.cezar/container-logins/claude`, mounted as a directory and
+named by `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Claude stores its login and takes its refresh lock in
+that directory, so containers refresh it themselves and take turns; being its own grant, it never
+spends the host's refresh token. A selected agent account keeps the copy, so the right account bills.
+An isolated turn's auth failure no longer marks the host's provider disconnected.
+
 Claude's own login is the exception to "copy": it is copied **without its refresh token**
 (2026-10-13). OAuth refresh tokens are single-use, so a container that refreshed its copy left the
 host holding a spent one, and the host's next refresh logged the operator out of Claude everywhere.

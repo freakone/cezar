@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { CONTAINER_AGENTS } from './container-agents.ts';
+import { CONTAINER_AGENTS, GUEST_CLAUDE_LOGIN_DIR, containerClaudeLoginDir, containerClaudeLoginReady } from './container-agents.ts';
 import type { LaunchOpts, ProcessLauncher } from './process-launcher.ts';
 import { containerEnvPairs, guestKillScript, guestScript } from './container-runtime.ts';
 import type { SandboxConfig } from '../config.ts';
@@ -159,6 +159,10 @@ export function podmanRunArgs(
     ...(opts.homes
       ? Object.values(CONTAINER_AGENTS).flatMap((agent) => ['-v', `${join(dirname(homes.claude), agent.id)}:${agent.guestHome}`])
       : []),
+    // The container-only Claude login (`containerClaudeLoginDir`), as a directory so Claude's
+    // write-then-rename of a refreshed token lands on the host. Always mounted — empty until
+    // `cez container-login claude` — so setting it up is not a mount change.
+    ...(opts.homes ? ['-v', `${containerClaudeLoginDir()}:${GUEST_CLAUDE_LOGIN_DIR}`] : []),
   ];
   // Kimi's login, mounted at directory granularity (see `hostKimiLogin`): only for a task that
   // runs Kimi, and the SELECTED account's — an agent profile's KIMI_CODE_HOME, not the default's.
@@ -354,6 +358,9 @@ export function podmanExec(
   // writable scratch dir (the HOST path, mounted at the same path) and the engine moves them into
   // the inbox at turn end. An empty CEZ_TODOS_FILE is "follow-ups off" and stays empty.
   if (env.CEZ_TODOS_FILE && opts.env?.TMPDIR) env.CEZ_TODOS_FILE = join(opts.env.TMPDIR, ISOLATED_TODOS_FILE);
+  // Claude signs in from the container-only login when there is one — unless an agent account is
+  // selected, whose own login is the one to bill (`syncAgentLogins` copies that one in).
+  if (!opts.env?.CLAUDE_CONFIG_DIR && containerClaudeLoginReady()) env.CLAUDE_SECURESTORAGE_CONFIG_DIR = GUEST_CLAUDE_LOGIN_DIR;
   Object.assign(env, containerGitConfig(env));
   return {
     args: [

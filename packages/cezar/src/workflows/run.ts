@@ -1114,9 +1114,10 @@ export function claudeLoginNote(expiresAt: number | undefined, now: number): str
   const minutes = Math.round((expiresAt - now) / 60_000);
   if (minutes > CLAUDE_LOGIN_WARN_MINUTES) return undefined;
   const when = minutes <= 0 ? 'has expired' : `expires in ${minutes} min`;
-  return `⚠ the Claude login passed to this container ${when}. Containers cannot refresh it themselves `
-    + '(that would log the host out), so it stops working until Claude runs on this machine again and '
-    + 'renews it — the next turn then picks up the fresh one.';
+  return `⚠ the Claude login copied into this container ${when}, and a copy cannot refresh itself — a turn `
+    + 'that outlives it fails with "OAuth access token has expired". For a login containers keep fresh '
+    + 'themselves, run `cez container-login claude` once; or store a `claude setup-token` token as '
+    + 'CLAUDE_CODE_OAUTH_TOKEN in Settings → Secrets for isolated agents.';
 }
 
 const CLAUDE_LOGIN_WARN_MINUTES = 20;
@@ -3188,8 +3189,6 @@ export class RunManager {
           message: `podman's VM "${container.startedMachine}" was stopped — cezar started it, and this task runs isolated as asked`,
         });
       }
-      const loginNote = claudeLoginNote(container.claudeLoginExpiresAt, Date.now());
-      if (loginNote) this.store.appendEvent(runId, { type: 'note', stepId, message: loginNote });
       if (container.addedAgent) {
         this.store.appendEvent(runId, {
           type: 'note',
@@ -3198,8 +3197,6 @@ export class RunManager {
             + 'conversations are intact; anything that lived only inside the old container is gone.',
         });
       }
-      const missing = containerAgent(container.missingLogin);
-      if (missing) this.store.appendEvent(runId, { type: 'note', stepId, message: missingLoginNote(missing) });
       this.store.updateRun(runId, { isolation: { effective: true, container: container.name } });
       return { sandbox: placed, container };
     } catch (err) {
@@ -3256,6 +3253,16 @@ export class RunManager {
       const secrets = await this.fetchSecrets(runId, placement.sandbox, stepId);
       if (secrets.fatal) return { launcher: localLauncher, fatal: secrets.fatal };
       env = secrets.env;
+      // Login notes wait for the secrets: a stored token is a login the container has.
+      const handed = new Set(env.map((pair) => pair.slice(0, pair.indexOf('='))));
+      const loginNote = handed.has('CLAUDE_CODE_OAUTH_TOKEN')
+        ? undefined
+        : claudeLoginNote(placement.container.claudeLoginExpiresAt, Date.now());
+      if (loginNote) this.store.appendEvent(runId, { type: 'note', stepId, message: loginNote });
+      const missing = containerAgent(placement.container.missingLogin);
+      if (missing && !missing.envKeys.some((key) => handed.has(key))) {
+        this.store.appendEvent(runId, { type: 'note', stepId, message: missingLoginNote(missing) });
+      }
     }
     return { launcher: createLauncher(placement.sandbox, placement.container, env), fatal: null };
   }
@@ -3278,6 +3285,7 @@ export class RunManager {
     stepId: string,
   ): Promise<{ env: string[]; fatal: string | null }> {
     const resolved = resolvePassthrough(sandbox?.credentials);
+    const stored = await this.containerSecretPairs(runId, stepId);
     const github = await this.githubTokenEnv(runId, resolved);
     // A custom entry with no `valueFrom` forwards a HOST variable by name. The host-env sweep
     // scrubs only names that look secret and values of 12+ characters; the operator named these
@@ -3285,7 +3293,7 @@ export class RunManager {
     this.registerChosenSecrets(runId, resolved
       .filter((c) => !c.valueFrom && !c.skipped)
       .flatMap((c) => c.env.map((name) => process.env[name] ?? '')));
-    if (!resolved.some((c) => c.valueFrom)) return { env: github, fatal: null };
+    if (!resolved.some((c) => c.valueFrom)) return { env: [...stored, ...github], fatal: null };
     const read = await this.readerForVault();
     const { pairs, problems } = await resolveSecretEnv(resolved, async (reference) => {
       const ref = parseVaultRef(reference);
@@ -3306,7 +3314,7 @@ export class RunManager {
     }
     const required = problems.find((p) => p.required);
     return {
-      env: [...github, ...pairs],
+      env: [...stored, ...github, ...pairs],
       // A load-bearing secret is a step failure, not a note: without it the
       // agent gets several tool calls in and fails at something that names
       // neither the secret nor the store.
@@ -3329,6 +3337,22 @@ export class RunManager {
     registerSecretValues(values);
     this.registerChosenSecrets(runId, values);
     return pairs;
+  }
+
+  /**
+   * Secrets stored for the `containers` audience (Settings → Secrets), as `NAME=value` pairs for this
+   * turn's container — a long-lived `CLAUDE_CODE_OAUTH_TOKEN`, a `CURSOR_API_KEY`. Withheld from an
+   * untrusted fork head, like a check step's. Scrubbed from the transcript before they are handed on.
+   */
+  private async containerSecretPairs(runId: string, stepId: string): Promise<string[]> {
+    if (this.store.getRun(runId)?.untrustedHead === true) return [];
+    const resolved = await this.secrets.resolve(
+      this.projectId ? { projectId: this.projectId, root: this.repoRoot } : undefined,
+      'containers',
+    );
+    for (const note of resolved.notes) this.store.appendEvent(runId, { type: 'note', stepId, message: note });
+    this.registerChosenSecrets(runId, Object.values(resolved.values));
+    return Object.entries(resolved.values).map(([name, value]) => `${name}=${value}`);
   }
 
   /** Scrub values an operator chose as secrets from THIS run's transcript — see `secretFragments`. */

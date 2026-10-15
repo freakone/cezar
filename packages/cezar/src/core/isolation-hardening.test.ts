@@ -272,3 +272,36 @@ describe('host paths that mean nothing in a container', () => {
   });
 });
 
+describe('the container-only Claude login', () => {
+  const savedHome = process.env.CEZ_HOME;
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.CEZ_HOME;
+    else process.env.CEZ_HOME = savedHome;
+  });
+  const cfg = {
+    enabled: true, provider: 'podman', name: 'app', tmpdir: '/tmp/cez-agent',
+    containerfile: '.ai/cezar/Containerfile', claudeCredentialPassthrough: true, resources: { shmSize: '1g' },
+  } as unknown as SandboxConfig;
+
+  it('points Claude at it once it holds a login — and never for a selected agent account', async () => {
+    const { containerClaudeLoginDir, containerClaudeLoginReady, GUEST_CLAUDE_LOGIN_DIR } = await import('./container-agents.ts');
+    process.env.CEZ_HOME = temp('cez-ctr-login-');
+    expect(containerClaudeLoginReady()).toBe(false);
+    expect(podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: {} }, '/tmp/p').env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBeUndefined();
+    mkdirSync(containerClaudeLoginDir(), { recursive: true });
+    writeFileSync(join(containerClaudeLoginDir(), '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: 'r' } }));
+    // A spent access token still counts: the container refreshes it.
+    expect(containerClaudeLoginReady()).toBe(true);
+    expect(podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: {} }, '/tmp/p').env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(GUEST_CLAUDE_LOGIN_DIR);
+    expect(podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: { CLAUDE_CONFIG_DIR: '/Users/k/.claude-work' } }, '/tmp/p').env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBeUndefined();
+  });
+
+  it('is mounted as a directory, so a refreshed token written by rename lands on the host', async () => {
+    const { containerClaudeLoginDir, GUEST_CLAUDE_LOGIN_DIR } = await import('./container-agents.ts');
+    const { podmanRunArgs } = await import('./podman-launcher.ts');
+    process.env.CEZ_HOME = temp('cez-ctr-login-');
+    const args = podmanRunArgs(cfg, 'c', '/r', { credentialPassthrough: true, homes: { claude: '/h/claude', kimi: '/h/kimi' } });
+    expect(args).toContain(`${containerClaudeLoginDir()}:${GUEST_CLAUDE_LOGIN_DIR}`);
+  });
+});
+

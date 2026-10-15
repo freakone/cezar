@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { cezarHomeDir } from '../paths.ts';
 
 /**
  * What a runner other than Claude and Kimi needs inside a task container: its CLI in the image,
@@ -120,10 +121,37 @@ export function syncContainerAgentLogin(
   }
 }
 
+/**
+ * A Claude login that only containers use, kept on the host and mounted into every task container
+ * as a DIRECTORY. Claude Code stores its login wherever `CLAUDE_SECURESTORAGE_CONFIG_DIR` points —
+ * apart from its conversations — and takes its refresh LOCK in the same directory, so containers
+ * refresh it themselves, the new token persists here, and parallel containers take turns. It is its
+ * own login (`cez container-login claude`), never a copy of the operator's: two stores holding one
+ * single-use refresh token log each other out.
+ */
+export function containerClaudeLoginDir(env: NodeJS.ProcessEnv = process.env): string {
+  return join(cezarHomeDir(env), 'container-logins', 'claude');
+}
+
+/** Where that directory is mounted inside a task container. */
+export const GUEST_CLAUDE_LOGIN_DIR = '/root/.cez-claude-login';
+
+/** Does the container login hold a login? A spent access token still counts: it can refresh. */
+export function containerClaudeLoginReady(dir: string = containerClaudeLoginDir()): boolean {
+  try {
+    const oauth = (JSON.parse(readFileSync(join(dir, '.credentials.json'), 'utf8')) as {
+      claudeAiOauth?: { accessToken?: unknown; refreshToken?: unknown };
+    }).claudeAiOauth;
+    return Boolean(oauth && (oauth.refreshToken || oauth.accessToken));
+  } catch {
+    return false;
+  }
+}
+
 /** The task-log line for a turn whose runner has no login in its container. */
 export function missingLoginNote(agent: ContainerAgent): string {
   const keys = agent.envKeys.join(' or ');
   const file = agent.login ? ' and its login file on this machine was not found' : ' (its stored login is not passed into containers)';
-  return `⚠ ${agent.id} has no login inside this task's container${file} — set ${keys} in cezar's environment `
-    + 'for isolated tasks, or run the task without isolation.';
+  return `⚠ ${agent.id} has no login inside this task's container${file} — store ${keys} in Settings → Secrets `
+    + 'for isolated agents, or run the task without isolation.';
 }

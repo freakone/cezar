@@ -144,6 +144,25 @@ describe('watchProviderRuntimeAuthFailures', () => {
     ]));
   });
 
+  it('leaves the host login alone when the rejected turn ran in a container', () => {
+    const onInvalidated = watch();
+    const run = store.createRun({
+      title: 'isolated',
+      workflow: 'isolated',
+      task: 'work',
+      runner: 'claude',
+      steps: [{ id: 'implement', name: 'Implement', kind: 'agent' }],
+    });
+    store.updateRun(run.id, { isolation: { effective: true, container: 'cez-x' } });
+    store.appendEvent(run.id, {
+      type: 'error',
+      stepId: 'implement',
+      message: 'Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.',
+    });
+    expect(onInvalidated).not.toHaveBeenCalled();
+    expect(store.readEvents(run.id).some((e) => e.type === 'provider-auth-required')).toBe(false);
+  });
+
   it('falls back to the run backend when the event has no matching step', () => {
     const onInvalidated = watch();
     const run = store.createRun({

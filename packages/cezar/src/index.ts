@@ -60,6 +60,7 @@ Usage:
   cezar task <create|report|list>  dispatch or report from inside a running task (CEZ_DISPATCH=0 turns it off)
   cezar automation <add|create|check|run|list|…>  create and manage automations (GitHub polls, schedules) on a running cockpit
   cezar runs list           list a running cockpit's tasks from a shell (CEZ_API_URL=http://127.0.0.1:4321)
+  cezar container-login claude  sign in once for isolated Claude tasks; containers refresh that login themselves
   cezar init                scaffold .ai/cezar/ (example workflow + skill)
   cezar projects            list the projects this cockpit serves
                             (also: projects add [<dir>] · projects remove <id>)
@@ -137,6 +138,12 @@ async function main(): Promise<void> {
   // Opt-in telemetry's terminal switch (docs/telemetry.md): no server, no repo needed.
   if (process.argv[2] === 'telemetry') {
     process.exitCode = await runTelemetryCommand(process.argv.slice(3));
+    return;
+  }
+  // `cez container-login …`: an interactive sign-in run in a container, with its own arguments.
+  if (process.argv[2] === 'container-login') {
+    const { runContainerLoginCommand } = await import('./core/container-login.ts');
+    process.exitCode = await runContainerLoginCommand(process.argv.slice(3));
     return;
   }
   // `cez runs …` (#1080): the read-only twin for a person at a shell, same addressing.

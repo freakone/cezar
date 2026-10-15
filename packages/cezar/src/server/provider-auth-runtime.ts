@@ -35,6 +35,10 @@ export function watchProviderRuntimeAuthFailures(
       ? run.steps.find(({ id }) => id === event.stepId)
       : undefined;
     const provider: ProviderId = step?.backend ?? run.runner ?? 'claude';
+    // An isolated turn authenticates with the CONTAINER's login — a copy, a container-only login or
+    // a long-lived token, never this machine's own (Kimi's mounted login aside). Its rejection says
+    // nothing about the host, and latching it hid a working Claude from every composer (2026-10-15).
+    if (run.isolation?.effective && provider !== 'kimi') return;
     const report = providerAuth.reportRuntimeAuthFailure(provider);
     if (!report) return;
     if (report.transitioned) onProviderStatus(report.status);

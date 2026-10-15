@@ -15,7 +15,7 @@ export const HOST_ONLY_ENV: ReadonlySet<string> = new Set([
   // Host paths to an agent's home (an agent account sets them). Inside the container the agent's
   // home is the mounted one, logged in with the SELECTED account's credential; a Mac path would
   // send it looking for a login — and a place to keep its conversation — that is not there.
-  'KIMI_CODE_HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
+  'KIMI_CODE_HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR', 'CODEX_HOME',
   // The same for the other runners' homes and data dirs: each has a mounted per-project home
   // inside, and a Mac path would bypass it (OpenCode under XDG_DATA_HOME, Junie's binaries under
   // JUNIE_DATA, az under AZURE_CONFIG_DIR).
