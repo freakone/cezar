@@ -41,6 +41,8 @@ type Seam = {
     sandbox: SandboxConfig | undefined,
     backend: 'claude' | undefined,
     stepId: string,
+    accountEnv?: Record<string, string>,
+    purpose?: 'agent' | 'check',
   ): Promise<{ launcher: ProcessLauncher; fatal: string | null }>;
 };
 
@@ -247,6 +249,20 @@ describe('a login the container keeps for itself', () => {
     expect(turn.launcher.id).toBe('podman');
     expect((turn.launcher as unknown as { fetchedEnv: string[] }).fetchedEnv).toContain('CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test-token');
     expect(notes.some((n) => n.includes('Claude login copied'))).toBe(false);
+  });
+
+  it('never hands a `containers` secret to a check step — the audience names agents', async () => {
+    process.env.CEZ_HOME = mkdtempSync(join(tmpdir(), 'cez-container-secrets-'));
+    roots.push(process.env.CEZ_HOME);
+    const { SecretStore } = await import('../workspace/secrets.ts');
+    await new SecretStore(process.env, { keychain: async () => null }).set({ kind: 'workspace' }, 'CLAUDE_CODE_OAUTH_TOKEN', 'sk-ant-oat01-x', ['containers']);
+    const { store: runs, seam, runId } = harness();
+    const id = runId(true);
+    const turn = await seam.launcherForTurn(id, podman(), 'claude', 'step', undefined, 'check');
+    expect(turn.launcher.id).toBe('podman');
+    expect((turn.launcher as unknown as { fetchedEnv: string[] }).fetchedEnv.join(' ')).not.toContain('CLAUDE_CODE_OAUTH_TOKEN');
+    // And a check step leaves the step's agent-turn record alone.
+    expect(runs.getRun(id)?.steps[0]?.isolated).toBeUndefined();
   });
 
   it('warns about a copy that is about to expire, naming both lasting fixes', async () => {

@@ -105,6 +105,8 @@ const stepStateSchema = z.object({
   /** Backend that owns `sessionId`. Optional so pre-affinity runs.json files still parse;
    *  `storedRunnerSchema` so a legacy `claude-cli` folds to `claude` instead of failing (#547). */
   backend: storedRunnerSchema.optional(),
+  /** Whether this step's latest agent turn ran in the task's container (contract `isolated`). */
+  isolated: z.boolean().optional(),
   /** Agent profile (account) this step actually spawned under — `default`, or a stored profile
    *  id (spec 2026-07-29-agent-profiles). Recorded rather than re-derived because a session id
    *  only means something inside the config dir that created it: `sessionId` and `profileId` are

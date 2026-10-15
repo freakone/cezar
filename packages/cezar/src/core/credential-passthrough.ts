@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 
 /**
  * Which of the operator's credentials an isolated agent may use.
@@ -459,7 +459,7 @@ export function resolvePassthrough(
     if (refused) resolved.skipped = refused;
     else if (custom.guestPath !== undefined && !isGuestPath(custom.guestPath)) {
       resolved.skipped = `guest path ${JSON.stringify(custom.guestPath)} must be an absolute path without ':' or ','`;
-    } else if (hostPath && exists(hostPath)) resolved.hostPath = hostPath;
+    } else if (hostPath && exists(hostPath)) resolved.hostPath = resolvePath(hostPath);
     else if (hostPath) resolved.skipped = `${hostPath} does not exist on this machine`;
     out.push(resolved);
   }
@@ -540,12 +540,25 @@ export function isGuestPath(value: string): boolean {
  * withholds.
  */
 export function refusedHostPath(hostPath: string, home: string): string | undefined {
-  const normalized = hostPath.replace(/\/+$/, '') || '/';
-  if (normalized.includes(':') || normalized.includes(',')) return `${hostPath} contains ':' or ','`;
-  if (normalized === '/' || home === normalized || home.startsWith(`${normalized}/`)) {
+  if (hostPath.includes(':') || hostPath.includes(',')) return `${hostPath} contains ':' or ','`;
+  // Compared as the paths podman would mount: `.`/`..` collapsed (`/Users/k/.` IS the home) and
+  // symlinks followed (a link to the home mounts the home).
+  const target = canonicalPath(hostPath);
+  const homeDir = canonicalPath(home);
+  if (target === '/' || target === homeDir || homeDir.startsWith(`${target}/`)) {
     return `${hostPath} is not a credential — it would expose the whole home directory or more`;
   }
   return undefined;
+}
+
+/** `path` normalized, with symlinks resolved when it exists. */
+function canonicalPath(path: string): string {
+  const normalized = resolvePath(path);
+  try {
+    return realpathSync(normalized);
+  } catch {
+    return normalized;
+  }
 }
 
 export function credentialMountArgs(resolved: ResolvedCredential[]): string[] {

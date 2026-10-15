@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { cezarHomeDir } from '../paths.ts';
@@ -146,6 +146,35 @@ export function containerClaudeLoginReady(dir: string = containerClaudeLoginDir(
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether THIS turn's container gets the container-only login, decided once and used by all three
+ * places that act on it — the mount, the copy it replaces, and the variable that points Claude at
+ * it — so they cannot disagree. Only a Claude turn with logins passed through, and never an
+ * untrusted fork head: the directory holds a long-lived refresh token, where the copy it replaces
+ * holds a token blanked and hours from expiry. `use` additionally needs a login there and no
+ * selected agent account, whose own login is the one to bill. Mounted only when the directory
+ * exists: podman refuses a missing source, and that would fail every isolated task.
+ */
+export function containerLoginPlan(opts: {
+  backend?: string;
+  passLogins: boolean;
+  untrusted?: boolean;
+  accountEnv?: Record<string, string>;
+  dir?: string;
+}): { mountDir?: string; use: boolean } {
+  const claude = opts.backend === undefined || opts.backend === 'claude' || opts.backend === 'claude-cli';
+  if (!opts.passLogins || opts.untrusted || !claude) return { use: false };
+  const dir = opts.dir ?? containerClaudeLoginDir();
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch {
+    // an unwritable home: no mount, and the copy stays the login
+  }
+  if (!existsSync(dir)) return { use: false };
+  const accountSelected = Boolean(opts.accountEnv?.CLAUDE_CONFIG_DIR?.trim());
+  return { mountDir: dir, use: !accountSelected && containerClaudeLoginReady(dir) };
 }
 
 /** The task-log line for a turn whose runner has no login in its container. */

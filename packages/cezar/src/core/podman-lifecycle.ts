@@ -11,8 +11,7 @@ import { agentHomesFor, agentKimiHome, kimiHome } from './kimi-home.ts';
 import {
   CONTAINER_AGENTS,
   containerAgent,
-  containerClaudeLoginDir,
-  containerClaudeLoginReady,
+  containerLoginPlan,
   isImageExtra,
   syncContainerAgentLogin,
   withoutRefreshTokens,
@@ -265,17 +264,22 @@ export async function startTaskContainer(
     backend?: string;
     /** The selected agent account's env (`CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME`): whose login. */
     accountEnv?: Record<string, string>;
+    /** A fork head's code: no long-lived login reaches it (`containerLoginPlan`). */
+    untrusted?: boolean;
   } = {},
 ): Promise<TaskContainer> {
   const name = taskContainerName(runId);
   const startedMachine = await ensurePodmanMachine(bin);
   const homes = agentHomesFor(repoRoot);
   prepareHostDirs(repoRoot, runId, homes);
+  const passLogins = cfg.claudeCredentialPassthrough;
+  const containerLogin = containerLoginPlan({ backend: opts.backend, passLogins, untrusted: opts.untrusted, accountEnv: opts.accountEnv });
   const runOpts = {
     runId,
     homes,
     backends: opts.backend ? [opts.backend] : [],
     accountEnv: opts.accountEnv ?? {},
+    ...(containerLogin.mountDir ? { claudeLoginDir: containerLogin.mountDir } : {}),
   };
   let running = await run(bin, ['container', 'exists', name]).then(() => true).catch(() => false);
   // A mount is fixed when a container is created, so one that changed during a task — a
@@ -315,12 +319,11 @@ export async function startTaskContainer(
       addedAgent = agent.id;
     }
   }
-  const passLogins = cfg.claudeCredentialPassthrough;
   if (running) {
     // Every spawn re-copies, so a token refreshed on the host reaches the next
     // turn of a long task — the property a mount was supposed to give and
     // could not (see `podmanRunArgs`).
-    const login = await syncAgentLogins(name, bin, homes, opts, passLogins);
+    const login = await syncAgentLogins(name, bin, homes, opts, passLogins, containerLogin.use);
     // And the same for everything else that is COPIED, so a credential ticked
     // after this container started reaches the next turn of the task instead of
     // waiting for a task that does not exist yet.
@@ -332,6 +335,7 @@ export async function startTaskContainer(
       ...(startedMachine ? { startedMachine } : {}),
       ...(login?.expiresAt !== undefined ? { claudeLoginExpiresAt: login.expiresAt } : {}),
       ...(login?.missingLogin ? { missingLogin: login.missingLogin } : {}),
+      ...(containerLogin.use ? { claudeContainerLogin: true } : {}),
     };
   }
   // Allocated BEFORE the container exists, because publishing is a
@@ -355,7 +359,7 @@ export async function startTaskContainer(
   // target. Failing to place one is not fatal to the run: the agent will report
   // the tool being logged out, which is a far clearer symptom than a container
   // that refused to start.
-  const login = await syncAgentLogins(name, bin, homes, opts, passLogins);
+  const login = await syncAgentLogins(name, bin, homes, opts, passLogins, containerLogin.use);
   await applyCredentials(name, credentials, bin);
   return {
     name,
@@ -366,6 +370,7 @@ export async function startTaskContainer(
     ...(addedAgent ? { addedAgent } : {}),
     ...(login?.expiresAt !== undefined ? { claudeLoginExpiresAt: login.expiresAt } : {}),
     ...(login?.missingLogin ? { missingLogin: login.missingLogin } : {}),
+    ...(containerLogin.use ? { claudeContainerLogin: true } : {}),
   };
 }
 
@@ -376,13 +381,14 @@ async function syncAgentLogins(
   homes: { claude: string; kimi: string },
   opts: { backend?: string; accountEnv?: Record<string, string> },
   passLogins: boolean,
+  useContainerLogin: boolean,
 ): Promise<{ expiresAt?: number; missingLogin?: string } | undefined> {
   if (!passLogins) return undefined;
   let login: { expiresAt?: number; missingLogin?: string } | undefined;
   if (opts.backend === undefined || opts.backend === 'claude' || opts.backend === 'claude-cli') {
     const configDir = opts.accountEnv?.CLAUDE_CONFIG_DIR?.trim() || undefined;
-    // The container-only login refreshes itself (see `podmanExec`); a copy is only the fallback.
-    if (configDir || !containerClaudeLoginReady()) {
+    // The container-only login refreshes itself (`containerLoginPlan`); a copy is only the fallback.
+    if (!useContainerLogin) {
       login = await syncClaudeCredential(name, bin, undefined, hostClaudeLogins(configDir));
     }
   }
@@ -405,11 +411,6 @@ async function syncAgentLogins(
 function prepareHostDirs(repoRoot: string, runId: string, homes: { claude: string; kimi: string }): void {
   const data = join(repoRoot, '.ai', 'cezar');
   const runnerHomes = Object.values(CONTAINER_AGENTS).map((agent) => join(dirname(homes.claude), agent.id));
-  try {
-    mkdirSync(containerClaudeLoginDir(), { recursive: true, mode: 0o700 });
-  } catch {
-    // the mount is skipped when its source is missing
-  }
   for (const dir of [homes.claude, homes.kimi, ...runnerHomes, join(data, 'tmp', runId), join(data, 'runs')]) {
     try {
       mkdirSync(dir, { recursive: true });
@@ -487,7 +488,13 @@ export function wantedMounts(
   cfg: SandboxConfig,
   repoRoot: string,
   name: string,
-  runOpts: { runId?: string; homes?: { claude: string; kimi: string }; backends?: readonly string[]; accountEnv?: Record<string, string> } = {},
+  runOpts: {
+    runId?: string;
+    homes?: { claude: string; kimi: string };
+    backends?: readonly string[];
+    accountEnv?: Record<string, string>;
+    claudeLoginDir?: string;
+  } = {},
 ): MountSpec[] {
   const args = podmanRunArgs(cfg, name, repoRoot, {
     credentialPassthrough: cfg.claudeCredentialPassthrough,
@@ -833,6 +840,8 @@ export interface TaskContainer {
   addedAgent?: string;
   /** The runner this turn runs, when no login for it could be put in the container. */
   missingLogin?: string;
+  /** Claude signs in from the mounted container-only login this turn (`containerLoginPlan`). */
+  claudeContainerLogin?: boolean;
 }
 
 /**

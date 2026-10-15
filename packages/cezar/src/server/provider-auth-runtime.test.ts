@@ -163,6 +163,21 @@ describe('watchProviderRuntimeAuthFailures', () => {
     expect(store.readEvents(run.id).some((e) => e.type === 'provider-auth-required')).toBe(false);
   });
 
+  it('latches when an isolated task\'s turn fell back to the host — that was the host\'s own login', () => {
+    const onInvalidated = watch();
+    const run = store.createRun({
+      title: 'fell back',
+      workflow: 'fell-back',
+      task: 'work',
+      runner: 'claude',
+      steps: [{ id: 'continue-2', name: 'Continue', kind: 'agent' }],
+    });
+    store.updateRun(run.id, { isolation: { effective: true, container: 'cez-x' } });
+    store.updateStep(run.id, 'continue-2', { isolated: false });
+    store.appendEvent(run.id, { type: 'error', stepId: 'continue-2', message: 'authentication failed with HTTP 401' });
+    expect(onInvalidated).toHaveBeenCalledWith(expect.objectContaining({ provider: 'claude', status: 'disconnected' }));
+  });
+
   it('falls back to the run backend when the event has no matching step', () => {
     const onInvalidated = watch();
     const run = store.createRun({

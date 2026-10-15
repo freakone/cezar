@@ -95,6 +95,9 @@ export const stepStateSchema = z.object({
   sessionId: z.string().optional(),
   /** Backend that owns `sessionId`; absent on records written before backend affinity. */
   backend: runnerSchema.optional(),
+  /** Whether this step's latest agent turn ran in the task's container. A run's `isolation` keeps
+   *  its FIRST outcome; a later turn can still fall back to the host. Absent before it existed. */
+  isolated: z.boolean().optional(),
   /** Agent account (spec 2026-07-29-agent-profiles) that owns `sessionId` — `default`, or a
    *  stored profile id. The two are a PAIR: a session id only resolves inside the config dir
    *  that created it, so resume and Continue read this rather than the project's current

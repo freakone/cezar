@@ -2141,6 +2141,11 @@ export class RunManager {
     this.active.delete(runId);
     // Session result has settled and its sink has flushed before terminal cleanup.
     this.store.clearRunSecrets(runId);
+    // Per-run state that would otherwise outlive the run: the account env carries resolved
+    // tracker credentials, and an install whose result never arrived would never be removed.
+    this.lastAccountEnv.delete(runId);
+    this.containerSecretNotes.delete(runId);
+    for (const key of this.pendingInstalls.keys()) if (key.startsWith(`${runId}\0`)) this.pendingInstalls.delete(key);
     this.memoryPausing.delete(runId);
     this.lastNamerKey.delete(runId);
     this.pendingBranchNames.delete(runId);
@@ -3172,6 +3177,7 @@ export class RunManager {
       const container = await startTaskContainer(placed, this.repoRoot, runId, 'podman', {
         ...(backend ? { backend } : {}),
         ...(accountEnv ? { accountEnv } : {}),
+        ...(this.store.getRun(runId)?.untrustedHead === true ? { untrusted: true } : {}),
       });
       if (container.remounted) {
         this.store.appendEvent(runId, {
@@ -3245,14 +3251,20 @@ export class RunManager {
     stepId: string,
     /** The step's agent-account env (`agentEnvForStep`): which login the container gets. */
     accountEnv?: Record<string, string>,
+    /** A check step's command, not an agent: no `containers`-audience secrets, no login notes. */
+    purpose: 'agent' | 'check' = 'agent',
   ): Promise<{ launcher: ProcessLauncher; fatal: string | null }> {
-    if (accountEnv) this.lastAccountEnv.set(runId, accountEnv);
+    if (accountEnv && purpose === 'agent') this.lastAccountEnv.set(runId, accountEnv);
     const placement = await this.prepareSandbox(runId, sandbox, backend, stepId, this.store.getRun(runId)?.isolated, accountEnv);
+    // Where THIS turn ran, per step: the auth-failure watcher reads it, because the run's own
+    // `isolation` keeps the first outcome even when a later turn falls back to the host.
+    if (purpose === 'agent') this.store.updateStep(runId, stepId, { isolated: placement.container !== undefined });
     let env: string[] = [];
     if (placement.container) {
-      const secrets = await this.fetchSecrets(runId, placement.sandbox, stepId);
+      const secrets = await this.fetchSecrets(runId, placement.sandbox, stepId, purpose === 'agent');
       if (secrets.fatal) return { launcher: localLauncher, fatal: secrets.fatal };
       env = secrets.env;
+      if (purpose === 'check') return { launcher: createLauncher(placement.sandbox, placement.container, env), fatal: null };
       // Login notes wait for the secrets: a stored token is a login the container has.
       const handed = new Set(env.map((pair) => pair.slice(0, pair.indexOf('='))));
       const loginNote = handed.has('CLAUDE_CODE_OAUTH_TOKEN')
@@ -3283,9 +3295,11 @@ export class RunManager {
     runId: string,
     sandbox: SandboxConfig | undefined,
     stepId: string,
+    /** Include the `containers`-audience secrets — for an agent's turn, never a check step's. */
+    forAgent = true,
   ): Promise<{ env: string[]; fatal: string | null }> {
     const resolved = resolvePassthrough(sandbox?.credentials);
-    const stored = await this.containerSecretPairs(runId, stepId);
+    const stored = forAgent ? await this.containerSecretPairs(runId, stepId) : [];
     const github = await this.githubTokenEnv(runId, resolved);
     // A custom entry with no `valueFrom` forwards a HOST variable by name. The host-env sweep
     // scrubs only names that look secret and values of 12+ characters; the operator named these
@@ -3350,7 +3364,14 @@ export class RunManager {
       this.projectId ? { projectId: this.projectId, root: this.repoRoot } : undefined,
       'containers',
     );
-    for (const note of resolved.notes) this.store.appendEvent(runId, { type: 'note', stepId, message: note });
+    // Once per run: an unreadable store reads the same way on every turn.
+    if (!this.containerSecretNotes.has(runId)) {
+      this.containerSecretNotes.add(runId);
+      for (const note of resolved.notes) this.store.appendEvent(runId, { type: 'note', stepId, message: note });
+    }
+    // Process-wide as well as per run, like the Vault and gh values beside it: text derived after
+    // the run ends (a late title, a summary) is still scrubbed by value, not by token shape alone.
+    registerSecretValues(Object.values(resolved.values));
     this.registerChosenSecrets(runId, Object.values(resolved.values));
     return Object.entries(resolved.values).map(([name, value]) => `${name}=${value}`);
   }
@@ -6273,6 +6294,8 @@ export class RunManager {
   /** The agent account env of a run's last turn, so its check steps reuse the same container
    *  mounts instead of recreating the container for a different login. */
   private readonly lastAccountEnv = new Map<string, Record<string, string>>();
+  /** Runs that already reported an unreadable secret store — see `containerSecretPairs`. */
+  private readonly containerSecretNotes = new Set<string>();
 
   /** The backend of the run's most recent agent step — the one its container is shaped for. */
   private lastTurnBackend(runId: string): AgentBackend | undefined {
@@ -7873,6 +7896,7 @@ export class RunManager {
         this.lastTurnBackend(runId),
         step.id,
         this.lastAccountEnv.get(runId),
+        'check',
       );
       if (turn.fatal) return { ok: false, output: turn.fatal, exitCode: -1 };
       if (turn.launcher.id !== 'local') launcher = turn.launcher;

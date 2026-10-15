@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { CONTAINER_AGENTS, GUEST_CLAUDE_LOGIN_DIR, containerClaudeLoginDir, containerClaudeLoginReady } from './container-agents.ts';
+import { CONTAINER_AGENTS, GUEST_CLAUDE_LOGIN_DIR } from './container-agents.ts';
 import type { LaunchOpts, ProcessLauncher } from './process-launcher.ts';
 import { containerEnvPairs, guestKillScript, guestScript } from './container-runtime.ts';
 import type { SandboxConfig } from '../config.ts';
@@ -130,6 +130,8 @@ export function podmanRunArgs(
     runId?: string;
     /** This project's agent homes on the host (`agentHomesFor`). */
     homes?: { claude: string; kimi: string };
+    /** The container-only Claude login to mount (`containerLoginPlan`), when this turn gets it. */
+    claudeLoginDir?: string;
     /**
      * The agent CLIs this task runs. An agent's own login reaches only a task that runs it — a
      * Claude task has no business holding the operator's Kimi login. Absent means "unknown", and
@@ -159,10 +161,10 @@ export function podmanRunArgs(
     ...(opts.homes
       ? Object.values(CONTAINER_AGENTS).flatMap((agent) => ['-v', `${join(dirname(homes.claude), agent.id)}:${agent.guestHome}`])
       : []),
-    // The container-only Claude login (`containerClaudeLoginDir`), as a directory so Claude's
-    // write-then-rename of a refreshed token lands on the host. Always mounted — empty until
-    // `cez container-login claude` — so setting it up is not a mount change.
-    ...(opts.homes ? ['-v', `${containerClaudeLoginDir()}:${GUEST_CLAUDE_LOGIN_DIR}`] : []),
+    // The container-only Claude login, as a directory so Claude's write-then-rename of a refreshed
+    // token lands on the host — only where `containerLoginPlan` allows it. Mounted even before
+    // `cez container-login claude` has run, so setting it up later is not a mount change.
+    ...(opts.claudeLoginDir ? ['-v', `${opts.claudeLoginDir}:${GUEST_CLAUDE_LOGIN_DIR}`] : []),
   ];
   // Kimi's login, mounted at directory granularity (see `hostKimiLogin`): only for a task that
   // runs Kimi, and the SELECTED account's — an agent profile's KIMI_CODE_HOME, not the default's.
@@ -339,6 +341,8 @@ export function podmanExec(
    * on. The container receives values, never the credential that fetched them.
    */
   fetchedEnv: readonly string[] = [],
+  /** Sign Claude in from the mounted container-only login (`containerLoginPlan().use`). */
+  containerLogin = false,
 ): { args: string[]; env: Record<string, string> } {
   const resolved = resolvePassthrough(cfg.credentials);
   const githubTicked = resolved.some((c) => c.id === 'github-cli' && !c.skipped);
@@ -358,9 +362,7 @@ export function podmanExec(
   // writable scratch dir (the HOST path, mounted at the same path) and the engine moves them into
   // the inbox at turn end. An empty CEZ_TODOS_FILE is "follow-ups off" and stays empty.
   if (env.CEZ_TODOS_FILE && opts.env?.TMPDIR) env.CEZ_TODOS_FILE = join(opts.env.TMPDIR, ISOLATED_TODOS_FILE);
-  // Claude signs in from the container-only login when there is one — unless an agent account is
-  // selected, whose own login is the one to bill (`syncAgentLogins` copies that one in).
-  if (!opts.env?.CLAUDE_CONFIG_DIR && containerClaudeLoginReady()) env.CLAUDE_SECURESTORAGE_CONFIG_DIR = GUEST_CLAUDE_LOGIN_DIR;
+  if (containerLogin) env.CLAUDE_SECURESTORAGE_CONFIG_DIR = GUEST_CLAUDE_LOGIN_DIR;
   Object.assign(env, containerGitConfig(env));
   return {
     args: [
@@ -433,6 +435,8 @@ export class PodmanLauncher implements ProcessLauncher {
     private readonly fetchedEnv: readonly string[] = [],
     /** This project's agent homes on the host — see `ProcessLauncher.agentHomes`. */
     readonly agentHomes?: { claude: string; kimi: string },
+    /** Claude signs in from the mounted container-only login this turn (`containerLoginPlan`). */
+    private readonly containerLogin = false,
   ) {}
 
   describe(): string {
@@ -441,7 +445,7 @@ export class PodmanLauncher implements ProcessLauncher {
 
   spawn(bin: string, args: string[], opts: LaunchOpts): ChildProcessWithoutNullStreams {
     const pidFile = `${this.cfg.tmpdir}/cez-${randomUUID()}.pid`;
-    const exec = podmanExec(this.cfg, this.containerName, bin, args, opts, pidFile, this.fetchedEnv);
+    const exec = podmanExec(this.cfg, this.containerName, bin, args, opts, pidFile, this.fetchedEnv, this.containerLogin);
     const child = nodeSpawn(
       this.bin,
       exec.args,

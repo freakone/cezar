@@ -164,6 +164,18 @@ describe('what a credential grant may name', () => {
     expect(refusedHostPath('/Users/k/', home)).toBeDefined();
     expect(refusedHostPath('/Users/k/.aws:/root/x', home)).toBeDefined();
     expect(refusedHostPath('/Users/k/.aws', home)).toBeUndefined();
+    // Spelled differently, the same directory: `.`, `..`, and a symlink to it.
+    expect(refusedHostPath('/Users/k/.', home)).toBeDefined();
+    expect(refusedHostPath('/Users/k/../k', home)).toBeDefined();
+    expect(refusedHostPath('/Users/k/.aws/..', home)).toBeDefined();
+  });
+
+  it('follows a symlink to the home directory', async () => {
+    const { symlinkSync } = await import('node:fs');
+    const realHome = temp('cez-home-');
+    const link = join(temp('cez-links-'), 'innocent');
+    symlinkSync(realHome, link);
+    expect(refusedHostPath(link, realHome)).toBeDefined();
   });
 
   it('takes only named volumes and absolute guest paths for cache volumes', () => {
@@ -283,25 +295,56 @@ describe('the container-only Claude login', () => {
     containerfile: '.ai/cezar/Containerfile', claudeCredentialPassthrough: true, resources: { shmSize: '1g' },
   } as unknown as SandboxConfig;
 
-  it('points Claude at it once it holds a login — and never for a selected agent account', async () => {
-    const { containerClaudeLoginDir, containerClaudeLoginReady, GUEST_CLAUDE_LOGIN_DIR } = await import('./container-agents.ts');
+  async function withLogin(): Promise<string> {
+    const { containerClaudeLoginDir } = await import('./container-agents.ts');
     process.env.CEZ_HOME = temp('cez-ctr-login-');
-    expect(containerClaudeLoginReady()).toBe(false);
-    expect(podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: {} }, '/tmp/p').env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBeUndefined();
     mkdirSync(containerClaudeLoginDir(), { recursive: true });
-    writeFileSync(join(containerClaudeLoginDir(), '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: 'r' } }));
     // A spent access token still counts: the container refreshes it.
-    expect(containerClaudeLoginReady()).toBe(true);
-    expect(podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: {} }, '/tmp/p').env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(GUEST_CLAUDE_LOGIN_DIR);
-    expect(podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: { CLAUDE_CONFIG_DIR: '/Users/k/.claude-work' } }, '/tmp/p').env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBeUndefined();
+    writeFileSync(join(containerClaudeLoginDir(), '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: 'r' } }));
+    return containerClaudeLoginDir();
+  }
+
+  it('reaches a trusted Claude turn only — never Codex, a fork head, or a turn without login passthrough', async () => {
+    const { containerLoginPlan } = await import('./container-agents.ts');
+    const dir = await withLogin();
+    expect(containerLoginPlan({ backend: 'claude', passLogins: true })).toEqual({ mountDir: dir, use: true });
+    expect(containerLoginPlan({ backend: undefined, passLogins: true })).toEqual({ mountDir: dir, use: true });
+    // Not mounted at all: a long-lived refresh token is not for these.
+    expect(containerLoginPlan({ backend: 'codex', passLogins: true })).toEqual({ use: false });
+    expect(containerLoginPlan({ backend: 'claude', passLogins: true, untrusted: true })).toEqual({ use: false });
+    expect(containerLoginPlan({ backend: 'claude', passLogins: false })).toEqual({ use: false });
+  });
+
+  it('is mounted but not used for a selected agent account, whose own login bills', async () => {
+    const { containerLoginPlan } = await import('./container-agents.ts');
+    const dir = await withLogin();
+    expect(containerLoginPlan({ backend: 'claude', passLogins: true, accountEnv: { CLAUDE_CONFIG_DIR: '/Users/k/.claude-work' } }))
+      .toEqual({ mountDir: dir, use: false });
+  });
+
+  it('is never mounted when its directory cannot exist — podman would refuse every container', async () => {
+    const { containerLoginPlan } = await import('./container-agents.ts');
+    const file = join(temp('cez-ctr-login-'), 'not-a-dir');
+    writeFileSync(file, '');
+    expect(containerLoginPlan({ backend: 'claude', passLogins: true, dir: join(file, 'claude') })).toEqual({ use: false });
+  });
+
+  it('points Claude at it only when the plan says so, whatever the host env carries', async () => {
+    const { GUEST_CLAUDE_LOGIN_DIR } = await import('./container-agents.ts');
+    await withLogin();
+    const hostEnv = { CLAUDE_CONFIG_DIR: '/Users/k/.claude' };
+    expect(podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: hostEnv }, '/tmp/p', [], true).env.CLAUDE_SECURESTORAGE_CONFIG_DIR)
+      .toBe(GUEST_CLAUDE_LOGIN_DIR);
+    expect(podmanExec(cfg, 'c', 'claude', [], { cwd: '/r', env: {} }, '/tmp/p', [], false).env.CLAUDE_SECURESTORAGE_CONFIG_DIR)
+      .toBeUndefined();
   });
 
   it('is mounted as a directory, so a refreshed token written by rename lands on the host', async () => {
-    const { containerClaudeLoginDir, GUEST_CLAUDE_LOGIN_DIR } = await import('./container-agents.ts');
+    const { GUEST_CLAUDE_LOGIN_DIR } = await import('./container-agents.ts');
     const { podmanRunArgs } = await import('./podman-launcher.ts');
-    process.env.CEZ_HOME = temp('cez-ctr-login-');
-    const args = podmanRunArgs(cfg, 'c', '/r', { credentialPassthrough: true, homes: { claude: '/h/claude', kimi: '/h/kimi' } });
-    expect(args).toContain(`${containerClaudeLoginDir()}:${GUEST_CLAUDE_LOGIN_DIR}`);
+    const dir = await withLogin();
+    const homes = { claude: '/h/claude', kimi: '/h/kimi' };
+    expect(podmanRunArgs(cfg, 'c', '/r', { credentialPassthrough: true, homes, claudeLoginDir: dir })).toContain(`${dir}:${GUEST_CLAUDE_LOGIN_DIR}`);
+    expect(podmanRunArgs(cfg, 'c', '/r', { credentialPassthrough: true, homes }).join(' ')).not.toContain(GUEST_CLAUDE_LOGIN_DIR);
   });
 });
-
