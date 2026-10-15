@@ -728,9 +728,9 @@ describe('ProviderAuthService', () => {
       { executable: 'opencode', args: ['auth', 'list'], timeoutMs: 10_000 },
       { executable: 'agent', args: ['status', '--format', 'json'], timeoutMs: 10_000 },
       { executable: 'pi', args: ['--list-models'], timeoutMs: 10_000 },
-
+      { executable: 'copilot', args: ['--acp', '--no-auto-update'], timeoutMs: 10_000 },
       // Discovered (PATH, then ~/.kimi-code/bin/kimi), so only its basename is fixed.
-      { executable: expect.stringMatching(/(^|[\\/])kimi$/), args: ['provider', 'list'], timeoutMs: 10_000 },      { executable: 'copilot', args: ['--acp', '--no-auto-update'], timeoutMs: 10_000 },
+      { executable: expect.stringMatching(/(^|[\\/])kimi$/), args: ['provider', 'list'], timeoutMs: 10_000 },
     ]);
     release();
     await expect(pending).resolves.toBeDefined();
