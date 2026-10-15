@@ -422,6 +422,7 @@ const DESCRIPTORS: readonly ProviderDescriptor[] = [
     loginArgs: ['login'],
     installHint: 'Install Kimi Code, then run `kimi login`.',
     parse: parseKimiStatus,
+    overrideEnv: 'CEZ_KIMI_BIN',
   },
 ];
 

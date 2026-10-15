@@ -80,6 +80,21 @@ describe('the config API', () => {
       JSON.stringify({ agentDefaults: { sandbox: { credentials: { enabled: { ssh: true, aws: true } } } } }),
     );
 
+    it('a hosted cockpit (CEZ_REMOTE=1) can grant a credential too — its operator has no other way in', async () => {
+      // A refusal here protected nothing: whoever reaches a hosted cockpit can already start an
+      // unisolated task that reads the same files on the host. It only locked the operator of a
+      // remote-only cockpit out of isolation with any credential.
+      const saved = process.env.CEZ_REMOTE;
+      process.env.CEZ_REMOTE = '1';
+      try {
+        expect((await put({ sandbox: { credentials: { enabled: { azure: true } } } })).status).toBe(200);
+        expect((rawFile().sandbox as { credentials: { enabled: Record<string, unknown> } }).credentials.enabled).toEqual({ azure: true });
+      } finally {
+        if (saved === undefined) delete process.env.CEZ_REMOTE;
+        else process.env.CEZ_REMOTE = saved;
+      }
+    });
+
     it('a one-credential change writes that one credential, not the inherited ones', async () => {
       machineGrants();
       expect((await put({ sandbox: { credentials: { enabled: { gcloud: true } } } })).status).toBe(200);

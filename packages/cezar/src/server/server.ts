@@ -463,15 +463,6 @@ const selectAgentProfileSchema = z.object({
   profileId: z.string().max(64).nullable(),
 }).strict();
 
-/**
- * Credential grants and Vault wiring decide what reaches an agent container from THIS machine's
- * home, so — like agent-config writes and agent accounts — they are edited only from the machine
- * that owns the checkout, never by a remote visitor to a hosted cockpit.
- */
-const hostedGrantRefusal = {
-  error: 'credential grants are managed from the machine that owns the checkout (this cockpit runs in hosted mode)',
-};
-
 /** The hosted-mode refusal, worded like the agent-config one it mirrors. */
 const hostedProfileRefusal = {
   error: 'agent accounts are managed from the machine that owns the checkout (this cockpit runs in hosted mode)',
@@ -3509,14 +3500,6 @@ export function createApp(deps: ServerDeps) {
     .put('/workspace/config', jsonZodValidator(() => setWorkspaceConfigInputSchema), async (c) => {
       const parsed = { data: c.req.valid('json') };
       const { browseRoot, projectsDir, skillsAutoUpdate, composerDefaults, resources, agentDefaults, branding } = parsed.data;
-      if (
-        !capabilities().localHandoff &&
-        (agentDefaults?.vault !== undefined ||
-          agentDefaults?.sandbox?.credentials !== undefined ||
-          agentDefaults?.sandbox?.cacheVolumes !== undefined)
-      ) {
-        return c.json(hostedGrantRefusal, 409);
-      }
       for (const [configuredRoot, create] of [
         [browseRoot, false],
         [projectsDir, true],
@@ -6930,9 +6913,9 @@ export function createApp(deps: ServerDeps) {
       // (a clone must not be able to grant itself the operator's credentials), so for one the
       // grant is written to the git-ignored `config.local.json` instead — still this project's,
       // never in its history.
-      if (parsed.data.sandbox?.credentials !== undefined && !capabilities().localHandoff) {
-        return c.json(hostedGrantRefusal, 409);
-      }
+      // Editable in hosted mode too: whoever reaches this cockpit can already start an unisolated
+      // task that reads the same files on the host, so refusing grants protected nothing and left
+      // the operator of a remote-only cockpit unable to isolate with any credential (2026-10-15).
       const grantsLocally = (await configIsTracked(repoRoot)) && parsed.data.sandbox?.credentials !== undefined;
       const localPath = join(dataDir, LOCAL_CONFIG_FILE);
       let local: Record<string, unknown> = {};

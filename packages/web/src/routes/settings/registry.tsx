@@ -123,7 +123,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   {
     id: 'secrets',
     title: 'Secrets',
-    description: 'Encrypted values for this project’s check steps and cezar — never for agents.',
+    description: 'Encrypted values for this project’s check steps, cezar and isolated agents — never an agent on this machine.',
     icon: KeyRoundIcon,
     component: ProjectSecretsSection,
     scope: 'project',
@@ -236,7 +236,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   {
     id: 'workspace-secrets',
     title: 'Secrets',
-    description: 'Encrypted values shared by every project on this machine — never for agents.',
+    description: 'Encrypted values shared by every project on this machine — never an agent running on it.',
     icon: KeyRoundIcon,
     component: WorkspaceSecretsSection,
     scope: 'global',
