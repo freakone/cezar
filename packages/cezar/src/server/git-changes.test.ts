@@ -18,6 +18,7 @@ import {
   patchByPath,
   pushCurrentBranch,
   worktreeGitStatus,
+  readImageAtRev,
   readWorktreePath,
   splitPatch,
   type ChangesPayload,
@@ -219,6 +220,21 @@ describe('collectChanges — structured diff vs base', () => {
     if (!result.ok) return;
     expect(result.changes.files[0]?.patch.length).toBeLessThan(300);
     expect(result.changes.files[0]?.patch).toContain('… (patch truncated)');
+  });
+
+  it("excludeCezarData leaves cezar's own .ai/cezar files out of an in-place task's Changes", async () => {
+    writeFileSync(join(dir, 'tracked.txt'), 'a\n');
+    g(dir, 'add', '-A');
+    g(dir, 'commit', '-m', 'base');
+    mkdirSync(join(dir, '.ai/cezar'), { recursive: true });
+    for (const name of ['.gitignore', 'config.json', 'ui-state.json']) writeFileSync(join(dir, '.ai/cezar', name), '{}\n');
+    writeFileSync(join(dir, 'summary.md'), 'notes\n');
+
+    const scoped = await collectChanges(dir, 'main', { intentToAdd: false, excludeCezarData: true });
+    expect(scoped.ok && scoped.changes.files.map((f) => f.path)).toEqual(['summary.md']);
+    // The repo-wide view still shows everything.
+    const all = await collectChanges(dir, 'main', { intentToAdd: false });
+    expect(all.ok && all.changes.files.length).toBe(4);
   });
 
   it('intentToAdd:false never stages into the index (#major-index-mutation)', async () => {
@@ -478,6 +494,43 @@ describe('imageMimeType — the raw-serving allowlist (R5 Step 1.6)', () => {
   });
 });
 
+describe('readImageAtRev — an image as committed at a sha', () => {
+  let dir: string;
+  let sha: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cez-image-rev-'));
+    initRepo(dir);
+    writeFileSync(join(dir, 'a.png'), Buffer.from([137, 80, 78, 71, 0, 1]));
+    writeFileSync(join(dir, 'big.png'), Buffer.alloc(FILE_CONTENT_CAP + 1));
+    writeFileSync(join(dir, 'a.txt'), 'text\n');
+    g(dir, 'add', '-A');
+    g(dir, 'commit', '-m', 'base');
+    sha = g(dir, 'rev-parse', 'HEAD').trim();
+    rmSync(join(dir, 'a.png'));
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('reads bytes that are no longer in the working tree', async () => {
+    const result = await readImageAtRev(dir, sha, 'a.png');
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    expect(result.mime).toBe('image/png');
+    expect([...result.bytes]).toEqual([137, 80, 78, 71, 0, 1]);
+  });
+
+  it('refuses refs, non-images, oversized blobs, traversal and absent paths', async () => {
+    expect((await readImageAtRev(dir, 'HEAD', 'a.png')).kind).toBe('refused');
+    expect((await readImageAtRev(dir, `--output=${sha}`, 'a.png')).kind).toBe('refused');
+    expect(await readImageAtRev(dir, sha, 'a.txt')).toMatchObject({ error: expect.stringContaining('limited to images') });
+    expect(await readImageAtRev(dir, sha, 'big.png')).toMatchObject({ error: expect.stringContaining('too large') });
+    expect((await readImageAtRev(dir, sha, '../a.png')).kind).toBe('refused');
+    expect((await readImageAtRev(dir, sha, './a.png')).kind).toBe('refused');
+    expect((await readImageAtRev(dir, sha, 'missing.png')).kind).toBe('refused');
+  });
+});
+
 describe('isOsOpenableImage — the OS-launcher allowlist (#365)', () => {
   it('allows raster images, matching the raw allowlist case-insensitively', () => {
     expect(isOsOpenableImage('logo.png')).toBe(true);
@@ -571,7 +624,7 @@ describe('session git API routes', () => {
     expect(res.status).toBe(200);
     // No upstream yet: "never pushed" is null, not 0.
     // The fixture's base `main` is where `task` forked from, so it is not behind (yet).
-    expect(await res.json()).toEqual({ uncommitted: 1, unpushed: null, behind: 0 });
+    expect(await res.json()).toEqual({ uncommitted: 1, unpushed: null, behind: 0, ahead: 0 });
 
     // Base moves on: two commits land on main that the task branch does not have.
     g(worktree, 'checkout', '-q', 'main');
@@ -590,6 +643,22 @@ describe('session git API routes', () => {
     const removed = store.createRun({ title: 'gone', workflow: 'quick-task', task: 'gone', steps: [] });
     store.updateRun(removed.id, { worktreePath: join(repoRoot, 'missing-wt'), branch: 'task' });
     expect((await apiRequest(app, `/api/v1/runs/${removed.id}/git/status`)).status).toBe(409);
+  });
+
+  it('GET /git/status answers for an in-place write task from the checkout, never for a read-only one', async () => {
+    mkdirSync(join(repoRoot, '.ai/cezar'), { recursive: true });
+    writeFileSync(join(repoRoot, '.ai/cezar/config.json'), '{}\n');
+    writeFileSync(join(repoRoot, 'summary.md'), 'notes\n');
+    const inPlace = store.createRun({ title: 'in place', workflow: 'quick-task', task: 'x', steps: [] });
+    store.updateRun(inPlace.id, { worktree: false });
+    const res = await apiRequest(app, `/api/v1/runs/${inPlace.id}/git/status`);
+    expect(res.status).toBe(200);
+    // cezar's own files are not the task's work; no upstream means null counts.
+    expect(await res.json()).toMatchObject({ uncommitted: 1, unpushed: null, behind: null });
+
+    const asked = store.createRun({ title: 'ask', workflow: 'quick-task', task: 'x', steps: [] });
+    store.updateRun(asked.id, { worktree: false, readOnly: true });
+    expect((await apiRequest(app, `/api/v1/runs/${asked.id}/git/status`)).status).toBe(409);
   });
 
   it('GET /changes uses the persisted task branch to detect a repointed HEAD', async () => {
@@ -747,6 +816,36 @@ describe('session git API routes', () => {
     expect(((await res.json()) as { error: string }).error).toContain('too large');
   });
 
+  it('GET /files?raw=1&rev=<baseSha> serves a deleted image from the diff base, cacheable forever', async () => {
+    writeFileSync(join(worktree, 'gone.png'), PNG);
+    g(worktree, 'add', '-A');
+    g(worktree, 'commit', '-m', 'image on task');
+    g(worktree, 'branch', '-f', 'main');
+    rmSync(join(worktree, 'gone.png'));
+
+    const changes = (await (await apiRequest(app, `/api/v1/runs/${run.id}/changes`)).json()) as ChangesPayload;
+    expect(changes.files.find((f) => f.path === 'gone.png')?.status).toBe('deleted');
+    expect(changes.baseSha).toBe(g(worktree, 'rev-parse', 'main').trim());
+
+    const res = await apiRequest(app, `/api/v1/runs/${run.id}/files?path=gone.png&raw=1&rev=${changes.baseSha}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('content-security-policy')).toContain('sandbox');
+    expect(res.headers.get('cache-control')).toContain('immutable');
+    expect(Buffer.from(await res.arrayBuffer()).equals(PNG)).toBe(true);
+  });
+
+  it('GET /files?rev= refuses refs, non-images and a non-raw request', async () => {
+    const sha = g(worktree, 'rev-parse', 'HEAD').trim();
+    const status = async (query: string) =>
+      (await apiRequest(app, `/api/v1/runs/${run.id}/files?${query}`)).status;
+    expect(await status('path=base.txt&raw=1&rev=main')).toBe(400);
+    expect(await status(`path=base.txt&raw=1&rev=${sha}`)).toBe(409);
+    expect(await status(`path=base.png&raw=0&rev=${sha}`)).toBe(409);
+    expect(await status(`path=${encodeURIComponent('../x.png')}&raw=1&rev=${sha}`)).toBe(409);
+  });
+
   it('GET /files?raw=1 still rejects traversal with a 409', async () => {
     const res = await apiRequest(app,
       `/api/v1/runs/${run.id}/files?path=${encodeURIComponent('../../etc/passwd')}&raw=1`,
@@ -864,6 +963,27 @@ describe('session git API routes', () => {
 
     expect((await commit(run.id, { message: '   ' })).status).toBe(400);
     expect((await commit(run.id, {})).status).toBe(400);
+  });
+
+  it('POST pr/adopt records the PR found by branch, leaves the status alone, and is idempotent', async () => {
+    const previous = process.env.CEZ_DRY_RUN;
+    process.env.CEZ_DRY_RUN = '1'; // the forge lookup answers the fixed demo PR, no gh
+    try {
+      const adopt = () => apiRequest(app, `/api/v1/runs/${run.id}/pr/adopt`, { method: 'POST' });
+      // No remote, no target: nothing to look up.
+      expect(await (await adopt()).json()).toEqual({ found: false });
+
+      g(worktree, 'remote', 'add', 'origin', 'git@github.com:open-mercato/cezar.git');
+      store.updateRun(run.id, { status: 'waiting' });
+      const url = 'https://github.com/open-mercato/demo/pull/777';
+      expect(await (await adopt()).json()).toEqual({ found: true, url });
+      expect(store.getRun(run.id)).toMatchObject({ pullRequestUrl: url, status: 'waiting' });
+      expect(await (await adopt()).json()).toEqual({ found: true, url });
+      expect((await apiRequest(app, '/api/v1/runs/nope/pr/adopt', { method: 'POST' })).status).toBe(404);
+    } finally {
+      if (previous === undefined) delete process.env.CEZ_DRY_RUN;
+      else process.env.CEZ_DRY_RUN = previous;
+    }
   });
 
   it('POST git/push with no remote is a 409 with a human reason', async () => {
@@ -1277,13 +1397,13 @@ describe('worktreeGitStatus — what has not left the worktree', () => {
       writeFileSync(join(dir, 'b.txt'), 'b\n');
       g(dir, 'add', '-A');
       g(dir, 'commit', '-m', 'base');
-      expect(await worktreeGitStatus(dir)).toEqual({ ok: true, uncommitted: 0, unpushed: null, behind: null });
+      expect(await worktreeGitStatus(dir)).toEqual({ ok: true, uncommitted: 0, unpushed: null, behind: null, ahead: null });
 
       writeFileSync(join(dir, 'a.txt'), 'changed\n');
       writeFileSync(join(dir, 'new.txt'), 'new\n');
       g(dir, 'mv', 'b.txt', 'c.txt');
       // modified + untracked + one rename (whose old path rides as an extra -z field)
-      expect(await worktreeGitStatus(dir)).toEqual({ ok: true, uncommitted: 3, unpushed: null, behind: null });
+      expect(await worktreeGitStatus(dir)).toEqual({ ok: true, uncommitted: 3, unpushed: null, behind: null, ahead: null });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1300,11 +1420,11 @@ describe('worktreeGitStatus — what has not left the worktree', () => {
       g(dir, 'commit', '-m', 'base');
       g(dir, 'remote', 'add', 'origin', remote);
       g(dir, 'push', '-q', '-u', 'origin', 'HEAD');
-      expect(await worktreeGitStatus(dir)).toEqual({ ok: true, uncommitted: 0, unpushed: 0, behind: null });
+      expect(await worktreeGitStatus(dir)).toEqual({ ok: true, uncommitted: 0, unpushed: 0, behind: null, ahead: null });
 
       writeFileSync(join(dir, 'a.txt'), 'b\n');
       g(dir, 'commit', '-qam', 'second');
-      expect(await worktreeGitStatus(dir)).toEqual({ ok: true, uncommitted: 0, unpushed: 1, behind: null });
+      expect(await worktreeGitStatus(dir)).toEqual({ ok: true, uncommitted: 0, unpushed: 1, behind: null, ahead: null });
     } finally {
       rmSync(remote, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });
@@ -1325,7 +1445,7 @@ describe('worktreeGitStatus — what has not left the worktree', () => {
       g(dir, 'push', '-q', 'origin', 'main');
       const fork = g(dir, 'rev-parse', 'HEAD').trim();
       g(dir, 'checkout', '-q', '-b', 'task');
-      expect((await worktreeGitStatus(dir, 'main')) as { behind: number | null }).toMatchObject({ behind: 0 });
+      expect((await worktreeGitStatus(dir, 'main')) as { behind: number | null }).toMatchObject({ behind: 0, ahead: 0 });
 
       // One commit lands on the REMOTE main (another clone pushed it) and is fetched — the local
       // main never moves, so only the remote-tracking ref knows the branch is behind.
@@ -1337,11 +1457,17 @@ describe('worktreeGitStatus — what has not left the worktree', () => {
       g(dir, 'reset', '-q', '--hard', fork);
       g(dir, 'checkout', '-q', 'task');
       expect(await worktreeGitStatus(dir, 'main')).toMatchObject({ behind: 1 });
-      expect(await worktreeGitStatus(dir, 'origin/main')).toMatchObject({ behind: 1 });
+      expect(await worktreeGitStatus(dir, 'origin/main')).toMatchObject({ behind: 1, ahead: 0 });
 
-      expect(await worktreeGitStatus(dir, fork)).toMatchObject({ behind: null });
-      expect(await worktreeGitStatus(dir, 'no-such-branch')).toMatchObject({ behind: null });
-      expect(await worktreeGitStatus(dir)).toMatchObject({ behind: null });
+      // The task commits its own work: ahead counts only what the branch would propose.
+      writeFileSync(join(dir, 'task.txt'), 't\n');
+      g(dir, 'add', '-A');
+      g(dir, 'commit', '-qm', 'task work');
+      expect(await worktreeGitStatus(dir, 'main')).toMatchObject({ behind: 1, ahead: 1 });
+
+      expect(await worktreeGitStatus(dir, fork)).toMatchObject({ behind: null, ahead: null });
+      expect(await worktreeGitStatus(dir, 'no-such-branch')).toMatchObject({ behind: null, ahead: null });
+      expect(await worktreeGitStatus(dir)).toMatchObject({ behind: null, ahead: null });
     } finally {
       rmSync(remote, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });

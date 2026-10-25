@@ -5,6 +5,7 @@ import { dirname, resolve as resolvePath } from 'node:path';
 import { trackChildExit } from './agent-runner.ts';
 import { buildChildEnv } from './agent-env.ts';
 import { EOF_KILL_GRACE_MS, EOF_TERM_GRACE_MS, KILL_GRACE_MS } from './claude-cli-runner.ts';
+import { spawnableCommand } from './windows-shim.ts';
 
 export interface JunieAcpMessage {
   id?: number | string;
@@ -58,10 +59,11 @@ export function spawnJunieAcp(
 ): ChildProcessWithoutNullStreams {
   try {
     const opts = { cwd, env: buildJunieAcpEnv(extraEnv) };
-    // Locally exactly as before (no disclaim trampoline); a container launcher execs inside.
-    return launcher.id === 'local'
-      ? nodeSpawn(bin, ['--acp=true', '-p', cwd], opts)
-      : launcher.spawn(bin, ['--acp=true', '-p', cwd], opts);
+    if (launcher.id === 'local') {
+      const [file, argv] = spawnableCommand(bin, ['--acp=true', '-p', cwd]);
+      return nodeSpawn(file, argv, opts);
+    }
+    return launcher.spawn(bin, ['--acp=true', '-p', cwd], opts);
   } catch (error) {
     throw junieSpawnError(error, bin);
   }

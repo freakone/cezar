@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { removeTempDir } from '../test-fixtures/remove-temp-dir.testkit.ts';
 import type { ContentBlock } from '../core/agent-runner.ts';
 import { parseAskMarker } from '../core/ask.ts';
 import type { UiEvent } from '../core/ui-events.ts';
@@ -559,7 +560,7 @@ describe('RunManager.continueRun override', () => {
     expect(after?.model).toBeUndefined();
   });
 
-  it('a runner-only switch keeps a free-form model id — only known foreign presets are cleared', () => {
+  it("a runner-only switch drops a pin that is not provably the target's (telemetry 8e1173b1)", () => {
     const record = store.createRun({
       title: 't',
       workflow: 'quick-task',
@@ -570,8 +571,24 @@ describe('RunManager.continueRun override', () => {
     });
     store.updateRun(record.id, { status: 'done', finishedAt: new Date().toISOString() });
     store.updateStep(record.id, 's1', { sessionId: 'sess-1' });
+    // Nobody picked this gateway id for codex; the composer already shows `auto` after a switch.
     expect(manager.continueRun(record.id, { runner: 'codex' })).toEqual({ ok: true });
-    expect(store.getRun(record.id)?.model).toBe('my-org/custom-tune');
+    expect(store.getRun(record.id)?.model).toBeUndefined();
+  });
+
+  it("a runner-only switch keeps a pin native to the target, and an explicit pick always wins", () => {
+    const record = store.createRun({
+      title: 't',
+      workflow: 'quick-task',
+      task: 't',
+      runner: 'opencode',
+      model: 'anthropic/claude-sonnet-5',
+      steps: [{ id: 's1', name: 'Work', kind: 'agent' }],
+    });
+    store.updateRun(record.id, { status: 'done', finishedAt: new Date().toISOString() });
+    store.updateStep(record.id, 's1', { sessionId: 'sess-1' });
+    expect(manager.continueRun(record.id, { runner: 'claude' })).toEqual({ ok: true });
+    expect(store.getRun(record.id)?.model).toBe('anthropic/claude-sonnet-5');
   });
 
   it('a runner-only continue on the SAME backend keeps the pin (no spurious clear)', () => {
@@ -953,6 +970,78 @@ describe('a single agent step plus a check step gets NO chain note (#410)', () =
     expect(notes[0]).not.toContain('chain of');
     expect(notes[0]).not.toContain('earlier step');
     expect(notes[0]).not.toContain('project-conventions');
+  }, 30_000);
+});
+
+/** spec 2026-10-19-repo-git-sync: an in-place run with `newBranch` forks the checkout itself. */
+describe('worktree off + newBranch switches the repo checkout to a branch off base', () => {
+  let repoRoot: string;
+  let store: RunStore;
+  let manager: RunManager;
+  const savedDryRun = process.env.CEZ_DRY_RUN;
+  const workflow: WorkflowDef = {
+    name: 'quick-task',
+    source: 'built-in',
+    steps: [{ id: 'work', name: 'Work', prompt: '{{task}}' }],
+  };
+  const settle = async (id: string) => {
+    const deadline = Date.now() + 20_000;
+    while (!['done', 'review', 'failed', 'cancelled'].includes(store.getRun(id)?.status ?? '')) {
+      if (Date.now() > deadline) throw new Error('run did not finish in time');
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return store.getRun(id);
+  };
+
+  beforeAll(async () => {
+    repoRoot = mkdtempSync(join(tmpdir(), 'cez-inplace-branch-'));
+    process.env.CEZ_DRY_RUN = '1';
+    await run('git', ['init', '-q', '-b', 'main'], { cwd: repoRoot });
+    writeFileSync(join(repoRoot, '.gitignore'), '.ai/\nnotes.md\n');
+    await run('git', ['add', '-A'], { cwd: repoRoot });
+    await run('git', [...GIT_ID, 'commit', '-q', '-m', 'base'], { cwd: repoRoot });
+    // The checkout stands on another branch: the new one still forks from `main`.
+    await run('git', ['checkout', '-q', '-b', 'elsewhere'], { cwd: repoRoot });
+    writeFileSync(join(repoRoot, 'x.txt'), 'x\n');
+    await run('git', ['add', '-A'], { cwd: repoRoot });
+    await run('git', [...GIT_ID, 'commit', '-q', '-m', 'elsewhere only'], { cwd: repoRoot });
+    store = RunStore.open(join(repoRoot, '.ai/cezar'));
+    writeFileSync(join(repoRoot, '.ai/cezar/config.json'), JSON.stringify({ baseBranch: 'main' }));
+    manager = new RunManager(store, repoRoot);
+  });
+
+  afterAll(async () => {
+    manager.dispose();
+    if (savedDryRun === undefined) delete process.env.CEZ_DRY_RUN;
+    else process.env.CEZ_DRY_RUN = savedDryRun;
+    store.flush();
+    await removeTempDir(repoRoot);
+  });
+
+  it('creates the named branch from base, records it, and keeps it out of the worktree path', async () => {
+    const record = manager.startRun(workflow, {
+      task: 'mock:done tweak',
+      worktree: false,
+      newBranch: true,
+      branch: 'feat/tweak',
+    });
+    const done = await settle(record.id);
+    expect(done).toMatchObject({ worktree: false, inPlaceBranch: true, branch: 'feat/tweak' });
+    expect(done?.worktreePath).toBeUndefined();
+    const head = (await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot })).stdout.trim();
+    expect(head).toBe('feat/tweak');
+    const mainSha = (await run('git', ['rev-parse', 'main'], { cwd: repoRoot })).stdout.trim();
+    expect(done?.baseBranch).toBe(mainSha);
+  }, 30_000);
+
+  it('without newBranch an in-place run leaves the checkout where it is', async () => {
+    await run('git', ['checkout', '-q', 'elsewhere'], { cwd: repoRoot });
+    const record = manager.startRun(workflow, { task: 'mock:done look', worktree: false });
+    const done = await settle(record.id);
+    expect(done?.inPlaceBranch).toBeUndefined();
+    expect(done?.branch).toBeUndefined();
+    const head = (await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot })).stdout.trim();
+    expect(head).toBe('elsewhere');
   }, 30_000);
 });
 
@@ -1544,6 +1633,102 @@ describe('CEZ:ASK parks as waiting and emits ask.requested (#473)', () => {
       active.delete(record.id);
       vi.useRealTimers();
     }
+  });
+
+  describe('Finish while the session is settling (telemetry 6a3cecee)', () => {
+    const createWaiting = (title: string) => {
+      const record = store.createRun({ title, workflow: 'quick-task', task: title, steps: [{ id: 'task', name: 'Task', kind: 'agent' }] });
+      store.updateRun(record.id, { status: 'waiting' });
+      return record;
+    };
+    const activeMap = () => (manager as unknown as { active: Map<string, object> }).active;
+    const lifecycleMessages = (id: string) =>
+      readEvents(id).filter((event) => event.type === 'lifecycle').map((event) => event.message);
+
+    it('a closed-but-unsettled session takes Finish as the settlement intent instead of a 409', () => {
+      const record = createWaiting('closing');
+      const state = { cancelled: false, sessionEverOpened: true, idleClosed: true, askPark: 'waiting', session: { open: false } };
+      activeMap().set(record.id, state);
+      try {
+        expect(manager.finish(record.id)).toBe(true);
+        expect(state.idleClosed).toBeUndefined();
+        expect(state.askPark).toBe('abandoned');
+        // A repeat click is the same request, not a second event.
+        expect(manager.finish(record.id)).toBe(true);
+        expect(lifecycleMessages(record.id).filter((m) => m === 'finished by user while the session was closing')).toHaveLength(1);
+      } finally {
+        activeMap().delete(record.id);
+      }
+    });
+
+    it('also covers the gap after teardown cleared the session object', () => {
+      const record = createWaiting('torn down');
+      activeMap().set(record.id, { cancelled: false, sessionEverOpened: true });
+      try {
+        expect(manager.finish(record.id)).toBe(true);
+      } finally {
+        activeMap().delete(record.id);
+      }
+    });
+
+    it('accepts a review that is still unwinding once the engine lets go', () => {
+      const record = createWaiting('review unwinding');
+      store.updateRun(record.id, { status: 'review' });
+      const state = { cancelled: false, sessionEverOpened: true };
+      activeMap().set(record.id, state);
+      expect(manager.finish(record.id)).toBe(true);
+      expect(store.getRun(record.id)?.status).toBe('review');
+      (manager as unknown as { dropActive: (id: string, s: object) => void }).dropActive(record.id, state);
+      expect(store.getRun(record.id)?.status).toBe('done');
+    });
+
+    it('a repeated End session that lands after the review settle does not accept the review', () => {
+      const record = createWaiting('double click');
+      const end = vi.fn();
+      const session = { open: true, end };
+      const state = { cancelled: false, sessionEverOpened: true, session };
+      activeMap().set(record.id, state);
+      expect(manager.finish(record.id)).toBe(true);
+      expect(end).toHaveBeenCalledOnce();
+      session.open = false;
+      store.updateRun(record.id, { status: 'review' });
+      expect(manager.finish(record.id)).toBe(true);
+      (manager as unknown as { dropActive: (id: string, s: object) => void }).dropActive(record.id, state);
+      expect(store.getRun(record.id)?.status).toBe('review');
+    });
+
+    it('still refuses a cancelled run and a run that never opened a session', () => {
+      const cancelled = createWaiting('cancelled');
+      const fresh = createWaiting('never opened');
+      activeMap().set(cancelled.id, { cancelled: true, sessionEverOpened: true });
+      activeMap().set(fresh.id, { cancelled: false });
+      try {
+        expect(manager.finish(cancelled.id)).toBe(false);
+        expect(manager.finish(fresh.id)).toBe(false);
+      } finally {
+        activeMap().delete(cancelled.id);
+        activeMap().delete(fresh.id);
+      }
+    });
+
+    it('a Finish that lands while the idle settle checks the review gate still wins', async () => {
+      const record = createWaiting('finish mid gate');
+      const state = { cancelled: false, sessionEverOpened: true, idleClosed: true as boolean | undefined };
+      activeMap().set(record.id, state);
+      const internals = manager as unknown as {
+        reviewGateApplies: (id: string) => Promise<boolean>;
+        idleClosedFails: (id: string, s: object) => Promise<boolean>;
+      };
+      internals.reviewGateApplies = async () => {
+        expect(manager.finish(record.id)).toBe(true);
+        return false;
+      };
+      try {
+        expect(await internals.idleClosedFails(record.id, state)).toBe(false);
+      } finally {
+        activeMap().delete(record.id);
+      }
+    });
   });
 
   it('keeps the configured timeout armed at both new-run and reply continuation parks (#992)', async () => {
@@ -3554,6 +3739,7 @@ describe("registry /skill expansion on a fresh run's opening prompt (#278)", () 
       '---\nname: demo-review\ndescription: Review a diff.\n---\n\nRun the `demo-engine` skill verbatim.\n',
     );
     writeFileSync(join(repoRoot, '.ai/cezar/skills/demo-engine.md'), '---\nname: demo-engine\n---\n\nEngine.\n');
+    vi.mocked(track).mockClear();
     const record = manager.startRun(SINGLE_STEP, { task: '/demo-review 12', worktree: true });
     runId = record.id;
     await waitFor(() => eventsOf(record.id).some((e) => e.stepId === 'task' && e.type === 'text'));
@@ -3563,7 +3749,21 @@ describe("registry /skill expansion on a fresh run's opening prompt (#278)", () 
       expect(readFileSync(join(wt, dir, 'demo-engine/SKILL.md'), 'utf8')).toContain('Engine.');
     }
     expect(vi.mocked(track)).toHaveBeenCalledWith('skills_provisioned', { label: 'installed', value: 2 });
+    // The selected skill counts once, under its source: a repo skill's own name stays local.
+    const used = vi.mocked(track).mock.calls.filter(([event]) => event === 'skill_used');
+    expect(used).toEqual([['skill_used', { label: 'repo' }]]);
   }, 40_000);
+
+  it('reports where a task came from and which workflow it ran, never a custom name', () => {
+    vi.mocked(track).mockClear();
+    const sid = '0192f0e0-0000-7000-8000-000000000000';
+    manager.cancel(manager.startRun(SINGLE_STEP, { task: 'from the cockpit', worktree: false, deviceSid: sid }).id);
+    expect(vi.mocked(track)).toHaveBeenCalledWith('task_origin', { label: 'cockpit' }, { sid });
+    expect(vi.mocked(track)).toHaveBeenCalledWith('workflow_used', { label: 'quick-task' }, { sid });
+    runId = manager.startRun({ ...SINGLE_STEP, name: 'acme-secret-flow', source: 'file' }, { task: 'mine', worktree: false }).id;
+    expect(vi.mocked(track)).toHaveBeenCalledWith('task_origin', { label: 'api' }, { sid: undefined });
+    expect(vi.mocked(track)).toHaveBeenCalledWith('workflow_used', { label: 'custom' }, { sid: undefined });
+  });
 
   it("writes no skill copies into the user's own checkout on an in-place run", async () => {
     // In place the cwd IS the checkout, whose skill dirs `discoverSkills` reads ahead of the
@@ -3577,6 +3777,8 @@ describe("registry /skill expansion on a fresh run's opening prompt (#278)", () 
       for (const dir of ['.claude/skills', '.agents/skills']) {
         expect(existsSync(join(repoRoot, dir, 'create-cezar-automation'))).toBe(false);
       }
+      // cezar's own skill is public, so it is counted by name.
+      expect(vi.mocked(track)).toHaveBeenCalledWith('skill_used', { label: 'create-cezar-automation' });
     } finally {
       if (savedApiUrl === undefined) delete process.env.CEZ_API_URL;
       else process.env.CEZ_API_URL = savedApiUrl;
@@ -3598,5 +3800,6 @@ describe("registry /skill expansion on a fresh run's opening prompt (#278)", () 
     expect(echoed?.text).toContain('/compact please');
     // A backend's own command is not a missing skill.
     expect(vi.mocked(track)).not.toHaveBeenCalledWith('skills_provisioned', expect.anything());
+    expect(vi.mocked(track)).not.toHaveBeenCalledWith('skill_used', expect.anything());
   }, 40_000);
 });

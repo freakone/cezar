@@ -16,6 +16,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 import {
+  pickBranchPr,
   AGGREGATE_CHECK_NAME,
   __clearCommentsCacheForTests,
   __clearMergeStateCacheForTests,
@@ -62,6 +63,39 @@ import type { ForgeComment } from './types.ts';
 /** `rollupToChecks` collapses a `gh … --json statusCheckRollup` array — already zod-validated
  *  via `ghCheckRunSchema` at the call site — down to the single enum the GitHub tab renders,
  *  both on PR rows (#400) and in the detail pane's `ChecksBadge`. */
+
+describe('pickBranchPr — adopting the PR the agent opened', () => {
+  const pr = (number: number, login?: string, state = 'OPEN') => ({
+    url: `https://github.com/open-mercato/cezar/pull/${number}`,
+    number,
+    state,
+    ...(login ? { headRepositoryOwner: { login } } : {}),
+  });
+
+  it('a same-repo head takes the newest match', () => {
+    expect(pickBranchPr([pr(12, 'open-mercato'), pr(9, 'open-mercato')], undefined)).toMatchObject({ number: 12 });
+  });
+
+  it('a fork head only adopts a PR from that owner — never another fork with the same branch name', () => {
+    expect(pickBranchPr([pr(12, 'someone-else'), pr(9, 'Me')], 'me')).toMatchObject({ number: 9 });
+    expect(pickBranchPr([pr(12, 'someone-else')], 'me')).toBeNull();
+  });
+
+  it('a closed or merged PR on a reused branch name is never adopted — only an open one', () => {
+    expect(pickBranchPr([pr(12, 'open-mercato', 'MERGED'), pr(9, 'open-mercato', 'CLOSED')], undefined)).toBeNull();
+    expect(pickBranchPr([pr(12, 'open-mercato', 'CLOSED'), pr(14, 'open-mercato')], undefined)).toMatchObject({ number: 14 });
+  });
+
+  it('a same-repo head only adopts a PR from the base repo’s owner — never a stranger’s fork with that branch name', () => {
+    // `findBranchPr` passes the base repo's owner when the head is not owner-qualified.
+    expect(pickBranchPr([pr(31, 'stranger'), pr(30, 'open-mercato')], 'open-mercato')).toMatchObject({ number: 30 });
+    expect(pickBranchPr([pr(31, 'stranger')], 'open-mercato')).toBeNull();
+  });
+
+  it('no PRs → null', () => {
+    expect(pickBranchPr([], undefined)).toBeNull();
+  });
+});
 
 describe('ghCheckRunSchema', () => {
   it('accepts a real gh rollup entry (conclusion + status, no state)', () => {

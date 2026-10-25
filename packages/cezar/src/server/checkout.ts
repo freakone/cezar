@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { ghEnv } from '../core/gh-env.ts';
 import { lstat, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { isAbsolutePath } from '../paths.ts';
@@ -318,7 +319,7 @@ function spawnClone(
       // unauthenticated `gh`/`glab`, or a private repo `git` wants a password
       // for, must fail with a message the dialog can show rather than block on a
       // prompt nobody can see.
-      env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0', ...extraEnv },
+      env: { ...ghEnv(), GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0', ...extraEnv },
     });
     const tail: string[] = [];
     let settled = false;

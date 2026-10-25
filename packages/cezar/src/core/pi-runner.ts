@@ -1,5 +1,6 @@
+import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { localLauncher, type ProcessLauncher } from './process-launcher.ts';
-import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { disclaimedCommand } from './disclaim-spawn.ts';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as resolvePath } from 'node:path';
 import type {
@@ -65,10 +66,16 @@ export class PiRunner implements AgentRunner {
     onEvent?: (event: AgentEvent) => void,
     opts: SessionOptions = {},
   ): AgentSession {
-    const child = this.launcher.spawn(this.bin, buildPiArgs(spec), {
-      cwd: spec.cwd,
-      env: buildChildEnv({ backend: this.backend, extraEnv: spec.env }),
-    });
+    const env = buildChildEnv({ backend: this.backend, extraEnv: spec.env });
+    const child =
+      this.launcher.id === 'local'
+        ? (() => {
+            const [file, argv] = disclaimedCommand(this.bin, buildPiArgs(spec), env);
+            const proc = nodeSpawn(file, argv, { cwd: spec.cwd, env });
+            proc.stdin.on('error', () => {});
+            return proc;
+          })()
+        : this.launcher.spawn(this.bin, buildPiArgs(spec), { cwd: spec.cwd, env });
     let open = true;
     let settled = true;
     let timedOut = false;
